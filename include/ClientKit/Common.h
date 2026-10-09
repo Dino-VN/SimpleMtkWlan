@@ -213,6 +213,13 @@ struct ioctl_debug {
     uint32_t txdata_cpu, txdata_dma, txdata_cons;
     uint32_t rx_delivered, rx_normal_mcu, rx_event, rx_notify;
     uint32_t if_ierrors, if_oerrors;
+    /* bit 31 set = value captured */
+    uint32_t aspm_lnkctl_before, aspm_lnkctl_after;
+    uint32_t aspm_l1ss_before, aspm_l1ss_after, aspm_parent_l1ss_before;
+    uint32_t glo_cfg;
+    uint32_t pci_status;
+    uint32_t txdata_desc[4];
+    uint32_t txdata_txp[4];
 };
 
 #define MTK_LOG_CHUNK 3800

@@ -247,6 +247,9 @@ MCLGETL(struct mbuf *m, int how, size_t len)
 #define MWX_FW_CHUNK	(4096 - sizeof(struct mwx_mcu_txd))
 
 extern int mtk_compat_intr_index;
+extern uint32_t mtk_aspm_lnkctl_before, mtk_aspm_lnkctl_after;
+extern uint32_t mtk_aspm_l1ss_before, mtk_aspm_l1ss_after;
+extern uint32_t mtk_aspm_parent_l1ss_before;
 extern int mtk_compat_intr_is_msi;
 
 /* Times an MCU send slept on a full TX ring, or retried a failed
@@ -1545,7 +1548,7 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 	}
 
 	static uint32_t tx_log_count;
-	if (tx_log_count < 32) {
+	if (tx_log_count < 64) {
 		MWX_DEV_LOG(sc, "tx frame wcid=%u pid=%d len=%zu\n",
 		    mn->wcid, mt->mt_idx, mbuf_pkthdr_len(m));
 		MWX_DEV_LOG(sc,
@@ -1553,10 +1556,11 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 		    txp->txwi[0], txp->txwi[1], txp->txwi[2], txp->txwi[3],
 		    txp->txwi[4], txp->txwi[5], txp->txwi[6], txp->txwi[7]);
 		MWX_DEV_LOG(sc,
-		    "tx desc msdu=%u/%u/%u/%u len=%u/%u/%u/%u\n",
+		    "tx desc msdu=%u/%u/%u/%u len=%u/%u/%u/%u buf=0x%08x/0x%08x/0x%08x/0x%08x\n",
 		    txp->msdu_id[0], txp->msdu_id[1], txp->msdu_id[2],
 		    txp->msdu_id[3], txp->ptr[0].len0, txp->ptr[0].len1,
-		    txp->ptr[1].len0, txp->ptr[1].len1);
+		    txp->ptr[1].len0, txp->ptr[1].len1, txp->ptr[0].buf0,
+		    txp->ptr[0].buf1, txp->ptr[1].buf0, txp->ptr[1].buf1);
 		tx_log_count++;
 	}
 
@@ -6846,6 +6850,30 @@ MtkMwx::fillDebug(void *out)
 	d->rx_notify = sc->sc_rx_pkt_txrx_notify;
 	d->if_ierrors = sc->sc_ic.ic_if.if_ierrors;
 	d->if_oerrors = sc->sc_ic.ic_if.if_oerrors;
+
+	d->aspm_lnkctl_before = mtk_aspm_lnkctl_before;
+	d->aspm_lnkctl_after = mtk_aspm_lnkctl_after;
+	d->aspm_l1ss_before = mtk_aspm_l1ss_before;
+	d->aspm_l1ss_after = mtk_aspm_l1ss_after;
+	d->aspm_parent_l1ss_before = mtk_aspm_parent_l1ss_before;
+	d->glo_cfg = mwx_read(sc, MT_WFDMA0_GLO_CFG);
+	d->pci_status = pci_conf_read(sc->sc_pc, sc->sc_tag, 0x04);
+
+	/* The descriptor the TX data DMA engine is stuck on, if any. */
+	uint32_t idx = d->txdata_dma % sc->sc_txq.mq_count;
+	struct mwx_desc *desc = &sc->sc_txq.mq_desc[idx];
+	d->txdata_desc[0] = le32toh(desc->buf0);
+	d->txdata_desc[1] = le32toh(desc->ctrl);
+	d->txdata_desc[2] = le32toh(desc->buf1);
+	d->txdata_desc[3] = le32toh(desc->info);
+	struct mwx_txwi *mt = sc->sc_txq.mq_data[idx].md_txwi;
+	if (mt != NULL && mt->mt_desc != NULL) {
+		struct mt76_connac_txp_ptr *ptr = &mt->mt_desc->ptr[0];
+		d->txdata_txp[0] = le32toh(ptr->buf0);
+		d->txdata_txp[1] = le16toh(ptr->len0) | (le16toh(ptr->len1) << 16);
+		d->txdata_txp[2] = le32toh(ptr->buf1);
+		d->txdata_txp[3] = mt->mt_idx;
+	}
 }
 
 IOReturn
