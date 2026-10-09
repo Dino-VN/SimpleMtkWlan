@@ -40,6 +40,8 @@ struct taskq {
     thread_call_t call;
     struct task_list work;
     bool stopping;
+    /* The call is entered or running. Guarded by lock. */
+    bool armed;
 };
 static struct taskq system_queue;
 struct taskq *const systq = &system_queue;
@@ -51,6 +53,9 @@ static void taskq_run(thread_call_param_t arg, thread_call_param_t)
         IORecursiveLockLock(q->lock);
         struct task *item = TAILQ_FIRST(&q->work);
         if (q->stopping || item == NULL) {
+            /* Last access to q; taskq_quiesce() waits for this. */
+            q->armed = false;
+            IORecursiveLockWakeup(q->lock, &q->armed, false);
             IORecursiveLockUnlock(q->lock);
             return;
         }
@@ -68,6 +73,7 @@ static bool taskq_setup(struct taskq *q)
     if (!q->lock) return false;
     TAILQ_INIT(&q->work);
     q->stopping = false;
+    q->armed = false;
     q->call = thread_call_allocate_with_options(taskq_run, q,
         THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
     if (!q->call) {
@@ -105,16 +111,23 @@ void taskq_quiesce(struct taskq *q)
         TAILQ_REMOVE(&q->work, item, t_entry);
         item->t_flags &= ~TASK_ONQUEUE;
     }
+    /* task_add and resubmission are now rejected under the same lock.
+     * thread_call_cancel_wait() is in com.apple.kpi.private, so wait for
+     * a running callback through armed instead. */
+    if (q->armed && thread_call_cancel(q->call))
+        q->armed = false;
+    while (q->armed)
+        IORecursiveLockSleep(q->lock, &q->armed, THREAD_UNINT);
     IORecursiveLockUnlock(q->lock);
-    /* task_add and resubmission are now rejected under the same lock. */
-    thread_call_cancel_wait(q->call);
 }
 
 void taskq_destroy(struct taskq *q)
 {
     if (!q || !q->lock) return;
     taskq_quiesce(q);
-    thread_call_free(q->call);
+    /* The callback may still be returning after it cleared armed. */
+    while (!thread_call_free(q->call))
+        IOSleep(1);
     q->call = NULL;
     IORecursiveLockFree(q->lock);
     q->lock = NULL;
@@ -140,7 +153,10 @@ int task_add(struct taskq *q, struct task *t)
     t->t_flags |= TASK_ONQUEUE;
     TAILQ_INSERT_TAIL(&q->work, t, t_entry);
     /* Submit while locked, so shutdown cannot miss a late submission. */
-    thread_call_enter(q->call);
+    if (!q->armed) {
+        q->armed = true;
+        thread_call_enter(q->call);
+    }
     IORecursiveLockUnlock(q->lock);
     return 1;
 }

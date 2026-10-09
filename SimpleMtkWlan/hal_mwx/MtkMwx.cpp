@@ -241,6 +241,15 @@ MCLGETL(struct mbuf *m, int how, size_t len)
 	return m;
 }
 
+/* Firmware chunk plus MCU header headspace must fit a 4 KB cluster;
+ * larger requests need 16 KB jumbo clusters, which run out quickly. */
+#define MWX_FW_CHUNK	(4096 - sizeof(struct mwx_mcu_txd))
+
+/* Times an MCU send slept on a full TX ring, or retried a failed
+ * firmware chunk allocation (bring-up diagnostics). */
+static uint32_t mwx_ebusy_sleeps;
+static uint32_t mwx_enomem_retries;
+
 static const struct pci_matchid mwx_devices[] = {
 	{ PCI_VENDOR_MEDIATEK, PCI_PRODUCT_MEDIATEK_MT7921 },
 	{ PCI_VENDOR_MEDIATEK, PCI_PRODUCT_MEDIATEK_MT7921K },
@@ -445,6 +454,7 @@ struct mwx_softc {
 		struct mbuf	*mcu_m;
 		uint32_t	 mcu_cmd;
 		uint32_t	 mcu_int;
+		volatile int	 mcu_done;
 	}			sc_mcu_wait[16];
 	uint8_t			sc_scan_seq_num;
 
@@ -836,6 +846,8 @@ mwx_init(struct ifnet *ifp)
 
 	MWX_DEV_LOG(sc, "init start opmode=%d flags=0x%x ic_state=%d\n",
 	    ic->ic_opmode, ifp->if_flags, ic->ic_state);
+	if ((rv = mwx_mcu_drv_pmctrl(sc)) != 0)
+		MWX_DEV_LOG(sc, "init driver own failed error=%d\n", rv);
 	rv = mwx_mcu_set_deep_sleep(sc, 0);
 	if (rv)
 		MWX_DEV_LOG(sc, "init disable deep sleep returned %d\n", rv);
@@ -1663,6 +1675,9 @@ mwx_intr(void *arg)
 		    intr & ~mask);
 		intr_unhandled_log_count++;
 	}
+	/* Re-read status after processing so events that arrived while
+	 * INT_ENA was 0 are not left waiting for the next interrupt. */
+	for (int loops = 0; ; loops++) {
 	/* ack interrupts */
 	intr &= mask;
 	mwx_write(sc, MT_WFDMA0_HOST_INT_STA, intr);
@@ -1686,6 +1701,11 @@ mwx_intr(void *arg)
 		mwx_dma_rx_done(sc, &sc->sc_rxmcuq);
 	if (intr & MT_INT_RX_DONE_DATA)
 		mwx_dma_rx_done(sc, &sc->sc_rxq);
+
+	intr = mwx_read(sc, MT_WFDMA0_HOST_INT_STA);
+	if ((intr & mask) == 0 || loops >= 8)
+		break;
+	}
 
 	/* TODO power management */
 //	mt76_connac_pm_unref(&dev->mphy, &dev->pm);
@@ -1711,11 +1731,9 @@ mwx_preinit(struct mwx_softc *sc)
 	}
 	MWX_DEV_LOG(sc, "preinit hardware init ok\n");
 
-	if ((rv = mwx_mcu_set_deep_sleep(sc, 1)) != 0) {
-		MWX_DEV_LOG(sc, "preinit deep sleep enable failed error=%d\n", rv);
-		return rv;
-	}
-	MWX_DEV_LOG(sc, "preinit deep sleep enabled\n");
+	/* Power management is not implemented (no pm_ref before MCU
+	 * commands), so keep the chip awake. */
+	MWX_DEV_LOG(sc, "preinit deep sleep left disabled\n");
 
 	ic->ic_sup_rates[IEEE80211_MODE_11B] = ieee80211_std_rateset_11b;
 	ic->ic_sup_rates[IEEE80211_MODE_11G] = ieee80211_std_rateset_11g;
@@ -3092,6 +3110,7 @@ enqueue:
 		rv = mwx_dma_tx_enqueue(sc, q, m);
 		if (rv != EBUSY)
 			break;
+		mwx_ebusy_sleeps++;
 		q->mq_wakeme = 1;
 		tsleep_nsec(q, 0, "mwxq", MSEC_TO_NSEC(100));
 	}
@@ -3250,11 +3269,51 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 
 		sc->sc_mcu_wait[rxd_seq].mcu_int = mcu_int;
 		sc->sc_mcu_wait[rxd_seq].mcu_m = m;
+		sc->sc_mcu_wait[rxd_seq].mcu_done = 1;
 		wakeup(&sc->sc_mcu_wait[rxd_seq]);
 		return;
 	}
 
 	m_freem(m);
+}
+
+/* Log WFDMA state when an MCU command gets no response. */
+static void
+mwx_dump_mcu_state(struct mwx_softc *sc, uint32_t cmd, int seq)
+{
+	MWX_DEV_LOG(sc, "timeout diag cmd=0x%08x seq=%d lpctl=0x%08x int_sta=0x%08x int_ena=0x%08x\n",
+	    cmd, seq, mwx_read(sc, MT_CONN_ON_LPCTL),
+	    mwx_read(sc, MT_WFDMA0_HOST_INT_STA),
+	    mwx_read(sc, MT_WFDMA0_HOST_INT_ENA));
+	MWX_DEV_LOG(sc, "timeout diag rxmcu cpu=%u dma=%u cons=%u rxfwdl cpu=%u dma=%u cons=%u txmcu cpu=%u dma=%u cons=%u\n",
+	    mwx_read(sc, sc->sc_rxmcuq.mq_regbase + MT_DMA_CPU_IDX),
+	    mwx_read(sc, sc->sc_rxmcuq.mq_regbase + MT_DMA_DMA_IDX),
+	    sc->sc_rxmcuq.mq_cons,
+	    mwx_read(sc, sc->sc_rxfwdlq.mq_regbase + MT_DMA_CPU_IDX),
+	    mwx_read(sc, sc->sc_rxfwdlq.mq_regbase + MT_DMA_DMA_IDX),
+	    sc->sc_rxfwdlq.mq_cons,
+	    mwx_read(sc, sc->sc_txmcuq.mq_regbase + MT_DMA_CPU_IDX),
+	    mwx_read(sc, sc->sc_txmcuq.mq_regbase + MT_DMA_DMA_IDX),
+	    sc->sc_txmcuq.mq_cons);
+}
+
+/* The response may land before we sleep, so poll the done flag
+ * instead of trusting a single wakeup. */
+static int
+mwx_mcu_sleep_resp(struct mwx_softc *sc, uint32_t cmd, int seq)
+{
+	int i;
+
+	for (i = 0; i < 300; i++) {
+		if (sc->sc_mcu_wait[seq].mcu_done)
+			return 0;
+		tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait",
+		    MSEC_TO_NSEC(10));
+	}
+	if (sc->sc_mcu_wait[seq].mcu_done)
+		return 0;
+	mwx_dump_mcu_state(sc, cmd, seq);
+	return EWOULDBLOCK;
 }
 
 int
@@ -3265,7 +3324,7 @@ mwx_mcu_wait_resp_int(struct mwx_softc *sc, uint32_t cmd, int seq,
 
 	KASSERT(seq < nitems(sc->sc_mcu_wait));
 
-	rv = tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait", SEC_TO_NSEC(3));
+	rv = mwx_mcu_sleep_resp(sc, cmd, seq);
 	if (rv != 0) {
 		printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
 		mwx_reset(sc);
@@ -3289,7 +3348,7 @@ mwx_mcu_wait_resp_msg(struct mwx_softc *sc, uint32_t cmd, int seq,
 
 	KASSERT(seq < nitems(sc->sc_mcu_wait));
 
-	rv = tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait", SEC_TO_NSEC(3));
+	rv = mwx_mcu_sleep_resp(sc, cmd, seq);
 	if (rv != 0) {
 		printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
 		mwx_reset(sc);
@@ -3773,7 +3832,7 @@ mwx_load_firmware(struct mwx_softc *sc)
 			goto out;
 		}
 		rv = mwx_mcu_send_firmware(sc, MCU_CMD_FW_SCATTER,
-		    dl, len, 4096);
+		    dl, len, MWX_FW_CHUNK);
 		if (rv != 0) {
 			MWX_DEV_LOG(sc, "patch send failed index=%d error=%d\n",
 			    i, rv);
@@ -3828,8 +3887,9 @@ out:
 
 		if (region->feature_set & FW_FEATURE_OVERRIDE_ADDR)
 			override = addr;
-		MWX_DEV_LOG(sc, "WM region index=%d addr=0x%08x len=%u mode=0x%08x feature=0x%02x offset=%zu\n",
-		    i, addr, len, mode, region->feature_set, offset);
+		MWX_DEV_LOG(sc, "WM region index=%d addr=0x%08x len=%u mode=0x%08x feature=0x%02x offset=%zu ebusy_sleeps=%u enomem_retries=%u\n",
+		    i, addr, len, mode, region->feature_set, offset,
+		    mwx_ebusy_sleeps, mwx_enomem_retries);
 
 		if (offset + len > fwlen - sizeof(*fwhdr) -
 		    fwhdr->n_region * sizeof(struct mwx_fw_region)) {
@@ -3852,7 +3912,7 @@ out:
 		}
 
 		rv = mwx_mcu_send_firmware(sc, MCU_CMD_FW_SCATTER,
-		    fwbuf + offset, len, 4096);
+		    fwbuf + offset, len, MWX_FW_CHUNK);
 		if (rv != 0) {
 			MWX_DEV_LOG(sc, "WM send failed index=%d error=%d\n",
 			    i, rv);
@@ -4034,14 +4094,22 @@ mwx_mcu_send_firmware(struct mwx_softc *sc, int cmd, u_char *data,
     size_t len, size_t max_len)
 {
 	size_t cur_len;
-	int rv;
+	int rv, retry;
 
 	while (len > 0) {
 		cur_len = len;
 		if (cur_len > max_len)
 			cur_len = max_len;
 
-		rv = mwx_mcu_send_msg(sc, cmd, data, cur_len, NULL);
+		/* mbuf allocation is M_DONTWAIT; let the pool refill. */
+		for (retry = 0; ; retry++) {
+			rv = mwx_mcu_send_msg(sc, cmd, data, cur_len, NULL);
+			if (rv != ENOMEM || retry >= 50)
+				break;
+			mwx_enomem_retries++;
+			mwx_dma_tx_cleanup(sc, &sc->sc_txfwdlq);
+			IOSleep(2);
+		}
 		if (rv != 0)
 			return rv;
 
