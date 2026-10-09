@@ -180,4 +180,30 @@ struct ioctl_network_info {
     uint32_t recv_timestamp;
 };
 
+/* Bring-up counters and WFDMA state (IOCTL_80211_DEBUG). */
+struct ioctl_debug {
+    unsigned int version;
+    uint32_t ic_state;
+    uint32_t sc_flags;
+    uint32_t intr_count;
+    uint32_t mcu_events;
+    uint32_t last_mcu_eid;
+    uint32_t mcu_bad_seq;
+    uint32_t mcu_timeouts;
+    uint32_t scan_requests;
+    uint32_t scan_done_count;
+    uint32_t scan_watchdog_fired;
+    uint32_t rx_pkt_normal;
+    uint32_t rx_pkt_unknown;
+    uint32_t rx_fill_fail;
+    uint32_t lpctl;
+    uint32_t int_sta;
+    uint32_t int_ena;
+    uint32_t rxmcu_cpu, rxmcu_dma, rxmcu_cons;
+    uint32_t rxfwdl_cpu, rxfwdl_dma, rxfwdl_cons;
+    uint32_t rxdata_cpu, rxdata_dma, rxdata_cons;
+    uint32_t txmcu_cpu, txmcu_dma, txmcu_cons;
+    uint32_t nodes;
+};
+
 #endif /* Common_h */

@@ -42,6 +42,7 @@ const IOControlMethodAction MtkWlanUserClient::sMethods[IOCTL_ID_MAX] {
     sSCAN_RESULT,
     sTX_POWER_LEVEL,
     sNW_BSSID,
+    sDEBUG,
 };
 
 bool MtkWlanUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties)
@@ -407,6 +408,18 @@ sSCAN_RESULT(OSObject* target, void* data, bool isSet)
     that->fNextNodeToSend = RB_NEXT(ieee80211_tree, &ic->ic_tree, that->fNextNodeToSend);
     if (that->fNextNodeToSend == NULL)
         that->fScanResultWrapping = true;
+    return kIOReturnSuccess;
+}
+
+IOReturn MtkWlanUserClient::
+sDEBUG(OSObject* target, void* data, bool isSet)
+{
+    MtkWlanUserClient *that = OSDynamicCast(MtkWlanUserClient, target);
+    if (isSet) {
+        return kIOReturnError;
+    }
+    memset(data, 0, sizeof(struct ioctl_debug));
+    that->fDriverController->fillDebug(data);
     return kIOReturnSuccess;
 }
 

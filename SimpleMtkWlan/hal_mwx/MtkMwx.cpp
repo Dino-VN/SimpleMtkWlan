@@ -45,6 +45,7 @@
 #include <FwData.h>
 
 #include "if_mwxreg.h"
+#include <ClientKit/Common.h>
 
 OSDefineMetaClassAndStructors(MtkMwx, MtkHalService)
 
@@ -410,6 +411,7 @@ struct mwx_softc {
 	struct task		sc_scan_task;
 	struct task		sc_reset_task;
 	CTimeout		*sc_reset_to;
+	CTimeout		*sc_scan_to;
 	u_int			sc_flags;
 #define MWX_FLAG_SCANNING		0x01
 #define MWX_FLAG_BGSCAN			0x02
@@ -480,6 +482,14 @@ struct mwx_softc {
 	uint32_t		sc_rx_delivered;
 	uint32_t		sc_scan_done_count;
 	uint32_t		sc_scan_last_ieee80211_nodes;
+	/* Bring-up counters, read through IOCTL_80211_DEBUG. */
+	uint32_t		sc_intr_count;
+	uint32_t		sc_mcu_events;
+	uint32_t		sc_last_mcu_eid;
+	uint32_t		sc_mcu_bad_seq;
+	uint32_t		sc_mcu_timeouts;
+	uint32_t		sc_scan_requests;
+	uint32_t		sc_scan_watchdog_fired;
 
 };
 
@@ -678,6 +688,7 @@ int		mwx_mcu_set_deep_sleep(struct mwx_softc *, int);
 void		mt7921_mcu_low_power_event(struct mwx_softc *, struct mbuf *);
 void		mt7921_mcu_tx_done_event(struct mwx_softc *, struct mbuf *);
 void		mwx_end_scan_task(void *);
+void		mwx_scan_timeo(void *);
 void		mt7921_mcu_scan_event(struct mwx_softc *, struct mbuf *);
 int		mt7921_mcu_hw_scan(struct mwx_softc *, int);
 int		mt7921_mcu_hw_scan_cancel(struct mwx_softc *);
@@ -972,6 +983,7 @@ mwx_stop(struct ifnet *ifp)
 	}
 	task_del(systq, &sc->sc_scan_task);
 	timeout_del(&sc->sc_reset_to);
+	timeout_del(&sc->sc_scan_to);
 
 	ifp->if_timer = 0;
 	ifp->if_flags &= ~IFF_RUNNING;
@@ -1212,6 +1224,9 @@ mwx_scan(struct mwx_softc *sc)
 		printf("%s: could not initiate scan\n", DEVNAME(sc));
 		return rv;
 	}
+	sc->sc_scan_requests++;
+	/* End the scan ourselves if the firmware never reports SCAN_DONE. */
+	timeout_add_sec(&sc->sc_scan_to, 12);
 
 	/*
 	 * The current mode might have been fixed during association.
@@ -1660,6 +1675,7 @@ mwx_intr(void *arg)
 		mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, mask);
 		return 0;
 	}
+	sc->sc_intr_count++;
 
 	/* TODO power management */
 //	mt76_connac_pm_ref(&dev->mphy, &dev->pm);
@@ -1997,6 +2013,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	task_set(&sc->sc_reset_task, mwx_reset_task, sc, "mwx_reset");
 	task_set(&sc->sc_scan_task, mwx_end_scan_task, sc, "mwx_scan");
 	timeout_set(&sc->sc_reset_to, mwx_reset_timeo, sc);
+	timeout_set(&sc->sc_scan_to, mwx_scan_timeo, sc);
 
 	/*
 	 * We cannot read the MAC address without loading the
@@ -3194,6 +3211,8 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 	rxd_ext_eid = rxd->ext_eid;
 	rxd_seq = rxd->seq;
 	m_adj(m, sizeof(*rxd));
+	sc->sc_mcu_events++;
+	sc->sc_last_mcu_eid = rxd_eid;
 
 	switch (rxd_eid) {
 	case MCU_EVENT_SCHED_SCAN_DONE:
@@ -3229,6 +3248,7 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 		if (rxd_seq == 0 || rxd_seq >= nitems(sc->sc_mcu_wait)) {
 			printf("%s: mcu rx bad seq %x\n", DEVNAME(sc),
 			    rxd_seq);
+			sc->sc_mcu_bad_seq++;
 			break;
 		}
 
@@ -3312,6 +3332,7 @@ mwx_mcu_sleep_resp(struct mwx_softc *sc, uint32_t cmd, int seq)
 	}
 	if (sc->sc_mcu_wait[seq].mcu_done)
 		return 0;
+	sc->sc_mcu_timeouts++;
 	mwx_dump_mcu_state(sc, cmd, seq);
 	return EWOULDBLOCK;
 }
@@ -4490,6 +4511,20 @@ mt7921_mcu_hw_scan_cancel(struct mwx_softc *sc)
 }
 
 void
+mwx_scan_timeo(void *arg)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+
+	if ((sc->sc_flags & MWX_FLAG_SCANNING) == 0)
+		return;
+	sc->sc_scan_watchdog_fired++;
+	MWX_DEV_LOG(sc, "scan watchdog: no SCAN_DONE, ending scan (fired=%u)\n",
+	    sc->sc_scan_watchdog_fired);
+	mt7921_mcu_hw_scan_cancel(sc);
+	task_add(systq, &sc->sc_scan_task);
+}
+
+void
 mwx_end_scan_task(void *arg)
 {
 	struct mwx_softc *sc = (struct mwx_softc *)arg;
@@ -4510,6 +4545,7 @@ mt7921_mcu_scan_event(struct mwx_softc *sc, struct mbuf *m)
 	int i, nodes_before;
 
 	sc->sc_scan_done_count++;
+	timeout_del(&sc->sc_scan_to);
 	nodes_before = mwx_count_nodes(ic);
 	sc->sc_scan_last_ieee80211_nodes = nodes_before;
 
@@ -6572,11 +6608,13 @@ MtkMwx::detach(IOPCIDevice *device)
     struct ifnet *ifp = &com->sc_ic.ic_if;
     com->sc_detaching = true;
     timeout_del(&com->sc_reset_to);
+    timeout_del(&com->sc_scan_to);
     /* Keep interrupts alive while in-flight MCU requests finish. */
     taskq_quiesce(com->sc_nswq);
     if (taskQueueOwned) taskq_quiesce(systq);
     if (ifp->if_flags & IFF_RUNNING) mwx_stop(ifp);
     timeout_free(&com->sc_reset_to);
+    timeout_free(&com->sc_scan_to);
     /* No interrupt callback may access buffers during their destruction. */
     if (com->sc_ih) {
         pci_intr_disestablish(pci->pa_pc, com->sc_ih);
@@ -6747,6 +6785,44 @@ MtkMwx::clearScanningFlags()
 {
 	if (com)
 		com->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
+}
+
+void
+MtkMwx::fillDebug(void *out)
+{
+	struct ioctl_debug *d = (struct ioctl_debug *)out;
+	struct mwx_softc *sc = com;
+
+	d->version = IOCTL_VERSION;
+	if (sc == NULL)
+		return;
+	d->ic_state = sc->sc_ic.ic_state;
+	d->sc_flags = sc->sc_flags;
+	d->intr_count = sc->sc_intr_count;
+	d->mcu_events = sc->sc_mcu_events;
+	d->last_mcu_eid = sc->sc_last_mcu_eid;
+	d->mcu_bad_seq = sc->sc_mcu_bad_seq;
+	d->mcu_timeouts = sc->sc_mcu_timeouts;
+	d->scan_requests = sc->sc_scan_requests;
+	d->scan_done_count = sc->sc_scan_done_count;
+	d->scan_watchdog_fired = sc->sc_scan_watchdog_fired;
+	d->rx_pkt_normal = sc->sc_rx_pkt_normal;
+	d->rx_pkt_unknown = sc->sc_rx_pkt_unknown;
+	d->rx_fill_fail = sc->sc_rx_fill_fail;
+	d->lpctl = mwx_read(sc, MT_CONN_ON_LPCTL);
+	d->int_sta = mwx_read(sc, MT_WFDMA0_HOST_INT_STA);
+	d->int_ena = mwx_read(sc, MT_WFDMA0_HOST_INT_ENA);
+#define MWX_DBG_Q(q, p) do { \
+	d->p##_cpu = mwx_read(sc, (q).mq_regbase + MT_DMA_CPU_IDX); \
+	d->p##_dma = mwx_read(sc, (q).mq_regbase + MT_DMA_DMA_IDX); \
+	d->p##_cons = (q).mq_cons; \
+} while (0)
+	MWX_DBG_Q(sc->sc_rxmcuq, rxmcu);
+	MWX_DBG_Q(sc->sc_rxfwdlq, rxfwdl);
+	MWX_DBG_Q(sc->sc_rxq, rxdata);
+	MWX_DBG_Q(sc->sc_txmcuq, txmcu);
+#undef MWX_DBG_Q
+	d->nodes = mwx_count_nodes(&sc->sc_ic);
 }
 
 IOReturn

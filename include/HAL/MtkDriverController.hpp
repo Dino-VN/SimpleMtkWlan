@@ -28,6 +28,7 @@ class MtkDriverController {
 public:
     
     virtual void clearScanningFlags() = 0;
+    virtual void fillDebug(void *out) = 0;
     
     virtual IOReturn setMulticastList(IOEthernetAddress *addr, int count) = 0;
 };
