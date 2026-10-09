@@ -1973,7 +1973,8 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	ic->ic_max_rssi = 100;	/* rxi_rssi is normalized for ni_rssi. */
 
 	ifp->if_softc = sc;
-	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST;
+	/* IFF_DEBUG enables net80211 state/EAPOL messages in the debug log. */
+	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST | IFF_DEBUG;
 	ifp->if_ioctl = mwx_ioctl;
 	ifp->if_start = mwx_start;
 	ifp->if_watchdog = mwx_watchdog;
@@ -6828,6 +6829,23 @@ MtkMwx::fillDebug(void *out)
 	d->nodes = mwx_count_nodes(&sc->sc_ic);
 	d->intr_index = mtk_compat_intr_index;
 	d->intr_is_msi = mtk_compat_intr_is_msi;
+
+	struct ieee80211_node *ni = sc->sc_ic.ic_bss;
+	if (ni != NULL) {
+		d->port_valid = ni->ni_port_valid;
+		d->node_flags = ((struct mwx_node *)ni)->flags;
+		d->wcid = ((struct mwx_node *)ni)->wcid;
+		d->rsn_supp_state = ni->ni_rsn_supp_state;
+	}
+	d->txdata_cpu = mwx_read(sc, sc->sc_txq.mq_regbase + MT_DMA_CPU_IDX);
+	d->txdata_dma = mwx_read(sc, sc->sc_txq.mq_regbase + MT_DMA_DMA_IDX);
+	d->txdata_cons = sc->sc_txq.mq_cons;
+	d->rx_delivered = sc->sc_rx_delivered;
+	d->rx_normal_mcu = sc->sc_rx_pkt_normal_mcu;
+	d->rx_event = sc->sc_rx_pkt_event;
+	d->rx_notify = sc->sc_rx_pkt_txrx_notify;
+	d->if_ierrors = sc->sc_ic.ic_if.if_ierrors;
+	d->if_oerrors = sc->sc_ic.ic_if.if_oerrors;
 }
 
 IOReturn

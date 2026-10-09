@@ -61,6 +61,7 @@ private:
     static IOReturn sTX_POWER_LEVEL(OSObject* target, void* data, bool isSet);
     static IOReturn sNW_BSSID(OSObject* target, void* data, bool isSet);
     static IOReturn sDEBUG(OSObject* target, void* data, bool isSet);
+    static IOReturn sLOG(OSObject* target, void* data, bool isSet);
     static const IOControlMethodAction sMethods[IOCTL_ID_MAX];
     
 private:
@@ -74,6 +75,7 @@ private:
 protected:
     bool fScanResultWrapping;
     ieee80211_node *fNextNodeToSend;
+    uint64_t fLogCursor;
 };
 
 

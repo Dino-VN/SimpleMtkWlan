@@ -85,6 +85,10 @@
 
 #include <IOKit/IOLib.h>
 
+/* Mirror driver printf() output into a ring readable through the user client. */
+int mtk_printf(const char *fmt, ...) __printflike(1, 2);
+#define printf(...) mtk_printf(__VA_ARGS__)
+
 #define IEEE80211_DEBUG
 
 #define _KASSERT(exp) KASSERT(exp, "")

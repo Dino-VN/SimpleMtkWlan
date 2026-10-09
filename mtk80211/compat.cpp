@@ -28,6 +28,7 @@
 
 #include "compat.h"
 #include <IOKit/IOLib.h>
+#include <stdarg.h>
 #include <sys/random.h>
 #include <sys/param.h>
 #include <sys/proc.h>
@@ -125,6 +126,54 @@ void interruptTrampoline(OSObject *ih, IOInterruptEventSource *, int count) {
 }
 
 /* IOInterruptEventSource index in use; -1 until established. */
+#define MTK_LOG_RING_SIZE (256 * 1024)
+static char mtk_log_ring[MTK_LOG_RING_SIZE];
+static volatile SInt64 mtk_log_head;
+
+int
+mtk_printf(const char *fmt, ...)
+{
+	char buf[512];
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	n = vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	if (n < 0)
+		return n;
+	if (n >= (int)sizeof(buf))
+		n = sizeof(buf) - 1;
+
+	SInt64 pos = OSAddAtomic64(n, &mtk_log_head);
+	for (int i = 0; i < n; i++)
+		mtk_log_ring[(pos + i) % MTK_LOG_RING_SIZE] = buf[i];
+	(printf)("%s", buf);
+	return n;
+}
+
+/*
+ * Copy log bytes starting at *cursor into out. Returns the number of bytes
+ * copied and advances *cursor; skips ahead if the ring already overwrote it.
+ */
+uint32_t
+mtk_log_read(uint64_t *cursor, char *out, uint32_t len, uint64_t *head_out)
+{
+	uint64_t head = (uint64_t)mtk_log_head;
+	uint64_t cur = *cursor;
+
+	if (head > MTK_LOG_RING_SIZE && cur < head - MTK_LOG_RING_SIZE)
+		cur = head - MTK_LOG_RING_SIZE;
+	if (cur > head)
+		cur = head;
+	uint32_t n = (uint32_t)((head - cur) < len ? (head - cur) : len);
+	for (uint32_t i = 0; i < n; i++)
+		out[i] = mtk_log_ring[(cur + i) % MTK_LOG_RING_SIZE];
+	*cursor = cur + n;
+	*head_out = head;
+	return n;
+}
+
 int mtk_compat_intr_index = -1;
 int mtk_compat_intr_is_msi = 0;
 

@@ -43,6 +43,7 @@ const IOControlMethodAction MtkWlanUserClient::sMethods[IOCTL_ID_MAX] {
     sTX_POWER_LEVEL,
     sNW_BSSID,
     sDEBUG,
+    sLOG,
 };
 
 bool MtkWlanUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties)
@@ -99,6 +100,12 @@ IOReturn MtkWlanUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
     if (!data) {
         return kIOReturnError;
     }
+    if (!isSet && selector == IOCTL_80211_DEBUG &&
+        arguments->structureOutputSize < sizeof(struct ioctl_debug))
+        return kIOReturnBadArgument;
+    if (!isSet && selector == IOCTL_80211_LOG &&
+        arguments->structureOutputSize < sizeof(struct ioctl_log))
+        return kIOReturnBadArgument;
     return sMethods[selector](this, data, isSet);
 }
 
@@ -420,6 +427,25 @@ sDEBUG(OSObject* target, void* data, bool isSet)
     }
     memset(data, 0, sizeof(struct ioctl_debug));
     that->fDriverController->fillDebug(data);
+    return kIOReturnSuccess;
+}
+
+extern uint32_t mtk_log_read(uint64_t *cursor, char *out, uint32_t len, uint64_t *head_out);
+
+IOReturn MtkWlanUserClient::
+sLOG(OSObject* target, void* data, bool isSet)
+{
+    MtkWlanUserClient *that = OSDynamicCast(MtkWlanUserClient, target);
+    struct ioctl_log *l = (struct ioctl_log *)data;
+    if (isSet) {
+        /* Rewind to the oldest byte still in the ring. */
+        that->fLogCursor = 0;
+        return kIOReturnSuccess;
+    }
+    memset(l, 0, sizeof(*l));
+    l->version = IOCTL_VERSION;
+    l->len = mtk_log_read(&that->fLogCursor, l->data, sizeof(l->data), &l->head);
+    l->cursor = that->fLogCursor;
     return kIOReturnSuccess;
 }
 

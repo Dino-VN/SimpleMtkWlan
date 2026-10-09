@@ -206,6 +206,23 @@ struct ioctl_debug {
     uint32_t nodes;
     int32_t intr_index;
     uint32_t intr_is_msi;
+    uint32_t port_valid;
+    uint32_t node_flags;
+    uint32_t wcid;
+    uint32_t rsn_supp_state;
+    uint32_t txdata_cpu, txdata_dma, txdata_cons;
+    uint32_t rx_delivered, rx_normal_mcu, rx_event, rx_notify;
+    uint32_t if_ierrors, if_oerrors;
+};
+
+#define MTK_LOG_CHUNK 3800
+
+struct ioctl_log {
+    unsigned int version;
+    uint32_t len;
+    uint64_t cursor;    /* position after this chunk */
+    uint64_t head;      /* total bytes ever logged */
+    char data[MTK_LOG_CHUNK];
 };
 
 #endif /* Common_h */
