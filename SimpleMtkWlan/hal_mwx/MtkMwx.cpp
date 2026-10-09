@@ -246,6 +246,9 @@ MCLGETL(struct mbuf *m, int how, size_t len)
  * larger requests need 16 KB jumbo clusters, which run out quickly. */
 #define MWX_FW_CHUNK	(4096 - sizeof(struct mwx_mcu_txd))
 
+extern int mtk_compat_intr_index;
+extern int mtk_compat_intr_is_msi;
+
 /* Times an MCU send slept on a full TX ring, or retried a failed
  * firmware chunk allocation (bring-up diagnostics). */
 static uint32_t mwx_ebusy_sleeps;
@@ -6823,6 +6826,8 @@ MtkMwx::fillDebug(void *out)
 	MWX_DBG_Q(sc->sc_txmcuq, txmcu);
 #undef MWX_DBG_Q
 	d->nodes = mwx_count_nodes(&sc->sc_ic);
+	d->intr_index = mtk_compat_intr_index;
+	d->intr_is_msi = mtk_compat_intr_is_msi;
 }
 
 IOReturn

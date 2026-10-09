@@ -204,6 +204,8 @@ struct ioctl_debug {
     uint32_t rxdata_cpu, rxdata_dma, rxdata_cons;
     uint32_t txmcu_cpu, txmcu_dma, txmcu_cons;
     uint32_t nodes;
+    int32_t intr_index;
+    uint32_t intr_is_msi;
 };
 
 #endif /* Common_h */

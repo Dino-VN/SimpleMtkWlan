@@ -124,10 +124,27 @@ void interruptTrampoline(OSObject *ih, IOInterruptEventSource *, int count) {
 	(void)_ih->func(_ih->arg); // jump to actual interrupt handler
 }
 
+/* IOInterruptEventSource index in use; -1 until established. */
+int mtk_compat_intr_index = -1;
+int mtk_compat_intr_is_msi = 0;
+
 void* pci_intr_establish(pci_chipset_tag_t pc, pci_intr_handle_t ih, int level, int (*handler)(void *), void *arg) {
 	ih->arg = arg;
 	ih->func = handler;
-	ih->intr = IOInterruptEventSource::interruptEventSource(ih, &interruptTrampoline, ih->dev);
+	/* Index 0 is the legacy INTx pin; it stalls on AMD (status stays
+	 * pending with no further interrupts). Prefer the MSI index. */
+	int index = 0, type = 0;
+	for (int i = 0; ih->dev->getInterruptType(i, &type) == kIOReturnSuccess; i++) {
+		if (type & kIOInterruptTypePCIMessaged) {
+			index = i;
+			mtk_compat_intr_is_msi = 1;
+			break;
+		}
+	}
+	mtk_compat_intr_index = index;
+	IOLog("SimpleMtkWlan: using interrupt index %d (%s)\n", index,
+	    mtk_compat_intr_is_msi ? "MSI" : "legacy INTx");
+	ih->intr = IOInterruptEventSource::interruptEventSource(ih, &interruptTrampoline, ih->dev, index);
 	
 	if (ih->intr == 0)
 		return 0;
