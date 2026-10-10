@@ -16,6 +16,10 @@
 
 extern IOCommandGate *_fCommandGate;
 
+// Join/leave decisions go to the driver log ring (mtkctl log); the kernel log
+// quarantines this kext once the data path gets chatty.
+#define WCL_LOG(fmt, ...) mtk_printf("AirportMtkWlan-wcl: " fmt, ##__VA_ARGS__)
+
 struct AirportMtkSkywalkInterface::CountryUpdate {
     AirportMtkSkywalkInterface *interface;
     AirportMtkWlan *controller;
@@ -366,6 +370,7 @@ IOReturn AirportMtkSkywalkInterface::beginWCLJoin(apple80211AssocCandidates *req
 {
     AirportWCL::JoinRequest join;
     if (!AirportWCL::decodeJoin(request, 0x2cc, join)) {
+        WCL_LOG("join decode failed\n");
         return kIOReturnBadArgument;
     }
     return startWCLJoin(join);
@@ -378,6 +383,14 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
     bool enterprise = auth == AirportWCL::LegacyAuth::Enterprise;
     bool supported = auth != AirportWCL::LegacyAuth::Invalid;
     ieee80211com *ic = fHalService->get80211Controller();
+    WCL_LOG("join ssid_len=%u bssid=%02x:%02x:%02x:%02x:%02x:%02x chspec=0x%04x auth=%d "
+            "lower=0x%x upper=0x%x key_len=%u cipher=%u rsn_len=%u state=%d if_flags=0x%x "
+            "join_pending=%d scan_pending=%d mac_reconfig=%d bgscan=%d\n",
+            join.ssidLength, join.bssid[0], join.bssid[1], join.bssid[2], join.bssid[3],
+            join.bssid[4], join.bssid[5], join.channelSpec, int(auth), join.lowerAuth,
+            join.upperAuth, join.keyLength, join.keyCipher, join.rsnLength, ic->ic_state,
+            ic->ic_if.if_flags, joinPending, scanPending, ic->ic_wcl_mac_reconfig,
+            !!(ic->ic_flags & IEEE80211_F_BGSCAN));
     // Applying a private MAC restarts firmware asynchronously. WCL can issue
     // the association before that restart has completed; keep one request
     // until the HAL reports READY rather than making the user retry it.
@@ -388,10 +401,20 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
         explicit_bzero(&join, sizeof(join));
         joinDeferred = joinPending = true;
         joinTimer->setTimeoutMS(30000);
+        WCL_LOG("join deferred until MAC reconfiguration completes\n");
         return kIOReturnSuccess;
+    }
+    // A user join outranks a scan: Control Center keeps the scan queue busy
+    // while the Wi-Fi menu is open. mwx_scan()/newstate cancel the HAL scan.
+    if (supported && !joinPending && scanPending) {
+        WCL_LOG("join aborts pending scan\n");
+        finishWCLScan(kIOReturnAborted);
     }
     if (!supported || !(ic->ic_if.if_flags & IFF_RUNNING) || joinPending || scanPending) {
         explicit_bzero(&join, sizeof(join));
+        WCL_LOG("join rejected: %s\n", !supported ? "unsupported auth" :
+                !(ic->ic_if.if_flags & IFF_RUNNING) ? "not running" :
+                joinPending ? "join pending" : "scan pending");
         return !supported ? kIOReturnUnsupported : kIOReturnBusy;
     }
     if (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
@@ -428,6 +451,8 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
         int error = ieee80211_ioctl_setwpaparms(ic, &wpa);
         if (error && error != ENETRESET) {
             explicit_bzero(&join, sizeof(join));
+            WCL_LOG("join rejected: setwpaparms error=%d protos=0x%x akms=0x%x\n",
+                    error, wpa.i_protos, wpa.i_akms);
             return kIOReturnBadArgument;
         }
         if (personal) {
@@ -475,6 +500,7 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
     disassocIsVoluntary = false;
     joinTimer->setTimeoutMS(30000);
     if (ic->ic_state != IEEE80211_S_SCAN && ic->ic_newstate(ic, IEEE80211_S_SCAN, -1)) {
+        WCL_LOG("join rejected: newstate SCAN failed\n");
         joinPending = false;
         joinTimer->cancelTimeout();
         ic->ic_wcl_join_requested = false;
@@ -506,6 +532,7 @@ void AirportMtkSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reason,
 {
     if (!joinPending)
         return;
+    WCL_LOG("join finished status=%u reason=%u driver=0x%x\n", status, reason, driverStatus);
     AirportWCL::ConnectionEvent event = {};
     event.status = status;
     event.reason = reason;
@@ -537,6 +564,7 @@ void AirportMtkSkywalkInterface::wclJoinTimeout(OSObject *owner, IOTimerEventSou
 IOReturn AirportMtkSkywalkInterface::leaveWCLNetwork()
 {
     ieee80211com *ic = fHalService->get80211Controller();
+    WCL_LOG("leave state=%d join_pending=%d\n", ic->ic_state, joinPending);
     joinPending = false;
     joinDeferred = false;
     explicit_bzero(&deferredJoin, sizeof(deferredJoin));

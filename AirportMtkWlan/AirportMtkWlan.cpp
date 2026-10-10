@@ -812,6 +812,11 @@ IOReturn AirportMtkWlan::setHardwareAddress(const void *addrP, UInt32 addrBytes)
     auto ic = fHalService->get80211Controller();
     bool initializing = (ic->ic_if.if_flags & IFF_UP) && !(ic->ic_if.if_flags & IFF_RUNNING);
     auto update = AirportWCL::planMacUpdate(ic->ic_myaddr, address, addrBytes, initializing);
+    if (addrBytes >= IEEE80211_ADDR_LEN)
+        mtk_printf("AirportMtkWlan-wcl: set mac %02x:%02x:%02x:%02x:%02x:%02x plan=%d "
+                   "state=%d if_flags=0x%x\n", address[0], address[1], address[2],
+                   address[3], address[4], address[5], int(update), ic->ic_state,
+                   ic->ic_if.if_flags);
     if (update == AirportWCL::MacUpdate::Invalid)
         return kIOReturnBadArgument;
     if (update == AirportWCL::MacUpdate::Busy) {
