@@ -383,6 +383,12 @@ struct mwx_setkey_task_arg {
 	struct ieee80211_key	*k;
 };
 
+struct mwx_ba_task_arg {
+	struct ieee80211_node	*ni;
+	uint8_t			tid;
+	uint8_t			start;
+};
+
 struct mwx_softc {
 	struct device		sc_dev;
 	struct ieee80211com	sc_ic;
@@ -424,6 +430,20 @@ struct mwx_softc {
 #define MWX_KNOB_LINEARIZE	0x01	/* copy TX frames into one segment */
 #define MWX_KNOB_DATA_RA	0x02	/* unicast data uses firmware rate control */
 #define MWX_KNOB_AUTORESET	0x04	/* full reset when WFDMA gets disabled */
+#define MWX_KNOB_NO_HT		0x08	/* associate as legacy 11a/g (next join) */
+#define MWX_KNOB_NO_VHT		0x10	/* do not offer 11ac (next join) */
+#define MWX_KNOB_NO_40		0x20	/* 20 MHz only (next join) */
+#define MWX_KNOB_NO_RXBA	0x40	/* refuse RX Block Ack agreements */
+#define MWX_KNOB_TX_VO		0x80	/* old behaviour: all frames on VO */
+	uint8_t			sc_bss_bw;	/* CMD_CBW_* used by the BSS */
+	uint8_t			sc_bss_center;	/* center channel for sc_bss_bw */
+	struct task		sc_ba_task;
+	struct mwx_ba_task_arg	sc_ba_arg[16];
+	u_int			sc_ba_cur, sc_ba_tail;
+	uint32_t		sc_rx_mode_cnt[16];	/* data frames per PHY mode */
+	uint32_t		sc_rx_cur_rate;		/* RXV word 0, current frame */
+	uint32_t		sc_rx_data_rate;	/* RXV word 0, last data frame */
+	uint32_t		sc_rx_data_cnt;
 	uint32_t		sc_dma_stalls;
 	uint32_t		sc_full_resets;
 	uint32_t		sc_mcu_cmd_irqs;
@@ -715,7 +735,7 @@ int		mt7921_mcu_hw_scan(struct mwx_softc *, int);
 int		mt7921_mcu_hw_scan_cancel(struct mwx_softc *);
 int		mt7921_mcu_set_mac_enable(struct mwx_softc *, int, int);
 int		mt7921_mcu_set_channel_domain(struct mwx_softc *);
-uint8_t		mt7921_mcu_chan_bw(struct ieee80211_channel *channel);
+uint8_t		mt7921_mcu_chan_bw(struct ieee80211_node *);
 int		mt7921_mcu_set_chan_info(struct mwx_softc *, int);
 void		mt7921_mcu_build_sku(struct mwx_softc *, int, int8_t *);
 int		mt7921_mcu_rate_txpower_band(struct mwx_softc *, int,
@@ -740,9 +760,16 @@ void		mwx_mac_tx_free(struct mwx_softc *, struct mbuf *);
 int		mt7921_set_channel(struct mwx_softc *);
 int mt7921_mcu_set_associated_bss(struct mwx_softc *, int);
 int mt7921_mcu_set_associated_peer(struct mwx_softc *);
+void		mwx_apply_phy_knobs(struct mwx_softc *);
+void		mwx_set_bss_bw(struct mwx_softc *, struct ieee80211_node *);
+int		mwx_ampdu_rx_start(struct ieee80211com *,
+		    struct ieee80211_node *, uint8_t);
+void		mwx_ampdu_rx_stop(struct ieee80211com *,
+		    struct ieee80211_node *, uint8_t);
+void		mwx_ba_task(void *);
+int		mt7921_mcu_sta_rx_ba(struct mwx_softc *,
+		    struct ieee80211_node *, uint8_t, int);
 
-uint8_t		 mt7921_get_phy_mode_v2(struct mwx_softc *,
-		    struct ieee80211_node *);
 struct mbuf	*mwx_alloc_sta_req_tlv(int);
 void		*mwx_append_len(struct mbuf *, int);
 void		*mwx_append_tlv(struct mbuf *, uint16_t *, int, int);
@@ -751,13 +778,13 @@ struct mbuf	*mwx_fill_sta_req_hdr(struct mbuf *, struct mwx_vif *,
 void		 mt7921_mcu_add_basic_tlv(struct mbuf *, uint16_t *,
 		    struct mwx_softc *, struct ieee80211_node *, int, int);
 void		 mt7921_mcu_add_sta_tlv(struct mbuf *, uint16_t *,
-		    struct mwx_softc *, struct ieee80211_node *, int, int);
+		    struct mwx_softc *, struct ieee80211_node *, int);
 int		 mt7921_mcu_wtbl_generic_tlv(struct mbuf *, uint16_t *,
 		    struct mwx_softc *, struct ieee80211_node *);
 int		 mt7921_mcu_wtbl_hdr_trans_tlv(struct mbuf *, uint16_t *,
 		    struct mwx_softc *, struct ieee80211_node *);
 int		 mt7921_mcu_wtbl_ht_tlv(struct mbuf *, uint16_t *,
-		    struct mwx_softc *, struct ieee80211_node *);
+		    struct mwx_softc *, struct ieee80211_node *, int);
 int		 mt7921_mac_sta_update(struct mwx_softc *,
 		    struct ieee80211_node *, int, int);
 void		 mt7921_mcu_add_key_tlv(struct mbuf *, uint16_t *,
@@ -1003,7 +1030,9 @@ mwx_stop(struct ifnet *ifp)
 		task_del(sc->sc_nswq, &sc->sc_bgscan_done_task);
 		task_del(sc->sc_nswq, &sc->sc_setkey_task);
 		task_del(sc->sc_nswq, &sc->sc_reset_task);
+		task_del(sc->sc_nswq, &sc->sc_ba_task);
 	}
+	sc->sc_ba_cur = sc->sc_ba_tail = 0;
 	task_del(systq, &sc->sc_scan_task);
 	timeout_del(&sc->sc_reset_to);
 	timeout_del(&sc->sc_scan_to);
@@ -1330,6 +1359,12 @@ mwx_newstate_task(void *ptr)
 	DPRINTF("%s: %s %d -> %d\n", DEVNAME(sc), __func__, ostate, nstate);
 	MWX_DEV_LOG(sc, "newstate task %d -> %d arg=%d\n", ostate, nstate, arg);
 
+	/* Scan, auth and assoc run on the primary 20 MHz channel. */
+	if (nstate != IEEE80211_S_RUN) {
+		sc->sc_bss_bw = CMD_CBW_20MHZ;
+		sc->sc_bss_center = 0;
+	}
+
 	switch (nstate) {
 	case IEEE80211_S_INIT:
 		break;
@@ -1339,6 +1374,7 @@ mwx_newstate_task(void *ptr)
 			break;
 		break;
 	case IEEE80211_S_AUTH:
+		mwx_apply_phy_knobs(sc);
 		rv = mt7921_set_channel(sc);
 		if (rv)
 			break;
@@ -1354,6 +1390,20 @@ mwx_newstate_task(void *ptr)
 
 		mt7921_mcu_hw_scan_cancel(sc);
 		mwx_mcu_set_deep_sleep(sc, 0);
+		mwx_set_bss_bw(sc, ic->ic_bss);
+		if (sc->sc_bss_bw != CMD_CBW_20MHZ) {
+			rv = mt7921_set_channel(sc);
+			MWX_DEV_LOG(sc, "run channel switch bw=%u center=%u rv=%d\n",
+			    sc->sc_bss_bw, sc->sc_bss_center, rv);
+			if (rv) {
+				/* Stay usable on the primary channel. */
+				sc->sc_bss_bw = CMD_CBW_20MHZ;
+				sc->sc_bss_center = 0;
+				rv = mt7921_set_channel(sc);
+				if (rv)
+					break;
+			}
+		}
 		rv = mt7921_mcu_set_associated_bss(sc, 1);
 		if (!rv)
 			rv = mt7921_mcu_set_associated_peer(sc);
@@ -1675,6 +1725,24 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
 	}
 	sc->sc_rx_delivered++;
 
+	if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA &&
+	    sc->sc_rx_cur_rate != 0) {
+		/* RXV word 0: rate 6:0, nsts 9:7, bw 14:12, sgi 16:15, mode 27:24 */
+		uint32_t v = sc->sc_rx_cur_rate;
+
+		sc->sc_rx_mode_cnt[(v >> 24) & 0xf]++;
+		sc->sc_rx_data_rate = v;
+		if ((sc->sc_rx_data_cnt++ & 0xfff) == 0) {
+			MWX_DEV_LOG(sc,
+			    "rx rate mode=%u mcs=%u nss=%u bw=%u sgi=%u frames cck=%u ofdm=%u ht=%u vht=%u\n",
+			    (v >> 24) & 0xf, v & 0x7f, ((v >> 7) & 0x7) + 1,
+			    (v >> 12) & 0x7, (v >> 15) & 0x3,
+			    sc->sc_rx_mode_cnt[0], sc->sc_rx_mode_cnt[1],
+			    sc->sc_rx_mode_cnt[2] + sc->sc_rx_mode_cnt[3],
+			    sc->sc_rx_mode_cnt[4]);
+		}
+	}
+
 #if NBPFILTER > 0
 	if (__predict_false(sc->sc_drvbpf != NULL)) {
 		struct mwx_rx_radiotap_header *tap = &sc->sc_rxtap;
@@ -1817,6 +1885,19 @@ mwx_preinit(struct mwx_softc *sc)
 
 	ic->ic_sup_rates[IEEE80211_MODE_11B] = ieee80211_std_rateset_11b;
 	ic->ic_sup_rates[IEEE80211_MODE_11G] = ieee80211_std_rateset_11g;
+
+	/* HT MCS 0-7 and VHT MCS 0-9 for each spatial stream. */
+	memset(ic->ic_sup_mcs, 0, sizeof(ic->ic_sup_mcs));
+	ic->ic_vht_rx_mcs_map = 0xffff;
+	for (i = 0; i < MAX(1, MIN(sc->sc_capa.num_streams, 2)); i++) {
+		ic->ic_sup_mcs[i] = 0xff;
+		ic->ic_vht_rx_mcs_map &= ~(0x3 << (2 * i));
+		ic->ic_vht_rx_mcs_map |=
+		    IEEE80211_VHT_MCS_SUPPORT_0_9 << (2 * i);
+	}
+	ic->ic_vht_tx_mcs_map = ic->ic_vht_rx_mcs_map;
+	ic->ic_vht_rx_highest = ic->ic_vht_tx_highest = 0;
+	ic->ic_tx_mcs_set = IEEE80211_TX_MCS_SET_DEFINED;
 	MWX_DEV_LOG(sc, "preinit capability 2ghz=%d 5ghz=%d 6ghz=%d streams=%u antenna_mask=0x%x\n",
 	    sc->sc_capa.has_2ghz, sc->sc_capa.has_5ghz,
 	    sc->sc_capa.has_6ghz, sc->sc_capa.num_streams,
@@ -1830,7 +1911,7 @@ mwx_preinit(struct mwx_softc *sc)
 			ic->ic_channels[chan].ic_flags =
 			    IEEE80211_CHAN_CCK | IEEE80211_CHAN_OFDM |
 			    IEEE80211_CHAN_DYN | IEEE80211_CHAN_2GHZ;
-			/* TODO 11n and 11ac flags */
+			ic->ic_channels[chan].ic_flags |= IEEE80211_CHAN_HT;
 		}
 
 	}
@@ -1843,7 +1924,9 @@ mwx_preinit(struct mwx_softc *sc)
 			ic->ic_channels[chan].ic_freq =
 			    ieee80211_ieee2mhz(chan, IEEE80211_CHAN_5GHZ);
 			ic->ic_channels[chan].ic_flags = IEEE80211_CHAN_A;
-			/* TODO 11n and 11ac flags */
+			ic->ic_channels[chan].ic_flags |= IEEE80211_CHAN_HT |
+			    IEEE80211_CHAN_VHT20 | IEEE80211_CHAN_VHT40 |
+			    IEEE80211_CHAN_VHT80;
 		}
 	}
 #ifdef NOTYET
@@ -1988,8 +2071,9 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 
 	/* Set device capabilities. */
 	ic->ic_caps =
+	    IEEE80211_C_QOS |		/* WMM, required for HT/VHT */
 #if NOTYET
-	    IEEE80211_C_QOS | IEEE80211_C_TX_AMPDU | /* A-MPDU */
+	    IEEE80211_C_TX_AMPDU | /* A-MPDU */
 	    IEEE80211_C_ADDBA_OFFLOAD | /* device sends ADDBA/DELBA frames */
 #endif
 	    IEEE80211_C_WEP |		/* WEP */
@@ -2005,25 +2089,24 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	    IEEE80211_C_SHSLOT |	/* short slot time supported */
 	    IEEE80211_C_SHPREAMBLE;	/* short preamble supported */
 
-#if NOTYET
+	/*
+	 * HT/VHT receive capabilities. A-MSDU stays at the 3839/3895 byte
+	 * minimum and is not offered inside A-MPDUs because the RX path does
+	 * not handle hardware A-MSDU de-aggregation yet. The MCS sets are
+	 * filled in by mwx_preinit() once the stream count is known.
+	 */
 	ic->ic_htcaps = IEEE80211_HTCAP_SGI20 | IEEE80211_HTCAP_SGI40;
 	ic->ic_htcaps |= IEEE80211_HTCAP_CBW20_40;
 	ic->ic_htcaps |=
 	    (IEEE80211_HTCAP_SMPS_DIS << IEEE80211_HTCAP_SMPS_SHIFT);
-#endif
 	ic->ic_htxcaps = 0;
 	ic->ic_txbfcaps = 0;
 	ic->ic_aselcaps = 0;
 	ic->ic_ampdu_params = (IEEE80211_AMPDU_PARAM_SS_4 | 0x3 /* 64k */);
 
-#if NOTYET
-	ic->ic_vhtcaps = IEEE80211_VHTCAP_MAX_MPDU_LENGTH_11454 |
-	    (IEEE80211_VHTCAP_MAX_AMPDU_LEN_64K <<
-	    IEEE80211_VHTCAP_MAX_AMPDU_LEN_SHIFT) |
-	    (IEEE80211_VHTCAP_CHAN_WIDTH_80 <<
-	    IEEE80211_VHTCAP_CHAN_WIDTH_SHIFT) | IEEE80211_VHTCAP_SGI80 |
-	    IEEE80211_VHTCAP_RX_ANT_PATTERN | IEEE80211_VHTCAP_TX_ANT_PATTERN;
-#endif
+	ic->ic_vhtcaps = IEEE80211_VHTCAP_MAX_MPDU_LENGTH_3895 |
+	    IEEE80211_VHTCAP_SHORT_GI_80 |
+	    (3 << IEEE80211_VHTCAP_MAX_A_MPDU_LENGTH_EXPONENT_SHIFT);
 
 	/* IBSS channel undefined for now. */
 	ic->ic_ibss_chan = &ic->ic_channels[1];
@@ -2061,6 +2144,8 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	ic->ic_bgscan_done = mwx_bgscan_done;
 	ic->ic_set_key = mwx_set_key;
 	ic->ic_delete_key = mwx_delete_key;
+	ic->ic_ampdu_rx_start = mwx_ampdu_rx_start;
+	ic->ic_ampdu_rx_stop = mwx_ampdu_rx_stop;
 
 	/* Override 802.11 state transition machine. */
 	sc->sc_newstate = ic->ic_newstate;
@@ -2082,6 +2167,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	timeout_set(&sc->sc_dma_to, mwx_dma_timeo, sc);
 	sc->sc_knobs = MWX_KNOB_DATA_RA;
 	task_set(&sc->sc_fullreset_task, mwx_fullreset_task, sc, "mwx_fullreset");
+	task_set(&sc->sc_ba_task, mwx_ba_task, sc, "mwx_ba");
 
 	/*
 	 * We cannot read the MAC address without loading the
@@ -4840,19 +4926,49 @@ mt7921_mcu_set_channel_domain(struct mwx_softc *sc)
 }
 
 uint8_t
-mt7921_mcu_chan_bw(struct ieee80211_channel *channel)
+mt7921_mcu_chan_bw(struct ieee80211_node *ni)
 {
 	/*
-	 * following modes are not yet supported
-	 *  CMD_CBW_5MHZ, CMD_CBW_10MHZ, CMD_CBW_8080MHZ
+	 * Use the width negotiated with the AP, not the channel's
+	 * capability flags. CMD_CBW_5MHZ and CMD_CBW_10MHZ are not used.
 	 */
-	if (channel->ic_flags & IEEE80211_CHAN_VHT160)
-		return CMD_CBW_160MHZ;
-	if (channel->ic_flags & IEEE80211_CHAN_VHT80)
-		return CMD_CBW_80MHZ;
-	if (channel->ic_flags & IEEE80211_CHAN_40MHZ)
+	switch (ni->ni_chw) {
+	case IEEE80211_CHAN_WIDTH_40:
 		return CMD_CBW_40MHZ;
-	return CMD_CBW_20MHZ;
+	case IEEE80211_CHAN_WIDTH_80:
+		return CMD_CBW_80MHZ;
+	case IEEE80211_CHAN_WIDTH_80P80:
+		return CMD_CBW_8080MHZ;
+	case IEEE80211_CHAN_WIDTH_160:
+		return CMD_CBW_160MHZ;
+	default:
+		return CMD_CBW_20MHZ;
+	}
+}
+
+/*
+ * Record the BSS width negotiated in the (re)association response.
+ * Until then (scan, auth, assoc) the radio stays on the primary 20 MHz.
+ */
+void
+mwx_set_bss_bw(struct mwx_softc *sc, struct ieee80211_node *ni)
+{
+	struct ieee80211_channel *c;
+
+	sc->sc_bss_bw = CMD_CBW_20MHZ;
+	sc->sc_bss_center = 0;
+	if (ni == NULL || ni->ni_chan == NULL ||
+	    ni->ni_chan == IEEE80211_CHAN_ANYC)
+		return;
+	if ((ni->ni_flags & (IEEE80211_NODE_HT | IEEE80211_NODE_VHT)) == 0)
+		return;
+	c = ni->ni_chan;
+	sc->sc_bss_bw = mt7921_mcu_chan_bw(ni);
+	if (sc->sc_bss_bw == CMD_CBW_20MHZ || c->ic_center_freq1 == 0) {
+		sc->sc_bss_bw = CMD_CBW_20MHZ;
+		return;
+	}
+	sc->sc_bss_center = ieee80211_mhz2ieee(c->ic_center_freq1, c->ic_flags);
 }
 
 int
@@ -4889,9 +5005,13 @@ mt7921_mcu_set_chan_info(struct mwx_softc *sc, int cmd)
 
 	req.control_ch = ieee80211_mhz2ieee(channel->ic_freq,
 		    channel->ic_flags);
-	req.center_ch = ieee80211_mhz2ieee(channel->ic_freq,
-		    channel->ic_flags);
-	req.bw = mt7921_mcu_chan_bw(channel);
+	req.center_ch = req.control_ch;
+	req.bw = CMD_CBW_20MHZ;
+	if (sc->sc_ic.ic_opmode == IEEE80211_M_STA &&
+	    sc->sc_ic.ic_bss != NULL && sc->sc_bss_bw != CMD_CBW_20MHZ) {
+		req.bw = sc->sc_bss_bw;
+		req.center_ch = sc->sc_bss_center;
+	}
 
 #ifdef NOTYET
 	if (channel->ic_flags & IEEE80211_CHAN_6GHZ)
@@ -5436,6 +5556,7 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 	int i;
 //	bool insert_ccmp_hdr = false;
 
+	sc->sc_rx_cur_rate = 0;
 	if (mbuf_len(m) < num_rxd * sizeof(uint32_t)) {
 		if (sc->sc_rx_fill_fail < 64) {
 			MWX_DEV_LOG(sc,
@@ -5556,7 +5677,8 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 		num_rxd += 2;
 		rxd += 2;
 
-		v0 = le32toh(rxv[0]); /* XXX not implemented yet */ 
+		v0 = le32toh(rxv[0]);
+		sc->sc_rx_cur_rate = v0;
 		v1 = le32toh(rxv[1]);
 
 		if (rxd1 & MT_RXD1_NORMAL_GROUP_5) {
@@ -6037,9 +6159,19 @@ mt7921_mac_write_txwi(struct mwx_softc *sc, struct mbuf *m,
 		p_fmt = MT_TX_TYPE_CT;
 		q_idx = MT_LMAC_ALTX0;
 	} else {
+		/* LMAC queues: BK=0 BE=1 VI=2 VO=3, indexed by QoS TID. */
+		static const uint8_t tid_to_lmac[] = { 1, 0, 0, 1, 2, 2, 3, 3 };
+		uint8_t lmac_ac = mt7921_lmac_mapping(0);	/* VO */
+
+		/* Management stays on VO, data uses BE unless QoS says otherwise. */
+		if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) ==
+		    IEEE80211_FC0_TYPE_DATA &&
+		    (sc->sc_knobs & MWX_KNOB_TX_VO) == 0)
+			lmac_ac = ieee80211_has_qos(wh) ?
+			    tid_to_lmac[ieee80211_get_qos(wh) &
+			    IEEE80211_QOS_TID & 7] : tid_to_lmac[0];
 		p_fmt = MT_TX_TYPE_CT;
-		q_idx = wmm_idx * MWX_MAX_WMM_SETS +
-		    mt7921_lmac_mapping(/* skb_get_queue_mapping(skb) */ 0);
+		q_idx = wmm_idx * MWX_MAX_WMM_SETS + lmac_ac;
 
 #ifdef NOTYET
 		/* counting non-offloading skbs */
@@ -6152,36 +6284,6 @@ mt7921_set_channel(struct mwx_softc *sc)
 
 	/* restart queues */
 	return 0;
-}
-
-uint8_t
-mt7921_get_phy_mode_v2(struct mwx_softc *sc, struct ieee80211_node *ni)
-{
-	uint8_t mode = 0;
-
-	if (ni == NULL)
-		ni = sc->sc_ic.ic_bss;
-
-	if (IEEE80211_IS_CHAN_2GHZ(ni->ni_chan)) {
-		mode |= PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP;
-		if (ieee80211_node_supports_ht(ni))
-			mode |= PHY_TYPE_BIT_HT;
-#ifdef NOTYET
-		if (ieee80211_node_supports_he(ni))
-			mode |= PHY_TYPE_BIT_HE;
-#endif
-	} else if (IEEE80211_IS_CHAN_5GHZ(ni->ni_chan) /* || CHAN_6GHZ */) {
-		mode |= PHY_TYPE_BIT_OFDM;
-		if (ieee80211_node_supports_ht(ni))
-			mode |= PHY_TYPE_BIT_HT;
-		if (ieee80211_node_supports_vht(ni))
-			mode |= PHY_TYPE_BIT_VHT;
-#ifdef NOTYET
-		if (ieee80211_node_supports_he(ni))
-			mode |= PHY_TYPE_BIT_HE;
-#endif
-	}
-	return mode;
 }
 
 struct mbuf *
@@ -6314,110 +6416,157 @@ mt7921_mcu_add_basic_tlv(struct mbuf *m, uint16_t *tlvnum, struct mwx_softc *sc,
 	basic->qos = (ni->ni_flags & IEEE80211_NODE_QOS) != 0;
 }
 
+/* Index of a legacy rate in the mt76 band rate table, or -1. */
+static int
+mwx_legacy_rate_idx(int is_2g, uint8_t rate)
+{
+	static const uint8_t cck[] = { 2, 4, 11, 22 };
+	static const uint8_t ofdm[] = { 12, 18, 24, 36, 48, 72, 96, 108 };
+	int i;
+
+	for (i = 0; is_2g && i < (int)nitems(cck); i++)
+		if (cck[i] == rate)
+			return i;
+	for (i = 0; i < (int)nitems(ofdm); i++)
+		if (ofdm[i] == rate)
+			return i + (is_2g ? (int)nitems(cck) : 0);
+	return -1;
+}
+
+/*
+ * Intersect a peer VHT MCS map with ours: per stream keep the lower
+ * of both maximum MCS values, 3 means "not supported".
+ */
+static uint16_t
+mwx_vht_mcs_map(uint16_t peer, uint16_t own)
+{
+	uint16_t map = 0;
+	int i;
+
+	for (i = 0; i < 8; i++) {
+		uint8_t p = (peer >> (2 * i)) & 3, o = (own >> (2 * i)) & 3;
+		uint8_t v;
+
+		if (p == IEEE80211_VHT_MCS_NOT_SUPPORTED ||
+		    o == IEEE80211_VHT_MCS_NOT_SUPPORTED)
+			v = IEEE80211_VHT_MCS_NOT_SUPPORTED;
+		else
+			v = MIN(p, o);
+		map |= v << (2 * i);
+	}
+	return map;
+}
+
+/*
+ * Station record TLVs (HT, VHT, PHY, RA, STATE) as in
+ * mt76_connac_mcu_sta_tlv(). HT/VHT information is only sent once the
+ * association response has been processed (assoc != 0); before that
+ * the node only carries what the AP advertised, not what was negotiated.
+ */
 void
 mt7921_mcu_add_sta_tlv(struct mbuf *m, uint16_t *tlvnum, struct mwx_softc *sc,
-    struct ieee80211_node *ni, int add, int isnew)
+    struct ieee80211_node *ni, int assoc)
 {
-	//struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211com *ic = &sc->sc_ic;
 	struct sta_rec_ra_info *ra_info;
 	struct sta_rec_state *state;
 	struct sta_rec_phy *phy;
-	uint16_t supp_rates;
+	uint16_t supp_rates = 0, basic_rates = 0;
+	int is_2g, ht, vht, i, idx;
 
-#ifdef NOTYET
-	/* sta rec ht */
-	if (sta->deflink.ht_cap.ht_supported) {
-		struct sta_rec_ht *ht;
+	is_2g = IEEE80211_IS_CHAN_2GHZ(ni->ni_chan);
+	ht = assoc && (ni->ni_flags & IEEE80211_NODE_HT) != 0;
+	vht = ht && !is_2g && (ni->ni_flags & IEEE80211_NODE_VHT) != 0;
 
-		ht = mwx_append_tlv(m, tlvnum, STA_REC_HT, sizeof(*ht));
-		ht->ht_cap = htole16(sta->deflink.ht_cap.cap);
+	if (ht) {
+		struct sta_rec_ht *sht;
+		uint16_t cap = ni->ni_htcaps;
+
+		if (sc->sc_bss_bw == CMD_CBW_20MHZ)
+			cap &= ~(IEEE80211_HTCAP_CBW20_40 |
+			    IEEE80211_HTCAP_SGI40);
+		cap &= ~((IEEE80211_HTCAP_SGI20 | IEEE80211_HTCAP_SGI40) &
+		    ~ic->ic_htcaps);
+		sht = (struct sta_rec_ht *)mwx_append_tlv(m, tlvnum,
+		    STA_REC_HT, sizeof(*sht));
+		sht->ht_cap = htole16(cap);
 	}
 
-	/* sta rec vht */
-	if (sta->deflink.vht_cap.vht_supported) {
-		struct sta_rec_vht *vht;
+	if (vht) {
+		struct sta_rec_vht *svht;
 
-		vht = mwx_append_tlv(m, tlvnum, STA_REC_VHT,
-		    sizeof(*vht));
-		vht->vht_cap = htole32(sta->deflink.vht_cap.cap);
-		vht->vht_rx_mcs_map = sta->deflink.vht_cap.vht_mcs.rx_mcs_map;
-		vht->vht_tx_mcs_map = sta->deflink.vht_cap.vht_mcs.tx_mcs_map;
+		svht = (struct sta_rec_vht *)mwx_append_tlv(m, tlvnum,
+		    STA_REC_VHT, sizeof(*svht));
+		svht->vht_cap = htole32(ni->ni_vhtcaps);
+		svht->vht_rx_mcs_map = htole16(mwx_vht_mcs_map(
+		    le16toh(ni->ni_vht_mcsinfo.rx_mcs_map),
+		    ic->ic_vht_tx_mcs_map));
+		svht->vht_tx_mcs_map = htole16(mwx_vht_mcs_map(
+		    le16toh(ni->ni_vht_mcsinfo.tx_mcs_map),
+		    ic->ic_vht_rx_mcs_map));
 	}
 
-	/* sta rec uapsd */
-	/* from function:
-		if (vif->type != NL80211_IFTYPE_AP || !sta->wme)
-			return;
-	*/
-	mt7921_mcu_sta_uapsd(m, tlvnum, vif, ni);
-#endif
+	/* Legacy rate bitmaps, indexed like the mt76 band rate tables. */
+	for (i = 0; i < ni->ni_rates.rs_nrates; i++) {
+		uint8_t r = ni->ni_rates.rs_rates[i];
 
-#ifdef NOTYET
-	if (sta->deflink.ht_cap.ht_supported || sta->deflink.he_cap.has_he)
-		mt76_connac_mcu_sta_amsdu_tlv(skb, sta, vif);
-
-	/* sta rec he */
-	if (sta->deflink.he_cap.has_he) {
-		mt76_connac_mcu_sta_he_tlv(skb, sta);
-		if (band == NL80211_BAND_6GHZ &&
-		    sta_state == MT76_STA_INFO_STATE_ASSOC) {
-			struct sta_rec_he_6g_capa *he_6g_capa;
-
-			he_6g_capa = mwx_append_tlv(m, tlvnum,
-			    STA_REC_HE_6G, sizeof(*he_6g_capa));
-			he_6g_capa->capa = sta->deflink.he_6ghz_capa.capa;
-		}
+		idx = mwx_legacy_rate_idx(is_2g, r & IEEE80211_RATE_VAL);
+		if (idx < 0)
+			continue;
+		supp_rates |= 1U << idx;
+		if (r & IEEE80211_RATE_BASIC)
+			basic_rates |= 1U << idx;
 	}
-#endif
 
 	phy = (struct sta_rec_phy *)mwx_append_tlv(m, tlvnum, STA_REC_PHY,
 	    sizeof(*phy));
-	/* XXX basic_rates: bitmap of basic rates, each bit stands for an
-	 *      index into the rate table configured by the driver in
-	 *      the current band.
-	 */
-	phy->basic_rate = htole16(0x0150); /* XXX */
-	phy->phy_type = mt7921_get_phy_mode_v2(sc, ni);
-#ifdef NOTYET
-	phy->ampdu = FIELD_PREP(IEEE80211_HT_AMPDU_PARM_FACTOR,
-	    sta->deflink.ht_cap.ampdu_factor) |
-	    FIELD_PREP(IEEE80211_HT_AMPDU_PARM_DENSITY,
-	    sta->deflink.ht_cap.ampdu_density);
-#endif
+	phy->basic_rate = htole16(basic_rates ? basic_rates : 0x0150);
+	phy->phy_type = is_2g ? PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP :
+	    PHY_TYPE_BIT_OFDM;
+	if (ht)
+		phy->phy_type |= PHY_TYPE_BIT_HT;
+	if (vht)
+		phy->phy_type |= PHY_TYPE_BIT_VHT;
+	/* A-MPDU factor (bits 1:0) and density (bits 4:2) */
+	if (ht)
+		phy->ampdu = ni->ni_ampdu_param &
+		    (IEEE80211_AMPDU_PARAM_LE | IEEE80211_AMPDU_PARAM_SS);
 	// XXX phy->rcpi = rssi_to_rcpi(-ewma_rssi_read(&sc->sc_vif.rssi));
 	phy->rcpi = 0xdc;	/* XXX STOLEN FROM LINUX DUMP */
 
-#ifdef HACK
-	supp_rates = sta->deflink.supp_rates[band];
-	if (band == NL80211_BAND_2GHZ)
-		supp_rates = FIELD_PREP(RA_LEGACY_OFDM, supp_rates >> 4) |
-		FIELD_PREP(RA_LEGACY_CCK, supp_rates & 0xf);
+	if (is_2g)
+		supp_rates = ((supp_rates >> 4) << 6 & RA_LEGACY_OFDM) |
+		    (supp_rates & RA_LEGACY_CCK);
 	else
-		supp_rates = FIELD_PREP(RA_LEGACY_OFDM, supp_rates);
-#else
-	supp_rates = RA_LEGACY_OFDM;
-#endif
+		supp_rates = (supp_rates << 6) & RA_LEGACY_OFDM;
+	if (supp_rates == 0)
+		supp_rates = RA_LEGACY_OFDM;
 
 	ra_info = (struct sta_rec_ra_info *)mwx_append_tlv(m, tlvnum,
 	    STA_REC_RA, sizeof(*ra_info));
 	ra_info->legacy = htole16(supp_rates);
-#ifdef NOTYET
-	if (sta->deflink.ht_cap.ht_supported)
-		memcpy(ra_info->rx_mcs_bitmask,
-			sta->deflink.ht_cap.mcs.rx_mask,
-			HT_MCS_MASK_NUM);
-#endif
+	if (ht) {
+		/* MCS the AP can receive, limited to our TX streams. */
+		for (i = 0; i < HT_MCS_MASK_NUM; i++)
+			ra_info->rx_mcs_bitmask[i] =
+			    ni->ni_rxmcs[i] & ic->ic_sup_mcs[i];
+	}
 
 	state = (struct sta_rec_state *)mwx_append_tlv(m, tlvnum,
 	    STA_REC_STATE, sizeof(*state));
-	state->state = /* XXX sta_state */ 0;
-#ifdef NOTYET
-	if (sta->deflink.vht_cap.vht_supported) {
-		state->vht_opmode = sta->deflink.bandwidth;
-		state->vht_opmode |= (sta->deflink.rx_nss - 1) <<
-			IEEE80211_OPMODE_NOTIF_RX_NSS_SHIFT;
+	/* MT76_STA_INFO_STATE_NONE=0, AUTH=1, ASSOC=2 */
+	state->state = assoc ? 2 : 0;
+	if (vht) {
+		uint8_t nss = MAX(1, MIN(ni->ni_rx_nss,
+		    MAX(1, sc->sc_capa.num_streams)));
+		uint8_t bw = sc->sc_bss_bw;
+
+		/* IEEE80211_STA_RX_BW_20/40/80/160 */
+		if (bw > CMD_CBW_160MHZ)
+			bw = bw == CMD_CBW_8080MHZ ? CMD_CBW_160MHZ :
+			    CMD_CBW_20MHZ;
+		state->vht_opmode = bw | ((nss - 1) << 4);
 	}
-#endif
 }
 
 int
@@ -6477,18 +6626,44 @@ mt7921_mcu_wtbl_hdr_trans_tlv(struct mbuf *m, uint16_t *tlvnum,
 
 int
 mt7921_mcu_wtbl_ht_tlv(struct mbuf *m, uint16_t *tlvnum,
-    struct mwx_softc *sc, struct ieee80211_node *ni)
+    struct mwx_softc *sc, struct ieee80211_node *ni, int assoc)
 {
 	struct wtbl_smps *smps;
+	struct wtbl_ht *ht = NULL;
+	int len = 0;
 
-	/* XXX lots missing here */
+	if (assoc && (ni->ni_flags & IEEE80211_NODE_HT)) {
+		ht = (struct wtbl_ht *)mwx_append_tlv(m, tlvnum, WTBL_HT,
+		    sizeof(*ht));
+		ht->ht = 1;
+		ht->ldpc = (ni->ni_htcaps & IEEE80211_HTCAP_LDPC) != 0;
+		ht->af = ni->ni_ampdu_param & IEEE80211_AMPDU_PARAM_LE;
+		ht->mm = (ni->ni_ampdu_param & IEEE80211_AMPDU_PARAM_SS) >> 2;
+		len += sizeof(*ht);
+	}
+
+	if (ht != NULL && (ni->ni_flags & IEEE80211_NODE_VHT) &&
+	    !IEEE80211_IS_CHAN_2GHZ(ni->ni_chan)) {
+		struct wtbl_vht *vht;
+		uint8_t af;
+
+		vht = (struct wtbl_vht *)mwx_append_tlv(m, tlvnum, WTBL_VHT,
+		    sizeof(*vht));
+		vht->ldpc = (ni->ni_vhtcaps & IEEE80211_VHTCAP_RXLDPC) != 0;
+		vht->vht = 1;
+		af = (ni->ni_vhtcaps &
+		    IEEE80211_VHTCAP_MAX_A_MPDU_LENGTH_EXPONENT_MASK) >>
+		    IEEE80211_VHTCAP_MAX_A_MPDU_LENGTH_EXPONENT_SHIFT;
+		ht->af = MAX(ht->af, af);
+		len += sizeof(*vht);
+	}
 
 	smps = (struct wtbl_smps *)mwx_append_tlv(m, tlvnum, WTBL_SMPS,
 	    sizeof(*smps));
 	/* spatial multiplexing power save mode, off for now */
 	//smps->smps = (sta->deflink.smps_mode == IEEE80211_SMPS_DYNAMIC);
 
-	return sizeof(*smps);
+	return len + sizeof(*smps);
 }
 
 int
@@ -6510,7 +6685,7 @@ mt7921_mac_sta_update(struct mwx_softc *sc, struct ieee80211_node *ni,
 		mt7921_mcu_add_basic_tlv(m, &tlvnum, sc, ni, add, isnew);
 
 	if (ni != NULL && add)
-		mt7921_mcu_add_sta_tlv(m, &tlvnum, sc, ni, add, isnew);
+		mt7921_mcu_add_sta_tlv(m, &tlvnum, sc, ni, 0);
 
 	wtbl = (struct sta_rec_wtbl *)mwx_append_tlv(m, &tlvnum,
 	    STA_REC_WTBL, sizeof(*wtbl));
@@ -6523,7 +6698,7 @@ mt7921_mac_sta_update(struct mwx_softc *sc, struct ieee80211_node *ni,
 		wlen += mt7921_mcu_wtbl_hdr_trans_tlv(m, &wnum, sc, ni);
 
 		if (ni)
-			wlen += mt7921_mcu_wtbl_ht_tlv(m, &wnum, sc, ni);
+			wlen += mt7921_mcu_wtbl_ht_tlv(m, &wnum, sc, ni, 0);
 	}
 
 	wtbl->tlv_num = htole16(wnum);
@@ -7107,24 +7282,58 @@ static int mwx_send_assoc_status(struct mwx_softc *sc, uint32_t cmd, void *data,
     return rv ? rv : (status ? EIO : 0);
 }
 
-/* Publish the associated peer without resetting WTBL or key state. */
-int mt7921_mcu_set_associated_peer(struct mwx_softc *sc)
+/*
+ * Publish the associated peer with its negotiated HT/VHT parameters.
+ * The WTBL is updated with WTBL_SET so the entry and any installed keys
+ * survive; only the generic (QoS) and HT/VHT fields are rewritten.
+ */
+int
+mt7921_mcu_set_associated_peer(struct mwx_softc *sc)
 {
-    struct ieee80211_node *ni = sc->sc_ic.ic_bss;
-    if (!ni || IEEE80211_AID(ni->ni_associd) == 0) return EINVAL;
-    struct mbuf *m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr));
-    if (!m) return ENOBUFS;
-    uint16_t tlvnum = 0;
-    mt7921_mcu_add_basic_tlv(m, &tlvnum, sc, ni, 1, 0);
-    struct sta_rec_state *state = (struct sta_rec_state *)mwx_append_tlv(m, &tlvnum, STA_REC_STATE, sizeof(*state));
-    state->state = 2; /* MT76_STA_INFO_STATE_ASSOC: NONE=0, AUTH=1, ASSOC=2. */
-    m = mwx_fill_sta_req_hdr(m, &sc->sc_vif, sc->sc_vif.omac_idx, ((struct mwx_node *)ni)->wcid, tlvnum);
-    if (!m) return ENOBUFS;
-    int seq, rv = mwx_mcu_send_mbuf(sc, MCU_UNI_CMD_STA_REC_UPDATE, m, &seq);
-    uint32_t status = 0;
-    if (!rv) rv = mwx_mcu_wait_resp_int(sc, MCU_UNI_CMD_STA_REC_UPDATE, seq, &status);
-    MWX_DEV_LOG(sc, "assoc_peer aid=%u state=2 transport=%d firmware=%u\n", IEEE80211_AID(ni->ni_associd), rv, status);
-    return rv ? rv : (status ? EIO : 0);
+	struct ieee80211_node *ni = sc->sc_ic.ic_bss;
+	struct mwx_node *mn = (struct mwx_node *)ni;
+	struct sta_rec_wtbl *wtbl;
+	struct mbuf *m;
+	uint16_t tlvnum = 0, wnum = 0;
+	uint32_t status = 0;
+	int wlen = 0, seq, rv;
+
+	if (!ni || IEEE80211_AID(ni->ni_associd) == 0)
+		return EINVAL;
+	m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr));
+	if (!m)
+		return ENOBUFS;
+
+	mt7921_mcu_add_basic_tlv(m, &tlvnum, sc, ni, 1, 0);
+	mt7921_mcu_add_sta_tlv(m, &tlvnum, sc, ni, 1);
+
+	wtbl = (struct sta_rec_wtbl *)mwx_append_tlv(m, &tlvnum,
+	    STA_REC_WTBL, sizeof(*wtbl));
+	wtbl->wlan_idx_lo = mn->wcid & 0xff;
+	wtbl->wlan_idx_hi = mn->wcid >> 8;
+	wtbl->operation = WTBL_SET;
+	wlen += mt7921_mcu_wtbl_generic_tlv(m, &wnum, sc, ni);
+	wlen += mt7921_mcu_wtbl_ht_tlv(m, &wnum, sc, ni, 1);
+	wtbl->tlv_num = htole16(wnum);
+	wtbl->len = htole16(le16toh(wtbl->len) + wlen);
+
+	m = mwx_fill_sta_req_hdr(m, &sc->sc_vif, sc->sc_vif.omac_idx,
+	    mn->wcid, tlvnum);
+	if (!m)
+		return ENOBUFS;
+	rv = mwx_mcu_send_mbuf(sc, MCU_UNI_CMD_STA_REC_UPDATE, m, &seq);
+	if (!rv)
+		rv = mwx_mcu_wait_resp_int(sc, MCU_UNI_CMD_STA_REC_UPDATE, seq,
+		    &status);
+	MWX_DEV_LOG(sc, "assoc_peer aid=%u flags=0x%x htcaps=0x%04x ampdu=0x%02x "
+	    "rxmcs=%02x%02x vhtcaps=0x%08x vhtmcs=0x%04x/0x%04x chw=%u nss=%u "
+	    "bw=%u center=%u tlvs=%u/%u transport=%d firmware=%u\n",
+	    IEEE80211_AID(ni->ni_associd), ni->ni_flags, ni->ni_htcaps,
+	    ni->ni_ampdu_param, ni->ni_rxmcs[1], ni->ni_rxmcs[0],
+	    ni->ni_vhtcaps, le16toh(ni->ni_vht_mcsinfo.rx_mcs_map),
+	    le16toh(ni->ni_vht_mcsinfo.tx_mcs_map), ni->ni_chw, ni->ni_rx_nss,
+	    sc->sc_bss_bw, sc->sc_bss_center, tlvnum, wnum, rv, status);
+	return rv ? rv : (status ? EIO : 0);
 }
 
 int
@@ -7137,6 +7346,10 @@ mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
 		uint8_t bss_idx;
 		uint8_t pad[3];
 		struct mt76_connac_bss_basic_tlv basic;
+		struct {
+			uint16_t tag, len;
+			uint8_t qos, pad[3];
+		} __packed qos;
 	} __packed bss = {};
 	struct {
 		uint8_t bss_idx;
@@ -7148,16 +7361,16 @@ mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
 			uint8_t sco, band, pad[2];
 		} __packed rlm;
 	} __packed channel = {};
-	int rv, is_2g;
+	int rv, is_2g, ht, vht;
 
 	if (ic->ic_opmode != IEEE80211_M_STA)
 		return 0;
 	if (ni == NULL || ni->ni_chan == NULL ||
 	    ni->ni_chan == IEEE80211_CHAN_ANYC)
 		return EINVAL;
-	if (mt7921_mcu_chan_bw(ni->ni_chan) != CMD_CBW_20MHZ)
-		return EOPNOTSUPP;
 	is_2g = IEEE80211_IS_CHAN_2GHZ(ni->ni_chan);
+	ht = (ni->ni_flags & IEEE80211_NODE_HT) != 0;
+	vht = !is_2g && (ni->ni_flags & IEEE80211_NODE_VHT) != 0;
 	bss.bss_idx = mvif->idx;
 	bss.basic.tag = htole16(UNI_BSS_INFO_BASIC);
 	bss.basic.len = htole16(sizeof(bss.basic));
@@ -7174,13 +7387,24 @@ mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
 	bss.basic.sta_idx = htole16(mvif->vif_mn.wcid);
 	bss.basic.bcn_interval = htole16(ni->ni_intval);
 	bss.basic.dtim_period = ni->ni_dtimperiod;
-	/* BSS phymode uses A/B/G bits; nonht_basic_phy uses PHY_TYPE bits. */
-	bss.basic.phymode = is_2g ? ((1U << 1) | (1U << 2)) : (1U << 0);
+	/*
+	 * BSS phymode uses PHY_MODE bits: A(0) B(1) G(2) GN(3) AN(4) AC(5);
+	 * nonht_basic_phy uses PHY_TYPE bits.
+	 */
+	if (is_2g)
+		bss.basic.phymode = (1U << 1) | (1U << 2) | (ht ? (1U << 3) : 0);
+	else
+		bss.basic.phymode = (1U << 0) | (ht ? (1U << 4) : 0) |
+		    (vht ? (1U << 5) : 0);
 	bss.basic.nonht_basic_phy = htole16(is_2g ?
 	    PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP : PHY_TYPE_BIT_OFDM);
+	bss.qos.tag = htole16(UNI_BSS_INFO_QBSS);
+	bss.qos.len = htole16(sizeof(bss.qos));
+	bss.qos.qos = associated && (ni->ni_flags & IEEE80211_NODE_QOS) != 0;
 	rv = mwx_send_assoc_status(sc, MCU_UNI_CMD_BSS_INFO_UPDATE, &bss, sizeof(bss));
-	MWX_DEV_LOG(sc, "associated BSS enable=%d channel=%u beacon=%u dtim=%u rv=%d\n",
-	    associated, ieee80211_mhz2ieee(ni->ni_chan->ic_freq, 0), ni->ni_intval, ni->ni_dtimperiod, rv);
+	MWX_DEV_LOG(sc, "associated BSS enable=%d channel=%u beacon=%u dtim=%u phymode=0x%x qos=%u rv=%d\n",
+	    associated, ieee80211_mhz2ieee(ni->ni_chan->ic_freq, 0), ni->ni_intval,
+	    ni->ni_dtimperiod, bss.basic.phymode, bss.qos.qos, rv);
 	if (rv != 0 || !associated)
 		return rv;
 
@@ -7190,13 +7414,204 @@ mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
 	channel.rlm.control_channel = ieee80211_mhz2ieee(ni->ni_chan->ic_freq, 0);
 	channel.rlm.center_chan = channel.rlm.control_channel;
 	channel.rlm.bw = CMD_CBW_20MHZ;
+	if (sc->sc_bss_bw != CMD_CBW_20MHZ) {
+		channel.rlm.bw = sc->sc_bss_bw;
+		channel.rlm.center_chan = sc->sc_bss_center;
+		channel.rlm.ht_op_info = 4;	/* HT 40M allowed */
+	}
+	if (channel.rlm.control_channel < channel.rlm.center_chan)
+		channel.rlm.sco = 1;	/* SCA */
+	else if (channel.rlm.control_channel > channel.rlm.center_chan)
+		channel.rlm.sco = 3;	/* SCB */
 	channel.rlm.tx_streams = sc->sc_capa.num_streams;
 	channel.rlm.rx_streams = sc->sc_capa.antenna_mask;
 	channel.rlm.short_st = 1;
 	channel.rlm.band = is_2g ? 0 : 1;
 	rv = mwx_send_assoc_status(sc, MCU_UNI_CMD_BSS_INFO_UPDATE,
 	    &channel, sizeof(channel));
-	MWX_DEV_LOG(sc, "associated BSS RLM channel=%u band=%u rv=%d\n",
-	    channel.rlm.control_channel, channel.rlm.band, rv);
+	MWX_DEV_LOG(sc, "associated BSS RLM channel=%u center=%u bw=%u sco=%u band=%u rv=%d\n",
+	    channel.rlm.control_channel, channel.rlm.center_chan,
+	    channel.rlm.bw, channel.rlm.sco, channel.rlm.band, rv);
 	return rv;
+}
+
+/*
+ * Select what the next association offers. Knob changes take effect on
+ * the next join; net80211 reads these flags when it builds the
+ * association request and negotiates HT/VHT from the response.
+ */
+void
+mwx_apply_phy_knobs(struct mwx_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+
+	ic->ic_flags &= ~(IEEE80211_F_HTON | IEEE80211_F_VHTON |
+	    IEEE80211_F_HEON);
+	ic->ic_htcaps |= IEEE80211_HTCAP_CBW20_40 | IEEE80211_HTCAP_SGI40;
+	if (sc->sc_knobs & MWX_KNOB_NO_40)
+		ic->ic_htcaps &= ~(IEEE80211_HTCAP_CBW20_40 |
+		    IEEE80211_HTCAP_SGI40);
+
+	if ((sc->sc_knobs & MWX_KNOB_NO_HT) == 0 &&
+	    (ic->ic_modecaps & (1 << IEEE80211_MODE_11N))) {
+		ic->ic_flags |= IEEE80211_F_HTON;
+		/* VHT requires 80 MHz support, so NO_40 disables it too. */
+		if ((sc->sc_knobs & (MWX_KNOB_NO_VHT | MWX_KNOB_NO_40)) == 0 &&
+		    (ic->ic_modecaps & (1 << IEEE80211_MODE_11AC)))
+			ic->ic_flags |= IEEE80211_F_VHTON;
+	}
+	MWX_DEV_LOG(sc, "phy knobs 0x%x: ht=%d vht=%d htcaps=0x%04x modecaps=0x%x\n",
+	    sc->sc_knobs, (ic->ic_flags & IEEE80211_F_HTON) != 0,
+	    (ic->ic_flags & IEEE80211_F_VHTON) != 0, ic->ic_htcaps,
+	    ic->ic_modecaps);
+}
+
+/*
+ * Tell the firmware about an RX Block Ack agreement, as in
+ * mt76_connac_mcu_sta_ba(): a WTBL_BA update followed by STA_REC_BA.
+ * net80211 does the reordering.
+ */
+int
+mt7921_mcu_sta_rx_ba(struct mwx_softc *sc, struct ieee80211_node *ni,
+    uint8_t tid, int enable)
+{
+	struct mwx_node *mn = (struct mwx_node *)ni;
+	struct ieee80211_rx_ba *ba = &ni->ni_rx_ba[tid];
+	struct sta_rec_wtbl *wtbl;
+	struct wtbl_ba *wba;
+	struct sta_rec_ba *sba;
+	struct mbuf *m;
+	uint16_t tlvnum = 0, wnum = 0;
+	uint16_t winsize = enable ? ba->ba_winsize : 0;
+	int rv;
+
+	m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr));
+	if (m == NULL)
+		return ENOBUFS;
+	wtbl = (struct sta_rec_wtbl *)mwx_append_tlv(m, &tlvnum,
+	    STA_REC_WTBL, sizeof(*wtbl));
+	wtbl->wlan_idx_lo = mn->wcid & 0xff;
+	wtbl->wlan_idx_hi = mn->wcid >> 8;
+	wtbl->operation = WTBL_SET;
+	wba = (struct wtbl_ba *)mwx_append_tlv(m, &wnum, WTBL_BA,
+	    sizeof(*wba));
+	wba->tid = tid;
+	wba->ba_type = MT_BA_TYPE_RECIPIENT;
+	wba->ba_winsize = htole16(winsize);
+	memcpy(wba->peer_addr, ni->ni_macaddr, IEEE80211_ADDR_LEN);
+	wba->rst_ba_tid = tid;
+	wba->rst_ba_sel = RST_BA_MAC_TID_MATCH;
+	wba->rst_ba_sb = 1;
+	wtbl->tlv_num = htole16(wnum);
+	wtbl->len = htole16(le16toh(wtbl->len) + sizeof(*wba));
+	m = mwx_fill_sta_req_hdr(m, &sc->sc_vif, sc->sc_vif.omac_idx,
+	    mn->wcid, tlvnum);
+	if (m == NULL)
+		return ENOBUFS;
+	rv = mwx_mcu_send_mbuf_wait(sc, MCU_UNI_CMD_STA_REC_UPDATE, m);
+	if (rv != 0)
+		goto out;
+
+	m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr));
+	if (m == NULL)
+		return ENOBUFS;
+	tlvnum = 0;
+	sba = (struct sta_rec_ba *)mwx_append_tlv(m, &tlvnum, STA_REC_BA,
+	    sizeof(*sba));
+	sba->tid = tid;
+	sba->ba_type = MT_BA_TYPE_RECIPIENT;
+	sba->amsdu = 0;
+	sba->ba_en = (enable ? 1 : 0) << tid;
+	sba->ssn = htole16(enable ? ba->ba_winstart : 0);
+	sba->winsize = htole16(winsize);
+	m = mwx_fill_sta_req_hdr(m, &sc->sc_vif, sc->sc_vif.omac_idx,
+	    mn->wcid, tlvnum);
+	if (m == NULL)
+		return ENOBUFS;
+	rv = mwx_mcu_send_mbuf_wait(sc, MCU_UNI_CMD_STA_REC_UPDATE, m);
+out:
+	MWX_DEV_LOG(sc, "rx ba %s tid=%u ssn=%u winsize=%u rv=%d\n",
+	    enable ? "start" : "stop", tid, enable ? ba->ba_winstart : 0,
+	    winsize, rv);
+	return rv;
+}
+
+static int
+mwx_ba_enqueue(struct mwx_softc *sc, struct ieee80211_node *ni,
+    uint8_t tid, int start)
+{
+	struct mwx_ba_task_arg *a;
+
+	if ((sc->sc_ba_cur + 1) % nitems(sc->sc_ba_arg) == sc->sc_ba_tail)
+		return ENOSPC;
+	a = &sc->sc_ba_arg[sc->sc_ba_cur];
+	a->ni = ni;
+	a->tid = tid;
+	a->start = start;
+	sc->sc_ba_cur = (sc->sc_ba_cur + 1) % nitems(sc->sc_ba_arg);
+	task_add(sc->sc_nswq, &sc->sc_ba_task);
+	return 0;
+}
+
+/* Called from the RX path: MCU commands wait, so defer to a task. */
+int
+mwx_ampdu_rx_start(struct ieee80211com *ic, struct ieee80211_node *ni,
+    uint8_t tid)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
+	int rv;
+
+	if (sc->sc_knobs & MWX_KNOB_NO_RXBA) {
+		MWX_DEV_LOG(sc, "rx ba refused tid=%u (knob)\n", tid);
+		return ENOTSUP;
+	}
+	rv = mwx_ba_enqueue(sc, ni, tid, 1);
+	return rv ? rv : EBUSY;
+}
+
+void
+mwx_ampdu_rx_stop(struct ieee80211com *ic, struct ieee80211_node *ni,
+    uint8_t tid)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
+
+	mwx_ba_enqueue(sc, ni, tid, 0);
+}
+
+void
+mwx_ba_task(void *arg)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct mwx_ba_task_arg *a;
+	int s = splnet();
+
+	while (sc->sc_ba_tail != sc->sc_ba_cur) {
+		struct ieee80211_node *ni;
+		uint8_t tid;
+		int start, rv;
+
+		a = &sc->sc_ba_arg[sc->sc_ba_tail];
+		ni = a->ni;
+		tid = a->tid;
+		start = a->start;
+		a->ni = NULL;
+		sc->sc_ba_tail = (sc->sc_ba_tail + 1) % nitems(sc->sc_ba_arg);
+
+		/* The agreement died with the association. */
+		if (ic->ic_state != IEEE80211_S_RUN || ni != ic->ic_bss)
+			continue;
+
+		rv = mt7921_mcu_sta_rx_ba(sc, ni, tid, start);
+		if (!start)
+			continue;
+		if (ni->ni_rx_ba[tid].ba_state != IEEE80211_BA_REQUESTED)
+			continue;
+		if (rv == 0)
+			ieee80211_addba_req_accept(ic, ni, tid);
+		else
+			ieee80211_addba_req_refuse(ic, ni, tid);
+	}
+
+	splx(s);
 }
