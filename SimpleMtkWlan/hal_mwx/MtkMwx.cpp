@@ -326,6 +326,7 @@ struct mwx_txwi {
 	u_int32_t			mt_addr;
 	u_int				mt_idx;
 	int				mt_busy;
+	int				mt_eapol;	/* log TX status */
 };
 
 struct mwx_txwi_desc {
@@ -445,6 +446,9 @@ struct mwx_softc {
 #define MWX_KNOB_NO_40		0x20	/* 20 MHz only (next join) */
 #define MWX_KNOB_NO_RXBA	0x40	/* refuse RX Block Ack agreements */
 #define MWX_KNOB_TX_VO		0x80	/* old behaviour: all frames on VO */
+#define MWX_KNOB_OLD_PEER	0x100	/* assoc peer: BASIC + STATE only */
+#define MWX_KNOB_OLD_STA	0x200	/* legacy-only STA_REC PHY/RA/STATE */
+#define MWX_KNOB_NO_QBSS	0x400	/* no QBSS TLV in BSS_INFO */
 	uint8_t			sc_bss_bw;	/* CMD_CBW_* used by the BSS */
 	uint8_t			sc_bss_center;	/* center channel for sc_bss_bw */
 	struct task		sc_ba_task;
@@ -1616,6 +1620,33 @@ mwx_mbuf_linearize(struct mbuf *m)
 	return n;
 }
 
+/*
+ * Return 1 and the EAPOL-Key key information field if m is an unprotected
+ * 802.11 data frame carrying an EAPOL-Key, for handshake debugging.
+ */
+static int
+mwx_eapol_keyinfo(struct mbuf *m, uint16_t *keyinfo)
+{
+	static const uint8_t llc[] = { 0xaa, 0xaa, 0x03, 0, 0, 0, 0x88, 0x8e };
+	struct ieee80211_frame *wh = mtod(m, struct ieee80211_frame *);
+	uint8_t buf[sizeof(llc) + 7];
+	u_int hdrlen;
+
+	if (mbuf_len(m) < sizeof(*wh) ||
+	    (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_DATA ||
+	    (wh->i_fc[1] & IEEE80211_FC1_PROTECTED))
+		return 0;
+	hdrlen = ieee80211_get_hdrlen(wh);
+	if (mbuf_pkthdr_len(m) < hdrlen + sizeof(buf))
+		return 0;
+	m_copydata(m, hdrlen, sizeof(buf), (caddr_t)buf);
+	/* LLC/SNAP 888e, EAPOL type 3 (Key), then descriptor type + info */
+	if (memcmp(buf, llc, sizeof(llc)) != 0 || buf[sizeof(llc) + 1] != 3)
+		return 0;
+	*keyinfo = (buf[sizeof(llc) + 5] << 8) | buf[sizeof(llc) + 6];
+	return 1;
+}
+
 int
 mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 {
@@ -1660,6 +1691,16 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 		m_freem(m);
 		mwx_txwi_put(sc, mt);
 		return rv;
+	}
+
+	{
+		uint16_t ki;
+
+		mt->mt_eapol = mwx_eapol_keyinfo(m, &ki);
+		if (mt->mt_eapol)
+			MWX_DEV_LOG(sc, "eapol tx keyinfo=0x%04x len=%zu msdu=%u "
+			    "knobs=0x%x\n", ki, mbuf_pkthdr_len(m), mt->mt_idx,
+			    sc->sc_knobs);
 	}
 
 	static uint32_t tx_log_count;
@@ -1734,6 +1775,15 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
 		}
 	}
 	sc->sc_rx_delivered++;
+
+	{
+		uint16_t ki;
+
+		if (mwx_eapol_keyinfo(m, &ki))
+			MWX_DEV_LOG(sc, "eapol rx keyinfo=0x%04x len=%zu rssi=%d "
+			    "fc=%02x/%02x\n", ki, mbuf_pkthdr_len(m),
+			    rxi.rxi_rssi, wh->i_fc[0], wh->i_fc[1]);
+	}
 
 	if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA &&
 	    sc->sc_rx_cur_rate != 0) {
@@ -6318,6 +6368,14 @@ mwx_mac_tx_free(struct mwx_softc *sc, struct mbuf *m)
 		mt = &sc->sc_txwi.mt_data[msdu];
 		if (mt->mt_busy == 0)
 			continue;
+		if (mt->mt_eapol) {
+			/* status 0 = acked; count = transmissions */
+			MWX_DEV_LOG(sc, "eapol txfree msdu=%u stat=%u count=%u "
+			    "raw=0x%08x\n", msdu,
+			    (txval & MT_TX_FREE_STATUS_MASK) >> 13,
+			    txval & MT_TX_FREE_COUNT_MASK, txval);
+			mt->mt_eapol = 0;
+		}
 		mwx_txwi_put(sc, mt);
 	}
 
@@ -6534,6 +6592,27 @@ mt7921_mcu_add_sta_tlv(struct mbuf *m, uint16_t *tlvnum, struct mwx_softc *sc,
 	is_2g = IEEE80211_IS_CHAN_2GHZ(ni->ni_chan);
 	ht = assoc && (ni->ni_flags & IEEE80211_NODE_HT) != 0;
 	vht = ht && !is_2g && (ni->ni_flags & IEEE80211_NODE_VHT) != 0;
+
+	if (sc->sc_knobs & MWX_KNOB_OLD_STA) {
+		/* What d9b69bb sent: fixed legacy PHY/RA, state NONE. */
+		phy = (struct sta_rec_phy *)mwx_append_tlv(m, tlvnum,
+		    STA_REC_PHY, sizeof(*phy));
+		phy->basic_rate = htole16(0x0150);
+		phy->phy_type = is_2g ?
+		    PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP : PHY_TYPE_BIT_OFDM;
+		if (ieee80211_node_supports_ht(ni))
+			phy->phy_type |= PHY_TYPE_BIT_HT;
+		if (!is_2g && ieee80211_node_supports_vht(ni))
+			phy->phy_type |= PHY_TYPE_BIT_VHT;
+		phy->rcpi = 0xdc;
+		ra_info = (struct sta_rec_ra_info *)mwx_append_tlv(m, tlvnum,
+		    STA_REC_RA, sizeof(*ra_info));
+		ra_info->legacy = htole16(RA_LEGACY_OFDM);
+		state = (struct sta_rec_state *)mwx_append_tlv(m, tlvnum,
+		    STA_REC_STATE, sizeof(*state));
+		state->state = 0;
+		return;
+	}
 
 	if (ht) {
 		struct sta_rec_ht *sht;
@@ -7362,6 +7441,14 @@ mt7921_mcu_set_associated_peer(struct mwx_softc *sc)
 		return ENOBUFS;
 
 	mt7921_mcu_add_basic_tlv(m, &tlvnum, sc, ni, 1, 0);
+	if (sc->sc_knobs & MWX_KNOB_OLD_PEER) {
+		struct sta_rec_state *state;
+
+		state = (struct sta_rec_state *)mwx_append_tlv(m, &tlvnum,
+		    STA_REC_STATE, sizeof(*state));
+		state->state = 2;
+		goto send;
+	}
 	mt7921_mcu_add_sta_tlv(m, &tlvnum, sc, ni, 1);
 
 	wtbl = (struct sta_rec_wtbl *)mwx_append_tlv(m, &tlvnum,
@@ -7374,6 +7461,7 @@ mt7921_mcu_set_associated_peer(struct mwx_softc *sc)
 	wtbl->tlv_num = htole16(wnum);
 	wtbl->len = htole16(le16toh(wtbl->len) + wlen);
 
+send:
 	m = mwx_fill_sta_req_hdr(m, &sc->sc_vif, sc->sc_vif.omac_idx,
 	    mn->wcid, tlvnum);
 	if (!m)
@@ -7458,7 +7546,13 @@ mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
 	bss.qos.tag = htole16(UNI_BSS_INFO_QBSS);
 	bss.qos.len = htole16(sizeof(bss.qos));
 	bss.qos.qos = associated && (ni->ni_flags & IEEE80211_NODE_QOS) != 0;
-	rv = mwx_send_assoc_status(sc, MCU_UNI_CMD_BSS_INFO_UPDATE, &bss, sizeof(bss));
+	if (sc->sc_knobs & MWX_KNOB_NO_QBSS) {
+		bss.qos.qos = 0;
+		rv = mwx_send_assoc_status(sc, MCU_UNI_CMD_BSS_INFO_UPDATE,
+		    &bss, sizeof(bss) - sizeof(bss.qos));
+	} else
+		rv = mwx_send_assoc_status(sc, MCU_UNI_CMD_BSS_INFO_UPDATE,
+		    &bss, sizeof(bss));
 	MWX_DEV_LOG(sc, "associated BSS enable=%d channel=%u beacon=%u dtim=%u phymode=0x%x qos=%u rv=%d\n",
 	    associated, ieee80211_mhz2ieee(ni->ni_chan->ic_freq, 0), ni->ni_intval,
 	    ni->ni_dtimperiod, bss.basic.phymode, bss.qos.qos, rv);
