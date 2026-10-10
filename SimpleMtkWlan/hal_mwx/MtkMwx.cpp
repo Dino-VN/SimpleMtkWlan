@@ -1647,6 +1647,27 @@ mwx_eapol_keyinfo(struct mbuf *m, uint16_t *keyinfo)
 	return 1;
 }
 
+/* Hex dump the first bytes of an EAPOL frame into the log, 32 bytes a line. */
+static void
+mwx_eapol_dump(struct mwx_softc *sc, const char *dir, struct mbuf *m)
+{
+	static const char hex[] = "0123456789abcdef";
+	uint8_t buf[224];
+	char line[65];
+	size_t len, off, i;
+
+	len = MIN(mbuf_pkthdr_len(m), sizeof(buf));
+	m_copydata(m, 0, len, (caddr_t)buf);
+	for (off = 0; off < len; off += 32) {
+		for (i = 0; i < 32 && off + i < len; i++) {
+			line[i * 2] = hex[buf[off + i] >> 4];
+			line[i * 2 + 1] = hex[buf[off + i] & 0xf];
+		}
+		line[i * 2] = '\0';
+		MWX_DEV_LOG(sc, "eapol %s hex %03zu %s\n", dir, off, line);
+	}
+}
+
 int
 mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 {
@@ -1697,10 +1718,12 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 		uint16_t ki;
 
 		mt->mt_eapol = mwx_eapol_keyinfo(m, &ki);
-		if (mt->mt_eapol)
+		if (mt->mt_eapol) {
 			MWX_DEV_LOG(sc, "eapol tx keyinfo=0x%04x len=%zu msdu=%u "
 			    "knobs=0x%x\n", ki, mbuf_pkthdr_len(m), mt->mt_idx,
 			    sc->sc_knobs);
+			mwx_eapol_dump(sc, "tx", m);
+		}
 	}
 
 	static uint32_t tx_log_count;
@@ -1779,10 +1802,12 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
 	{
 		uint16_t ki;
 
-		if (mwx_eapol_keyinfo(m, &ki))
+		if (mwx_eapol_keyinfo(m, &ki)) {
 			MWX_DEV_LOG(sc, "eapol rx keyinfo=0x%04x len=%zu rssi=%d "
 			    "fc=%02x/%02x\n", ki, mbuf_pkthdr_len(m),
 			    rxi.rxi_rssi, wh->i_fc[0], wh->i_fc[1]);
+			mwx_eapol_dump(sc, "rx", m);
+		}
 	}
 
 	if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA &&
