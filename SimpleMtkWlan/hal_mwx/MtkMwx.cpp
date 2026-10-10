@@ -437,6 +437,8 @@ struct mwx_softc {
 	struct task		sc_reset_task;
 #ifdef AIRPORT
 	struct task		sc_power_task;
+	volatile SInt32		sc_power_req;	/* bumped by every enable/disable */
+	SInt32			sc_power_done;	/* last request the task served */
 #endif
 	CTimeout		*sc_reset_to;
 	CTimeout		*sc_scan_to;
@@ -2455,15 +2457,33 @@ mwx_power_task(void *arg)
 {
 	struct mwx_softc *sc = (struct mwx_softc *)arg;
 	struct ifnet *ifp = &sc->sc_ic.ic_if;
+	SInt32 req;
 	int rv;
 
 	if (sc->sc_detaching)
 		return;
+	/*
+	 * A disable+enable pair (private MAC change) can be split across two
+	 * task runs when the task starts between them. The first run already
+	 * acts on the final IFF_UP, so the second must not stop and init the
+	 * firmware again right away: that hangs the MCU (cmd 0x46ed timeout).
+	 */
+	if (sc->sc_power_req == sc->sc_power_done) {
+		MWX_DEV_LOG(sc, "power task: requests already served flags=0x%x\n",
+		    ifp->if_flags);
+		return;
+	}
 	if (ifp->if_flags & IFF_RUNNING)
 		mwx_stop(ifp);
-	if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) != IFF_UP)
+	/* Requests counted here are served by the IFF_UP read below. */
+	req = sc->sc_power_req;
+	OSSynchronizeIO();
+	if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) != IFF_UP) {
+		sc->sc_power_done = req;
 		return;
+	}
 	rv = mwx_init(ifp);
+	sc->sc_power_done = req;
 	MWX_DEV_LOG(sc, "power task init=%d flags=0x%x\n", rv, ifp->if_flags);
 	if (rv != 0)
 		ifp->if_flags &= ~IFF_UP;
@@ -7395,6 +7415,7 @@ MtkMwx::enable(IONetworkInterface *interface)
 	}
 	ifp->if_flags |= IFF_UP;
 #ifdef AIRPORT
+	OSIncrementAtomic(&com->sc_power_req);
 	task_add(com->sc_nswq, &com->sc_power_task);
 	MWX_DEV_LOG(com, "HAL enable queued flags=0x%x\n", ifp->if_flags);
 	return kIOReturnSuccess;
@@ -7421,6 +7442,7 @@ MtkMwx::disable(IONetworkInterface *interface)
 	}
 	ifp->if_flags &= ~IFF_UP;
 #ifdef AIRPORT
+	OSIncrementAtomic(&com->sc_power_req);
 	task_add(com->sc_nswq, &com->sc_power_task);
 	MWX_DEV_LOG(com, "HAL disable queued flags=0x%x\n", ifp->if_flags);
 #else
