@@ -46,6 +46,16 @@
 
 #include "if_mwxreg.h"
 #include <ClientKit/Common.h>
+#include <IOKit/IOLocks.h>
+
+/*
+ * TX rings are touched by the interrupt (workloop thread), the firmware
+ * loader (IOConfigThread), MCU senders and if_start without any real
+ * spl exclusion; serialise descriptor and mbuf ownership changes.
+ * Never call wakeup() or sleep while holding it: wakeup enters the
+ * workloop gate, which the interrupt thread holds while taking this lock.
+ */
+static IOLock *mwx_txq_lock;
 
 OSDefineMetaClassAndStructors(MtkMwx, MtkHalService)
 
@@ -1984,6 +1994,12 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 
 	MWX_DEV_LOG(sc, "attach start pci_id=0x%08x vendor=0x%04x product=0x%04x\n",
 	    pa->pa_id, PCI_VENDOR(pa->pa_id), PCI_PRODUCT(pa->pa_id));
+	if (mwx_txq_lock == NULL)
+		mwx_txq_lock = IOLockAlloc();
+	if (mwx_txq_lock == NULL) {
+		printf("%s: can't allocate TX queue lock\n", DEVNAME(sc));
+		return false;
+	}
 	sc->sc_pc = pa->pa_pc;
 	sc->sc_tag = pa->pa_tag;
 	sc->sc_dmat = pa->pa_dmat;
@@ -2545,6 +2561,8 @@ mwx_queue_reset(struct mwx_softc *sc, struct mwx_queue *q)
 	uint32_t dmaaddr;
 	struct mwx_queue_data *md;
 
+	IOLockLock(mwx_txq_lock);
+
 	/* clear descriptors */
 	bus_dmamap_sync(sc->sc_dmat, q->mq_map, 0, q->mq_map->dm_mapsize,
 	    BUS_DMASYNC_PREWRITE);
@@ -2582,6 +2600,8 @@ mwx_queue_reset(struct mwx_softc *sc, struct mwx_queue *q)
 			md->md_mbuf = NULL;
 		}
 	}
+
+	IOLockUnlock(mwx_txq_lock);
 }
 
 int
@@ -2757,8 +2777,9 @@ mwx_dma_free_slots(struct mwx_queue *q)
 	return free;
 }
 
-int
-mwx_dma_tx_enqueue(struct mwx_softc *sc, struct mwx_queue *q, struct mbuf *m)
+static int
+mwx_dma_tx_enqueue_locked(struct mwx_softc *sc, struct mwx_queue *q,
+    struct mbuf *m)
 {
 	struct mwx_queue_data *md;
 	struct mwx_desc *desc;
@@ -2833,8 +2854,8 @@ mwx_dma_tx_enqueue(struct mwx_softc *sc, struct mwx_queue *q, struct mbuf *m)
 	return 0;
 }
 
-int
-mwx_dma_txwi_enqueue(struct mwx_softc *sc, struct mwx_queue *q,
+static int
+mwx_dma_txwi_enqueue_locked(struct mwx_softc *sc, struct mwx_queue *q,
     struct mwx_txwi *mt)
 {
 	struct mwx_queue_data *md;
@@ -2888,8 +2909,31 @@ mwx_dma_txwi_enqueue(struct mwx_softc *sc, struct mwx_queue *q,
 	return 0;
 }
 
-void
-mwx_dma_tx_cleanup(struct mwx_softc *sc, struct mwx_queue *q)
+int
+mwx_dma_tx_enqueue(struct mwx_softc *sc, struct mwx_queue *q, struct mbuf *m)
+{
+	int rv;
+
+	IOLockLock(mwx_txq_lock);
+	rv = mwx_dma_tx_enqueue_locked(sc, q, m);
+	IOLockUnlock(mwx_txq_lock);
+	return rv;
+}
+
+int
+mwx_dma_txwi_enqueue(struct mwx_softc *sc, struct mwx_queue *q,
+    struct mwx_txwi *mt)
+{
+	int rv;
+
+	IOLockLock(mwx_txq_lock);
+	rv = mwx_dma_txwi_enqueue_locked(sc, q, mt);
+	IOLockUnlock(mwx_txq_lock);
+	return rv;
+}
+
+static int
+mwx_dma_tx_cleanup_locked(struct mwx_softc *sc, struct mwx_queue *q)
 {
 	struct mwx_queue_data *md;
 	struct mwx_desc *desc;
@@ -2899,7 +2943,7 @@ mwx_dma_tx_cleanup(struct mwx_softc *sc, struct mwx_queue *q)
 	last = mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX);
 
 	if (idx == last)
-		return;
+		return 0;
 
 	bus_dmamap_sync(sc->sc_dmat, q->mq_map, 0, q->mq_map->dm_mapsize,
 	     BUS_DMASYNC_PREWRITE);
@@ -2946,8 +2990,21 @@ mwx_dma_tx_cleanup(struct mwx_softc *sc, struct mwx_queue *q)
 	q->mq_cons = idx;
 	if (q->mq_wakeme) {
 		q->mq_wakeme = 0;
-		wakeup(q);
+		return 1;
 	}
+	return 0;
+}
+
+void
+mwx_dma_tx_cleanup(struct mwx_softc *sc, struct mwx_queue *q)
+{
+	int wake;
+
+	IOLockLock(mwx_txq_lock);
+	wake = mwx_dma_tx_cleanup_locked(sc, q);
+	IOLockUnlock(mwx_txq_lock);
+	if (wake)
+		wakeup(q);
 }
 
 void
