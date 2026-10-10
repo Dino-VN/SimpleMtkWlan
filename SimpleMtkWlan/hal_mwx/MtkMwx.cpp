@@ -399,6 +399,7 @@ struct mwx_ba_task_arg {
 	struct ieee80211_node	*ni;
 	uint8_t			tid;
 	uint8_t			start;
+	uint8_t			tx;	/* originator (TX) agreement */
 };
 
 struct mwx_softc {
@@ -453,6 +454,7 @@ struct mwx_softc {
 #define MWX_KNOB_OLD_PEER	0x100	/* assoc peer: BASIC + STATE only */
 #define MWX_KNOB_OLD_STA	0x200	/* legacy-only STA_REC PHY/RA/STATE */
 #define MWX_KNOB_NO_QBSS	0x400	/* no QBSS TLV in BSS_INFO */
+#define MWX_KNOB_NO_TXBA	0x800	/* do not set up TX Block Ack (A-MPDU) */
 	uint8_t			sc_bss_bw;	/* CMD_CBW_* used by the BSS */
 	uint8_t			sc_bss_center;	/* center channel for sc_bss_bw */
 	struct task		sc_ba_task;
@@ -787,8 +789,14 @@ int		mwx_ampdu_rx_start(struct ieee80211com *,
 		    struct ieee80211_node *, uint8_t);
 void		mwx_ampdu_rx_stop(struct ieee80211com *,
 		    struct ieee80211_node *, uint8_t);
+int		mwx_ampdu_tx_start(struct ieee80211com *,
+		    struct ieee80211_node *, uint8_t);
+void		mwx_ampdu_tx_stop(struct ieee80211com *,
+		    struct ieee80211_node *, uint8_t);
 void		mwx_ba_task(void *);
 int		mt7921_mcu_sta_rx_ba(struct mwx_softc *,
+		    struct ieee80211_node *, uint8_t, int);
+int		mt7921_mcu_sta_tx_ba(struct mwx_softc *,
 		    struct ieee80211_node *, uint8_t, int);
 
 struct mbuf	*mwx_alloc_sta_req_tlv(int);
@@ -2237,8 +2245,8 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	/* Set device capabilities. */
 	ic->ic_caps =
 	    IEEE80211_C_QOS |		/* WMM, required for HT/VHT */
+	    IEEE80211_C_TX_AMPDU |	/* A-MPDU, net80211 sends ADDBA */
 #if NOTYET
-	    IEEE80211_C_TX_AMPDU | /* A-MPDU */
 	    IEEE80211_C_ADDBA_OFFLOAD | /* device sends ADDBA/DELBA frames */
 #endif
 	    IEEE80211_C_WEP |		/* WEP */
@@ -2311,6 +2319,8 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	ic->ic_delete_key = mwx_delete_key;
 	ic->ic_ampdu_rx_start = mwx_ampdu_rx_start;
 	ic->ic_ampdu_rx_stop = mwx_ampdu_rx_stop;
+	ic->ic_ampdu_tx_start = mwx_ampdu_tx_start;
+	ic->ic_ampdu_tx_stop = mwx_ampdu_tx_stop;
 
 	/* Override 802.11 state transition machine. */
 	sc->sc_newstate = ic->ic_newstate;
@@ -6277,6 +6287,21 @@ mt7921_mac_write_txwi_80211(struct mwx_softc *sc, struct mbuf *m,
 		tid = qos & IEEE80211_QOS_TID;
 	}
 
+	/* As mt76 does for ADDBA requests built by mac80211. */
+	if (type == (IEEE80211_FC0_TYPE_MGT >> IEEE80211_FC0_TYPE_SHIFT) &&
+	    subtype == (IEEE80211_FC0_SUBTYPE_ACTION >>
+	    IEEE80211_FC0_SUBTYPE_SHIFT) &&
+	    mbuf_len(m) >= hdrlen + 5) {
+		const uint8_t *frm = mtod(m, const uint8_t *) + hdrlen;
+
+		if (frm[0] == IEEE80211_CATEG_BA &&
+		    frm[1] == IEEE80211_ACTION_ADDBA_REQ) {
+			/* [1] category [1] action [1] token [2] params */
+			txp->txwi[5] |= htole32(MT_TXD5_ADD_BA);
+			tid = ((frm[3] | frm[4] << 8) >> 2) & 0xf;
+		}
+	}
+
 #ifdef NOTYET
 	if (ieee80211_is_action(fc) &&
 	    mgmt->u.action.category == WLAN_CATEGORY_BACK &&
@@ -7534,6 +7559,11 @@ MtkMwx::debugSet(uint32_t op, uint32_t val)
 	case IOCTL_DEBUG_OP_KNOBS:
 		MWX_DEV_LOG(sc, "knobs 0x%x -> 0x%x\n", sc->sc_knobs, val);
 		sc->sc_knobs = val;
+		/* net80211 checks this before each ADDBA request. */
+		if (val & MWX_KNOB_NO_TXBA)
+			sc->sc_ic.ic_caps &= ~IEEE80211_C_TX_AMPDU;
+		else
+			sc->sc_ic.ic_caps |= IEEE80211_C_TX_AMPDU;
 		return kIOReturnSuccess;
 	case IOCTL_DEBUG_OP_RESET:
 		if (sc->sc_detaching)
@@ -7858,9 +7888,83 @@ out:
 	return rv;
 }
 
+/*
+ * Tell the firmware about a TX (originator) Block Ack agreement so that it
+ * aggregates QoS data of this TID, as mt7921_mcu_uni_tx_ba() does through
+ * mt76_connac_mcu_sta_ba(): STA_REC_BA followed by a WTBL_BA update.
+ */
+int
+mt7921_mcu_sta_tx_ba(struct mwx_softc *sc, struct ieee80211_node *ni,
+    uint8_t tid, int enable)
+{
+	static const uint8_t ba_range[] = { 4, 8, 12, 24, 36, 48, 54, 64 };
+	struct mwx_node *mn = (struct mwx_node *)ni;
+	struct ieee80211_tx_ba *ba = &ni->ni_tx_ba[tid];
+	struct sta_rec_wtbl *wtbl;
+	struct wtbl_ba *wba;
+	struct sta_rec_ba *sba;
+	struct mbuf *m;
+	uint16_t tlvnum = 0, wnum = 0;
+	uint16_t winsize = enable ? ba->ba_winsize : 0;
+	uint16_t ssn = enable ? ba->ba_winstart : 0;
+	int i, rv;
+
+	m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr));
+	if (m == NULL)
+		return ENOBUFS;
+	sba = (struct sta_rec_ba *)mwx_append_tlv(m, &tlvnum, STA_REC_BA,
+	    sizeof(*sba));
+	sba->tid = tid;
+	sba->ba_type = MT_BA_TYPE_ORIGINATOR;
+	sba->amsdu = 0;
+	sba->ba_en = (enable ? 1 : 0) << tid;
+	sba->ssn = htole16(ssn);
+	sba->winsize = htole16(winsize);
+	m = mwx_fill_sta_req_hdr(m, &sc->sc_vif, sc->sc_vif.omac_idx,
+	    mn->wcid, tlvnum);
+	if (m == NULL)
+		return ENOBUFS;
+	rv = mwx_mcu_send_mbuf_wait(sc, MCU_UNI_CMD_STA_REC_UPDATE, m);
+	if (rv != 0)
+		goto out;
+
+	for (i = nitems(ba_range) - 1; i > 0; i--)
+		if (winsize >= ba_range[i])
+			break;
+
+	m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr));
+	if (m == NULL)
+		return ENOBUFS;
+	tlvnum = 0;
+	wtbl = (struct sta_rec_wtbl *)mwx_append_tlv(m, &tlvnum,
+	    STA_REC_WTBL, sizeof(*wtbl));
+	wtbl->wlan_idx_lo = mn->wcid & 0xff;
+	wtbl->wlan_idx_hi = mn->wcid >> 8;
+	wtbl->operation = WTBL_SET;
+	wba = (struct wtbl_ba *)mwx_append_tlv(m, &wnum, WTBL_BA,
+	    sizeof(*wba));
+	wba->tid = tid;
+	wba->ba_type = MT_BA_TYPE_ORIGINATOR;
+	wba->sn = htole16(ssn);
+	wba->ba_en = enable ? 1 : 0;
+	wba->ba_winsize_idx = enable ? i : 0;
+	wba->ba_winsize = htole16(winsize);
+	wtbl->tlv_num = htole16(wnum);
+	wtbl->len = htole16(le16toh(wtbl->len) + sizeof(*wba));
+	m = mwx_fill_sta_req_hdr(m, &sc->sc_vif, sc->sc_vif.omac_idx,
+	    mn->wcid, tlvnum);
+	if (m == NULL)
+		return ENOBUFS;
+	rv = mwx_mcu_send_mbuf_wait(sc, MCU_UNI_CMD_STA_REC_UPDATE, m);
+out:
+	MWX_DEV_LOG(sc, "tx ba %s tid=%u ssn=%u winsize=%u rv=%d\n",
+	    enable ? "start" : "stop", tid, ssn, winsize, rv);
+	return rv;
+}
+
 static int
 mwx_ba_enqueue(struct mwx_softc *sc, struct ieee80211_node *ni,
-    uint8_t tid, int start)
+    uint8_t tid, int start, int tx)
 {
 	struct mwx_ba_task_arg *a;
 
@@ -7870,6 +7974,7 @@ mwx_ba_enqueue(struct mwx_softc *sc, struct ieee80211_node *ni,
 	a->ni = ni;
 	a->tid = tid;
 	a->start = start;
+	a->tx = tx;
 	sc->sc_ba_cur = (sc->sc_ba_cur + 1) % nitems(sc->sc_ba_arg);
 	task_add(sc->sc_nswq, &sc->sc_ba_task);
 	return 0;
@@ -7887,7 +7992,7 @@ mwx_ampdu_rx_start(struct ieee80211com *ic, struct ieee80211_node *ni,
 		MWX_DEV_LOG(sc, "rx ba refused tid=%u (knob)\n", tid);
 		return ENOTSUP;
 	}
-	rv = mwx_ba_enqueue(sc, ni, tid, 1);
+	rv = mwx_ba_enqueue(sc, ni, tid, 1, 0);
 	return rv ? rv : EBUSY;
 }
 
@@ -7897,7 +8002,30 @@ mwx_ampdu_rx_stop(struct ieee80211com *ic, struct ieee80211_node *ni,
 {
 	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
 
-	mwx_ba_enqueue(sc, ni, tid, 0);
+	mwx_ba_enqueue(sc, ni, tid, 0, 0);
+}
+
+/* Called when the ADDBA response arrives (RX path): defer to the task. */
+int
+mwx_ampdu_tx_start(struct ieee80211com *ic, struct ieee80211_node *ni,
+    uint8_t tid)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
+	int rv;
+
+	if (sc->sc_knobs & MWX_KNOB_NO_TXBA)
+		return ENOTSUP;
+	rv = mwx_ba_enqueue(sc, ni, tid, 1, 1);
+	return rv ? rv : EBUSY;
+}
+
+void
+mwx_ampdu_tx_stop(struct ieee80211com *ic, struct ieee80211_node *ni,
+    uint8_t tid)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
+
+	mwx_ba_enqueue(sc, ni, tid, 0, 1);
 }
 
 void
@@ -7911,18 +8039,32 @@ mwx_ba_task(void *arg)
 	while (sc->sc_ba_tail != sc->sc_ba_cur) {
 		struct ieee80211_node *ni;
 		uint8_t tid;
-		int start, rv;
+		int start, tx, rv;
 
 		a = &sc->sc_ba_arg[sc->sc_ba_tail];
 		ni = a->ni;
 		tid = a->tid;
 		start = a->start;
+		tx = a->tx;
 		a->ni = NULL;
 		sc->sc_ba_tail = (sc->sc_ba_tail + 1) % nitems(sc->sc_ba_arg);
 
 		/* The agreement died with the association. */
 		if (ic->ic_state != IEEE80211_S_RUN || ni != ic->ic_bss)
 			continue;
+
+		if (tx) {
+			rv = mt7921_mcu_sta_tx_ba(sc, ni, tid, start);
+			if (!start ||
+			    ni->ni_tx_ba[tid].ba_state != IEEE80211_BA_REQUESTED)
+				continue;
+			if (rv == 0)
+				ieee80211_addba_resp_accept(ic, ni, tid);
+			else
+				ieee80211_addba_resp_refuse(ic, ni, tid,
+				    IEEE80211_STATUS_UNSPECIFIED);
+			continue;
+		}
 
 		rv = mt7921_mcu_sta_rx_ba(sc, ni, tid, start);
 		if (!start)

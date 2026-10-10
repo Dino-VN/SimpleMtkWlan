@@ -3246,6 +3246,12 @@ ieee80211_recv_addba_resp(struct ieee80211com *ic, mbuf_t m,
         return;
     }
     
+    /* The recipient may grant a smaller reorder buffer than requested. */
+    if (bufsz != 0 && bufsz < ba->ba_winsize) {
+        ba->ba_winsize = bufsz;
+        ba->ba_winend = (ba->ba_winstart + ba->ba_winsize - 1) & 0xfff;
+    }
+
     /* notify drivers of this new Block Ack agreement */
     if (ic->ic_ampdu_tx_start != NULL)
         err = ic->ic_ampdu_tx_start(ic, ni, tid);
