@@ -47,6 +47,7 @@
 #include "if_mwxreg.h"
 #include <ClientKit/Common.h>
 #include <IOKit/IOLocks.h>
+#include <crypto/sha1.h>
 
 /*
  * TX rings are touched by the interrupt (workloop thread), the firmware
@@ -1647,6 +1648,19 @@ mwx_eapol_keyinfo(struct mbuf *m, uint16_t *keyinfo)
 	return 1;
 }
 
+/* First 32 bits of SHA-1(key): identifies a PMK in the log without exposing it. */
+static uint32_t
+mwx_key_fp(const uint8_t *key, size_t len)
+{
+	SHA1_CTX ctx;
+	uint8_t d[SHA1_DIGEST_LENGTH];
+
+	SHA1Init(&ctx);
+	SHA1Update(&ctx, key, (unsigned int)len);
+	SHA1Final(d, &ctx);
+	return ((uint32_t)d[0] << 24) | (d[1] << 16) | (d[2] << 8) | d[3];
+}
+
 /* Hex dump the first bytes of an EAPOL frame into the log, 32 bytes a line. */
 static void
 mwx_eapol_dump(struct mwx_softc *sc, const char *dir, struct mbuf *m)
@@ -1723,6 +1737,12 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 			    "knobs=0x%x\n", ki, mbuf_pkthdr_len(m), mt->mt_idx,
 			    sc->sc_knobs);
 			mwx_eapol_dump(sc, "tx", m);
+			MWX_DEV_LOG(sc, "eapol keys pmk_fp=%08x psk_fp=%08x "
+			    "akms=0x%x nflags=0x%x myaddr=%s\n",
+			    mwx_key_fp(ni->ni_pmk, IEEE80211_PMK_LEN),
+			    mwx_key_fp(sc->sc_ic.ic_psk, IEEE80211_PMK_LEN),
+			    ni->ni_rsnakms, ni->ni_flags,
+			    ether_sprintf(sc->sc_ic.ic_myaddr));
 		}
 	}
 
