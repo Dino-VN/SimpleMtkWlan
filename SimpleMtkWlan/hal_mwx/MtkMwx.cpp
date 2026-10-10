@@ -2194,6 +2194,12 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 		goto fail;
 	}
 	MWX_DEV_LOG(sc, "attach WFSYS reset ok\n");
+	/*
+	 * A warm reboot keeps the card powered, so the WM firmware from the
+	 * previous OS session may still run and answers stale MCU state.
+	 * Drop it and download a fresh copy.
+	 */
+	sc->sc_fw_restart = 1;
 
 	mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, 0);
 	mwx_write(sc, MT_PCIE_MAC_INT_ENABLE, 0xff);
@@ -4168,6 +4174,7 @@ mwx_load_firmware(struct mwx_softc *sc)
 		MWX_DEV_LOG(sc, "firmware already downloaded status=0x%08x\n", reg);
 		return 0;
 	}
+	sc->sc_fw_restart = 0;
 
 	switch (sc->sc_hwtype) {
 	case MWX_HW_MT7921:
