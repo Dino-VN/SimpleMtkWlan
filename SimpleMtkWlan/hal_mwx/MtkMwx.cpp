@@ -948,6 +948,11 @@ mwx_init_running(struct ifnet *ifp)
 			return rv;
 		}
 	}
+#ifdef AIRPORT
+	/* WCL assigns a private MAC through setHardwareAddress (ac_enaddr). */
+	IEEE80211_ADDR_COPY(ic->ic_myaddr, ((struct arpcom *)ifp)->ac_enaddr);
+	MWX_DEV_LOG(sc, "init mac address=%s\n", ether_sprintf(ic->ic_myaddr));
+#endif
 
 	MWX_DEV_LOG(sc, "init start opmode=%d flags=0x%x ic_state=%d\n",
 	    ic->ic_opmode, ifp->if_flags, ic->ic_state);
@@ -5570,7 +5575,7 @@ mt7921_mcu_uni_add_dev(struct mwx_softc *sc, struct mwx_vif *mvif,
 	idx = mvif->omac_idx > EXT_BSSID_START ? HW_BSSID_0 : mvif->omac_idx;
 	basic_req.basic.hw_bss_idx = idx;
 
-	memcpy(dev_req.tlv.omac_addr, sc->sc_lladdr, ETHER_ADDR_LEN);
+	memcpy(dev_req.tlv.omac_addr, sc->sc_ic.ic_myaddr, ETHER_ADDR_LEN);
 
 	if (enable) {
 		cmd = MCU_UNI_CMD_DEV_INFO_UPDATE;
