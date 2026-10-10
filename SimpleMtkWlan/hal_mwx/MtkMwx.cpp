@@ -1507,6 +1507,12 @@ mwx_bgscan(struct ieee80211com *ic)
 	}
 
 	sc->sc_flags |= MWX_FLAG_BGSCAN;
+	sc->sc_scan_requests++;
+	/*
+	 * A lost SCAN_DONE leaves IEEE80211_F_BGSCAN set and every later
+	 * scan request from airportd is then ignored: end it ourselves.
+	 */
+	timeout_add_sec(&sc->sc_scan_to, 12);
 	return 0;
 }
 
@@ -3656,8 +3662,8 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 		printf("%s: MAGIC COMMAND\n", DEVNAME(sc));
 	default:
 		if (rxd_seq == 0 || rxd_seq >= nitems(sc->sc_mcu_wait)) {
-			printf("%s: mcu rx bad seq %x\n", DEVNAME(sc),
-			    rxd_seq);
+			printf("%s: mcu rx bad seq %x eid 0x%x ext 0x%x\n",
+			    DEVNAME(sc), rxd_seq, rxd_eid, rxd_ext_eid);
 			sc->sc_mcu_bad_seq++;
 			break;
 		}
