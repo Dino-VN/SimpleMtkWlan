@@ -348,6 +348,8 @@
 
 #define	MT_CONN_ON_MISC			0x7c0600f0
 #define	MT_TOP_MISC2_FW_N9_RDY		0x3
+#define	MT_TOP_MISC_FW_STATE		0x7
+#define	MT_TOP_MISC2_FW_PWR_ON		0x1
 
 #define	MT_CONN_ON_LPCTL		0x7c060010
 #define	PCIE_LPCR_HOST_SET_OWN		(1U << 0)

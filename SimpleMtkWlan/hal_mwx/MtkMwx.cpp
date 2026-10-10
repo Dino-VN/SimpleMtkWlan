@@ -434,6 +434,7 @@ struct mwx_softc {
 #define MWX_FLAG_BGSCAN			0x02
 	int			sc_coredump_cnt;
 	int8_t			sc_resetting;
+	int8_t			sc_fw_restart;
 	bool sc_detaching, sc_net_attached;
 	int8_t			sc_fw_loaded;
 
@@ -1539,6 +1540,22 @@ mwx_radiotap_attach(struct mwx_softc *sc)
 }
 #endif
 
+/* Copy a chain into one cluster; frees m and returns the copy, or NULL. */
+static struct mbuf *
+mwx_mbuf_linearize(struct mbuf *m)
+{
+	size_t len = mbuf_pkthdr_len(m);
+	struct mbuf *n = MCLGETL(NULL, M_DONTWAIT, len);
+
+	if (n == NULL)
+		return NULL;
+	m_copydata(m, 0, len, mtod(n, caddr_t));
+	mbuf_setlen(n, len);
+	mbuf_pkthdr_setlen(n, len);
+	m_freem(m);
+	return n;
+}
+
 int
 mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 {
@@ -1548,16 +1565,10 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 	int rv;
 
 	if ((sc->sc_knobs & MWX_KNOB_LINEARIZE) && mbuf_next(m) != NULL) {
-		size_t len = mbuf_pkthdr_len(m);
-		struct mbuf *n = MCLGETL(NULL, M_DONTWAIT, len);
+		struct mbuf *n = mwx_mbuf_linearize(m);
 
-		if (n != NULL) {
-			m_copydata(m, 0, len, mtod(n, caddr_t));
-			mbuf_setlen(n, len);
-			mbuf_pkthdr_setlen(n, len);
-			m_freem(m);
+		if (n != NULL)
 			m = n;
-		}
 	}
 
 	if ((mt = mwx_txwi_get(sc)) == NULL) {
@@ -1570,6 +1581,20 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 	mt7921_mac_write_txwi(sc, m, ni, txp);
 
 	rv = mwx_txwi_enqueue(sc, mt, m);
+	if (rv == EFBIG && mbuf_next(m) != NULL) {
+		struct mbuf *n = mwx_mbuf_linearize(m);
+		static uint32_t linearize_log_count;
+
+		if (n != NULL) {
+			m = n;
+			rv = mwx_txwi_enqueue(sc, mt, m);
+		}
+		if (linearize_log_count < 8) {
+			MWX_DEV_LOG(sc, "tx linearized len=%zu rv=%d\n",
+			    mbuf_pkthdr_len(m), rv);
+			linearize_log_count++;
+		}
+	}
 	if (rv != 0) {
 		/* Mapping failed before ownership reached the TXWI. */
 		m_freem(m);
@@ -2055,6 +2080,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	timeout_set(&sc->sc_reset_to, mwx_reset_timeo, sc);
 	timeout_set(&sc->sc_scan_to, mwx_scan_timeo, sc);
 	timeout_set(&sc->sc_dma_to, mwx_dma_timeo, sc);
+	sc->sc_knobs = MWX_KNOB_DATA_RA;
 	task_set(&sc->sc_fullreset_task, mwx_fullreset_task, sc, "mwx_fullreset");
 
 	/*
@@ -2281,13 +2307,15 @@ mwx_txwi_enqueue(struct mwx_softc *sc, struct mwx_txwi *mt, struct mbuf *m)
 
 	rv = bus_dmamap_load_mbuf(sc->sc_dmat, mt->mt_map, m,
 	    BUS_DMA_WRITE | BUS_DMA_NOWAIT);
-	if (rv == EFBIG && m_defrag(m, M_DONTWAIT) == 0)
-		rv = bus_dmamap_load_mbuf(sc->sc_dmat, mt->mt_map, m,
-		    BUS_DMA_WRITE | BUS_DMA_NOWAIT);
 	if (rv != 0)
-		return rv;
+		return EFBIG;
 
 	nsegs = mt->mt_map->dm_nsegs;
+	/* The TXP only has MT_HW_TXP_MAX_BUF_NUM buffer slots. */
+	if (nsegs > MT_HW_TXP_MAX_BUF_NUM) {
+		bus_dmamap_unload(sc->sc_dmat, mt->mt_map);
+		return EFBIG;
+	}
 
 	bus_dmamap_sync(sc->sc_dmat, mt->mt_map, 0, mt->mt_map->dm_mapsize,
 	    BUS_DMASYNC_PREWRITE);
@@ -3803,6 +3831,22 @@ mwx_load_firmware(struct mwx_softc *sc)
 	MWX_DEV_LOG(sc, "firmware load start hwtype=%s\n",
 	    sc->sc_hwtype == MWX_HW_MT7922 ? "MT7922" : "MT7921");
 	reg = mwx_read(sc, MT_CONN_ON_MISC) & MT_TOP_MISC2_FW_N9_RDY;
+	if (reg != 0 && sc->sc_fw_restart) {
+		/* Like mt76_connac_mcu_restart(): drop the running firmware. */
+		uint8_t req[4] = { 1, 0, 0, 0 };
+
+		sc->sc_fw_restart = 0;
+		rv = mwx_mcu_send_msg(sc, MCU_CMD_NIC_POWER_CTRL, req,
+		    sizeof(req), NULL);
+		rv = mwx_poll(sc, MT_CONN_ON_MISC, MT_TOP_MISC2_FW_PWR_ON,
+		    MT_TOP_MISC_FW_STATE, 1000);
+		reg = mwx_read(sc, MT_CONN_ON_MISC);
+		MWX_DEV_LOG(sc, "firmware restart rv=%d misc=0x%08x\n", rv, reg);
+		reg &= MT_TOP_MISC2_FW_N9_RDY;
+		if (reg == MT_TOP_MISC2_FW_N9_RDY)
+			return EIO;
+		reg = 0;
+	}
 	if (reg != 0) {
 		MWX_DEV_LOG(sc, "firmware already downloaded status=0x%08x\n", reg);
 		return 0;
@@ -4626,6 +4670,7 @@ mwx_fullreset_task(void *arg)
 		mwx_stop(ifp);
 	rv = mwx_wfsys_reset(sc);
 	MWX_DEV_LOG(sc, "full reset wfsys rv=%d\n", rv);
+	sc->sc_fw_restart = 1;
 	/* Channel/media setup from preinit stays valid; only redo hardware. */
 	rv = mwx_init_hardware(sc);
 	MWX_DEV_LOG(sc, "full reset hardware init rv=%d\n", rv);
