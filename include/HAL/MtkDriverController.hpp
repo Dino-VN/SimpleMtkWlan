@@ -29,6 +29,7 @@ public:
     
     virtual void clearScanningFlags() = 0;
     virtual void fillDebug(void *out) = 0;
+    virtual IOReturn debugSet(uint32_t op, uint32_t val) { return kIOReturnUnsupported; }
     
     virtual IOReturn setMulticastList(IOEthernetAddress *addr, int count) = 0;
 };

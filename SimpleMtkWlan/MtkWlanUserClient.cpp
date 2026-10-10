@@ -103,6 +103,9 @@ IOReturn MtkWlanUserClient::externalMethod(uint32_t selector, IOExternalMethodAr
     if (!isSet && selector == IOCTL_80211_DEBUG &&
         arguments->structureOutputSize < sizeof(struct ioctl_debug))
         return kIOReturnBadArgument;
+    if (isSet && selector == IOCTL_80211_DEBUG &&
+        arguments->structureInputSize < sizeof(struct ioctl_debug_set))
+        return kIOReturnBadArgument;
     if (!isSet && selector == IOCTL_80211_LOG &&
         arguments->structureOutputSize < sizeof(struct ioctl_log))
         return kIOReturnBadArgument;
@@ -423,7 +426,8 @@ sDEBUG(OSObject* target, void* data, bool isSet)
 {
     MtkWlanUserClient *that = OSDynamicCast(MtkWlanUserClient, target);
     if (isSet) {
-        return kIOReturnError;
+        struct ioctl_debug_set *req = (struct ioctl_debug_set *)data;
+        return that->fDriverController->debugSet(req->op, req->val);
     }
     memset(data, 0, sizeof(struct ioctl_debug));
     that->fDriverController->fillDebug(data);

@@ -418,6 +418,17 @@ struct mwx_softc {
 	struct task		sc_reset_task;
 	CTimeout		*sc_reset_to;
 	CTimeout		*sc_scan_to;
+	CTimeout		*sc_dma_to;
+	struct task		sc_fullreset_task;
+	uint32_t		sc_knobs;
+#define MWX_KNOB_LINEARIZE	0x01	/* copy TX frames into one segment */
+#define MWX_KNOB_DATA_RA	0x02	/* unicast data uses firmware rate control */
+#define MWX_KNOB_AUTORESET	0x04	/* full reset when WFDMA gets disabled */
+	uint32_t		sc_dma_stalls;
+	uint32_t		sc_full_resets;
+	uint32_t		sc_mcu_cmd_irqs;
+	uint32_t		sc_last_mcu_cmd;
+	int			sc_dma_stall_logged;
 	u_int			sc_flags;
 #define MWX_FLAG_SCANNING		0x01
 #define MWX_FLAG_BGSCAN			0x02
@@ -695,6 +706,9 @@ void		mt7921_mcu_low_power_event(struct mwx_softc *, struct mbuf *);
 void		mt7921_mcu_tx_done_event(struct mwx_softc *, struct mbuf *);
 void		mwx_end_scan_task(void *);
 void		mwx_scan_timeo(void *);
+void		mwx_dma_timeo(void *);
+void		mwx_fullreset_task(void *);
+void		mwx_dump_dma_state(struct mwx_softc *, const char *);
 void		mt7921_mcu_scan_event(struct mwx_softc *, struct mbuf *);
 int		mt7921_mcu_hw_scan(struct mwx_softc *, int);
 int		mt7921_mcu_hw_scan_cancel(struct mwx_softc *);
@@ -949,6 +963,8 @@ mwx_init(struct ifnet *ifp)
 	ifp->if_flags |= IFF_RUNNING;
 	ifq_clr_oactive(&ifp->if_snd);
 	MWX_DEV_LOG(sc, "init interface running flags=0x%x\n", ifp->if_flags);
+	sc->sc_dma_stall_logged = 0;
+	timeout_add_sec(&sc->sc_dma_to, 2);
 
 	if (ic->ic_opmode == IEEE80211_M_MONITOR) {
 		ic->ic_bss->ni_chan = ic->ic_ibss_chan;
@@ -990,6 +1006,7 @@ mwx_stop(struct ifnet *ifp)
 	task_del(systq, &sc->sc_scan_task);
 	timeout_del(&sc->sc_reset_to);
 	timeout_del(&sc->sc_scan_to);
+	timeout_del(&sc->sc_dma_to);
 
 	ifp->if_timer = 0;
 	ifp->if_flags &= ~IFF_RUNNING;
@@ -1530,6 +1547,19 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 	struct mt76_txwi *txp;
 	int rv;
 
+	if ((sc->sc_knobs & MWX_KNOB_LINEARIZE) && mbuf_next(m) != NULL) {
+		size_t len = mbuf_pkthdr_len(m);
+		struct mbuf *n = MCLGETL(NULL, M_DONTWAIT, len);
+
+		if (n != NULL) {
+			m_copydata(m, 0, len, mtod(n, caddr_t));
+			mbuf_setlen(n, len);
+			mbuf_pkthdr_setlen(n, len);
+			m_freem(m);
+			m = n;
+		}
+	}
+
 	if ((mt = mwx_txwi_get(sc)) == NULL) {
 		m_freem(m);
 		return ENOBUFS;
@@ -1707,7 +1737,9 @@ mwx_intr(void *arg)
 
 	if (intr & MT_INT_MCU_CMD) {
 		intr_sw = mwx_read(sc, MT_MCU_CMD);
-		if (intr_log_count < 16)
+		sc->sc_mcu_cmd_irqs++;
+		sc->sc_last_mcu_cmd = intr_sw;
+		if (intr_log_count < 16 || (intr_sw & ~MT_MCU_CMD_WAKE_RX_PCIE))
 			MWX_DEV_LOG(sc, "mcu interrupt status=0x%08x\n", intr_sw);
 		/* ack MCU2HOST_SW_INT_STA */
 		mwx_write(sc, MT_MCU_CMD, intr_sw);
@@ -2022,6 +2054,8 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	task_set(&sc->sc_scan_task, mwx_end_scan_task, sc, "mwx_scan");
 	timeout_set(&sc->sc_reset_to, mwx_reset_timeo, sc);
 	timeout_set(&sc->sc_scan_to, mwx_scan_timeo, sc);
+	timeout_set(&sc->sc_dma_to, mwx_dma_timeo, sc);
+	task_set(&sc->sc_fullreset_task, mwx_fullreset_task, sc, "mwx_fullreset");
 
 	/*
 	 * We cannot read the MAC address without loading the
@@ -4533,6 +4567,76 @@ mwx_scan_timeo(void *arg)
 }
 
 void
+mwx_dump_dma_state(struct mwx_softc *sc, const char *why)
+{
+	struct mwx_queue *q = &sc->sc_txq;
+
+	MWX_DEV_LOG(sc, "dma state (%s): glo_cfg=0x%08x dummy_cr=0x%08x mcu_cmd=0x%08x "
+	    "int_sta=0x%08x int_ena=0x%08x lpctl=0x%08x\n", why,
+	    mwx_read(sc, MT_WFDMA0_GLO_CFG), mwx_read(sc, MT_WFDMA_DUMMY_CR),
+	    mwx_read(sc, MT_MCU_CMD), mwx_read(sc, MT_WFDMA0_HOST_INT_STA),
+	    mwx_read(sc, MT_WFDMA0_HOST_INT_ENA), mwx_read(sc, MT_CONN_ON_LPCTL));
+	MWX_DEV_LOG(sc, "dma state (%s): txq base=0x%08x cnt=%u cpu=%u dma=%u cons=%u "
+	    "txmcu cpu=%u dma=%u mcu_cmd_irqs=%u last_mcu_cmd=0x%08x\n", why,
+	    mwx_read(sc, q->mq_regbase), mwx_read(sc, q->mq_regbase + 4),
+	    mwx_read(sc, q->mq_regbase + MT_DMA_CPU_IDX),
+	    mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX), q->mq_cons,
+	    mwx_read(sc, sc->sc_txmcuq.mq_regbase + MT_DMA_CPU_IDX),
+	    mwx_read(sc, sc->sc_txmcuq.mq_regbase + MT_DMA_DMA_IDX),
+	    sc->sc_mcu_cmd_irqs, sc->sc_last_mcu_cmd);
+}
+
+void
+mwx_dma_timeo(void *arg)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+	struct ifnet *ifp = &sc->sc_ic.ic_if;
+
+	if ((ifp->if_flags & IFF_RUNNING) == 0 || sc->sc_resetting ||
+	    sc->sc_detaching)
+		return;
+
+	if ((mwx_read(sc, MT_WFDMA0_GLO_CFG) & MT_WFDMA0_GLO_CFG_TX_DMA_EN) == 0 &&
+	    !sc->sc_dma_stall_logged) {
+		sc->sc_dma_stall_logged = 1;
+		sc->sc_dma_stalls++;
+		mwx_dump_dma_state(sc, "TX DMA disabled");
+		if (sc->sc_knobs & MWX_KNOB_AUTORESET) {
+			sc->sc_resetting = 1;
+			task_add(systq, &sc->sc_fullreset_task);
+			return;
+		}
+	}
+	timeout_add_sec(&sc->sc_dma_to, 2);
+}
+
+/* Reset WFSYS and reload firmware; the only way out of a WFDMA stop. */
+void
+mwx_fullreset_task(void *arg)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+	struct ifnet *ifp = &sc->sc_ic.ic_if;
+	int rv, s = splnet();
+
+	sc->sc_full_resets++;
+	MWX_DEV_LOG(sc, "full reset %u start\n", sc->sc_full_resets);
+	mwx_dump_dma_state(sc, "before reset");
+	sc->sc_resetting = 1;
+	if (ifp->if_flags & IFF_RUNNING)
+		mwx_stop(ifp);
+	rv = mwx_wfsys_reset(sc);
+	MWX_DEV_LOG(sc, "full reset wfsys rv=%d\n", rv);
+	/* Channel/media setup from preinit stays valid; only redo hardware. */
+	rv = mwx_init_hardware(sc);
+	MWX_DEV_LOG(sc, "full reset hardware init rv=%d\n", rv);
+	sc->sc_resetting = 0;
+	if (rv == 0 && (ifp->if_flags & IFF_UP))
+		rv = mwx_init(ifp);
+	MWX_DEV_LOG(sc, "full reset done init rv=%d\n", rv);
+	splx(s);
+}
+
+void
 mwx_end_scan_task(void *arg)
 {
 	struct mwx_softc *sc = (struct mwx_softc *)arg;
@@ -5771,7 +5875,14 @@ mt7921_mac_write_txwi_80211(struct mwx_softc *sc, struct mbuf *m,
 	}
 #endif
 
-	if (multicast || type != IEEE80211_FC0_TYPE_DATA) {
+	/*
+	 * type is shifted here, so OpenBSD's comparison against the unshifted
+	 * IEEE80211_FC0_TYPE_DATA made every data frame fixed-rate. Keep that
+	 * behaviour unless MWX_KNOB_DATA_RA asks for firmware rate control.
+	 */
+	if (multicast ||
+	    type != (IEEE80211_FC0_TYPE_DATA >> IEEE80211_FC0_TYPE_SHIFT) ||
+	    (sc->sc_knobs & MWX_KNOB_DATA_RA) == 0) {
 		/* Fixed rata is available just for 802.11 txd */
 		uint32_t rate, val6;
 
@@ -6617,12 +6728,14 @@ MtkMwx::detach(IOPCIDevice *device)
     com->sc_detaching = true;
     timeout_del(&com->sc_reset_to);
     timeout_del(&com->sc_scan_to);
+    timeout_del(&com->sc_dma_to);
     /* Keep interrupts alive while in-flight MCU requests finish. */
     taskq_quiesce(com->sc_nswq);
     if (taskQueueOwned) taskq_quiesce(systq);
     if (ifp->if_flags & IFF_RUNNING) mwx_stop(ifp);
     timeout_free(&com->sc_reset_to);
     timeout_free(&com->sc_scan_to);
+    timeout_free(&com->sc_dma_to);
     /* No interrupt callback may access buffers during their destruction. */
     if (com->sc_ih) {
         pci_intr_disestablish(pci->pa_pc, com->sc_ih);
@@ -6857,6 +6970,13 @@ MtkMwx::fillDebug(void *out)
 	d->aspm_l1ss_after = mtk_aspm_l1ss_after;
 	d->aspm_parent_l1ss_before = mtk_aspm_parent_l1ss_before;
 	d->glo_cfg = mwx_read(sc, MT_WFDMA0_GLO_CFG);
+	d->dummy_cr = mwx_read(sc, MT_WFDMA_DUMMY_CR);
+	d->mcu_cmd = mwx_read(sc, MT_MCU_CMD);
+	d->knobs = sc->sc_knobs;
+	d->dma_stalls = sc->sc_dma_stalls;
+	d->full_resets = sc->sc_full_resets;
+	d->mcu_cmd_irqs = sc->sc_mcu_cmd_irqs;
+	d->last_mcu_cmd = sc->sc_last_mcu_cmd;
 	d->pci_status = pci_conf_read(sc->sc_pc, sc->sc_tag, 0x04);
 
 	/* The descriptor the TX data DMA engine is stuck on, if any. */
@@ -6873,6 +6993,31 @@ MtkMwx::fillDebug(void *out)
 		d->txdata_txp[1] = le16toh(ptr->len0) | (le16toh(ptr->len1) << 16);
 		d->txdata_txp[2] = le32toh(ptr->buf1);
 		d->txdata_txp[3] = mt->mt_idx;
+	}
+}
+
+IOReturn
+MtkMwx::debugSet(uint32_t op, uint32_t val)
+{
+	struct mwx_softc *sc = com;
+
+	if (sc == NULL)
+		return kIOReturnNotReady;
+	switch (op) {
+	case IOCTL_DEBUG_OP_KNOBS:
+		MWX_DEV_LOG(sc, "knobs 0x%x -> 0x%x\n", sc->sc_knobs, val);
+		sc->sc_knobs = val;
+		return kIOReturnSuccess;
+	case IOCTL_DEBUG_OP_RESET:
+		if (sc->sc_detaching)
+			return kIOReturnNotReady;
+		task_add(systq, &sc->sc_fullreset_task);
+		return kIOReturnSuccess;
+	case IOCTL_DEBUG_OP_DUMP:
+		mwx_dump_dma_state(sc, "user");
+		return kIOReturnSuccess;
+	default:
+		return kIOReturnBadArgument;
 	}
 }
 

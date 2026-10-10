@@ -220,6 +220,20 @@ struct ioctl_debug {
     uint32_t pci_status;
     uint32_t txdata_desc[4];
     uint32_t txdata_txp[4];
+    uint32_t dummy_cr, mcu_cmd;
+    uint32_t knobs, dma_stalls, full_resets, mcu_cmd_irqs, last_mcu_cmd;
+};
+
+enum {
+    IOCTL_DEBUG_OP_KNOBS = 1,   /* val = MWX_KNOB_* bits */
+    IOCTL_DEBUG_OP_RESET = 2,   /* WFSYS reset + firmware reload */
+    IOCTL_DEBUG_OP_DUMP = 3,    /* write DMA state to the log */
+};
+
+struct ioctl_debug_set {
+    unsigned int version;
+    uint32_t op;
+    uint32_t val;
 };
 
 #define MTK_LOG_CHUNK 3800
