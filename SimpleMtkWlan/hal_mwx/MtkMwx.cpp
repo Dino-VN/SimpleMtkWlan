@@ -434,6 +434,9 @@ struct mwx_softc {
 	struct task		sc_setkey_task;
 	struct task		sc_scan_task;
 	struct task		sc_reset_task;
+#ifdef AIRPORT
+	struct task		sc_power_task;
+#endif
 	CTimeout		*sc_reset_to;
 	CTimeout		*sc_scan_to;
 	CTimeout		*sc_dma_to;
@@ -676,6 +679,9 @@ int	mwx_activate(struct device *, int);
 void	mwx_reset(struct mwx_softc *);
 void	mwx_reset_timeo(void *);
 void	mwx_reset_task(void *);
+#ifdef AIRPORT
+void	mwx_power_task(void *);
+#endif
 int	mwx_txwi_alloc(struct mwx_softc *, int);
 void	mwx_txwi_free(struct mwx_softc *);
 struct mwx_txwi	*mwx_txwi_get(struct mwx_softc *);
@@ -2309,6 +2315,9 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	task_set(&sc->sc_bgscan_done_task, mwx_bgscan_done_task, sc, "mwx_bgscan");
 	task_set(&sc->sc_setkey_task, mwx_setkey_task, sc, "mwx_setkey");
 	task_set(&sc->sc_reset_task, mwx_reset_task, sc, "mwx_reset");
+#ifdef AIRPORT
+	task_set(&sc->sc_power_task, mwx_power_task, sc, "mwx_power");
+#endif
 	task_set(&sc->sc_scan_task, mwx_end_scan_task, sc, "mwx_scan");
 	timeout_set(&sc->sc_reset_to, mwx_reset_timeo, sc);
 	timeout_set(&sc->sc_scan_to, mwx_scan_timeo, sc);
@@ -2380,6 +2389,34 @@ mwx_reset_task(void *arg)
 	sc->sc_resetting = 0;
 	sc->sc_coredump_cnt = 0;
 }
+
+#ifdef AIRPORT
+/*
+ * IO80211 calls enable/disable (power, MAC address changes) with the
+ * workloop gate held. MCU replies are delivered by the interrupt event
+ * source on that same workloop, so stopping or initialising the firmware
+ * there times out every command. Bring the interface to the state
+ * IFF_UP asks for from the task queue instead, like the iwx HAL does.
+ */
+void
+mwx_power_task(void *arg)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+	struct ifnet *ifp = &sc->sc_ic.ic_if;
+	int rv;
+
+	if (sc->sc_detaching)
+		return;
+	if (ifp->if_flags & IFF_RUNNING)
+		mwx_stop(ifp);
+	if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) != IFF_UP)
+		return;
+	rv = mwx_init(ifp);
+	MWX_DEV_LOG(sc, "power task init=%d flags=0x%x\n", rv, ifp->if_flags);
+	if (rv != 0)
+		ifp->if_flags &= ~IFF_UP;
+}
+#endif
 
 int
 mwx_txwi_alloc(struct mwx_softc *sc, int count)
@@ -7238,10 +7275,16 @@ MtkMwx::enable(IONetworkInterface *interface)
 		return kIOReturnSuccess;
 	}
 	ifp->if_flags |= IFF_UP;
+#ifdef AIRPORT
+	task_add(com->sc_nswq, &com->sc_power_task);
+	MWX_DEV_LOG(com, "HAL enable queued flags=0x%x\n", ifp->if_flags);
+	return kIOReturnSuccess;
+#else
 	int rv = mwx_init(ifp);
 	MWX_DEV_LOG(com, "HAL enable done mwx_init=%d flags=0x%x\n",
 	    rv, ifp->if_flags);
 	return rv == 0 ? kIOReturnSuccess : kIOReturnError;
+#endif
 }
 
 IOReturn
@@ -7258,9 +7301,14 @@ MtkMwx::disable(IONetworkInterface *interface)
 		return kIOReturnSuccess;
 	}
 	ifp->if_flags &= ~IFF_UP;
+#ifdef AIRPORT
+	task_add(com->sc_nswq, &com->sc_power_task);
+	MWX_DEV_LOG(com, "HAL disable queued flags=0x%x\n", ifp->if_flags);
+#else
 	if (ifp->if_flags & IFF_RUNNING)
 		mwx_stop(ifp);
 	MWX_DEV_LOG(com, "HAL disable complete flags=0x%x\n", ifp->if_flags);
+#endif
 	return kIOReturnSuccess;
 }
 
