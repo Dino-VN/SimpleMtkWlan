@@ -3261,8 +3261,15 @@ mwx_dma_rx_process(struct mwx_softc *sc, struct mbuf_list *ml)
 		sc->sc_rx_pkt_normal_mcu += normal_mcu_count;
 		sc->sc_rx_pkt_normal += normal_count;
 		sc->sc_rx_pkt_unknown += unknown_count;
+		/*
+		 * Normal data arrives in nearly every batch (~2000/s under
+		 * load), so only log the first batches, the first batches with
+		 * unknown packets, and a periodic summary.
+		 */
 		if (sc->sc_rx_process_events < 64 ||
-		    normal_count != 0 || unknown_count != 0) {
+		    (unknown_count != 0 &&
+		    sc->sc_rx_pkt_unknown - unknown_count < 16) ||
+		    (sc->sc_rx_process_events & 0x3ffff) == 0) {
 			MWX_DEV_LOG(sc,
 			    "rx process event=%u notify=%u normal_mcu=%u normal=%u unknown=%u totals e=%u n=%u nmcu=%u norm=%u unk=%u\n",
 			    event_count, notify_count, normal_mcu_count,
