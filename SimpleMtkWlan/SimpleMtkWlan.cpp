@@ -218,8 +218,20 @@ void SimpleMtkWlan::joinSSID(const char *ssid_name, const char *ssid_pwd)
         join.i_len = strlen(ssid_name);
         memcpy(join.i_nwid, ssid_name, join.i_len);
     }
-    if (ieee80211_add_ess(ic, &join) == 0)
+    if (ieee80211_add_ess(ic, &join) == 0) {
         ic->ic_flags |= IEEE80211_F_AUTO_JOIN;
+        /*
+         * ieee80211_switch_ess() skips ieee80211_set_ess() when the best AP
+         * is already ic_des_essid, so new keys for the current network would
+         * never reach ic_psk. Forget the current ESSID so the next scan
+         * (after a deauth or reset) applies the updated entry.
+         */
+        if (ic->ic_des_esslen == join.i_len &&
+            memcmp(ic->ic_des_essid, join.i_nwid, join.i_len) == 0) {
+            memset(ic->ic_des_essid, 0, IEEE80211_NWID_LEN);
+            ic->ic_des_esslen = 0;
+        }
+    }
 }
 
 void SimpleMtkWlan::associateSSID(const char *ssid, const char *pwd)
