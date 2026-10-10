@@ -457,6 +457,8 @@ struct mwx_softc {
 #define MWX_KNOB_NO_TXBA	0x800	/* do not set up TX Block Ack (A-MPDU) */
 	uint8_t			sc_bss_bw;	/* CMD_CBW_* used by the BSS */
 	uint8_t			sc_bss_center;	/* center channel for sc_bss_bw */
+	uint16_t		sc_sta_wcid;	/* AP STA_REC in firmware, 0 = none */
+	uint8_t			sc_sta_addr[IEEE80211_ADDR_LEN];
 	struct task		sc_ba_task;
 	struct mwx_ba_task_arg	sc_ba_arg[16];
 	u_int			sc_ba_cur, sc_ba_tail;
@@ -814,6 +816,7 @@ int		 mt7921_mcu_wtbl_hdr_trans_tlv(struct mbuf *, uint16_t *,
 		    struct mwx_softc *, struct ieee80211_node *);
 int		 mt7921_mcu_wtbl_ht_tlv(struct mbuf *, uint16_t *,
 		    struct mwx_softc *, struct ieee80211_node *, int);
+int		 mt7921_mac_sta_remove(struct mwx_softc *);
 int		 mt7921_mac_sta_update(struct mwx_softc *,
 		    struct ieee80211_node *, int, int);
 void		 mt7921_mcu_add_key_tlv(struct mbuf *, uint16_t *,
@@ -1107,10 +1110,17 @@ mwx_stop(struct ifnet *ifp)
 		free(sc->sc_bgscan_arg, M_DEVBUF, sc->sc_bgscan_arg_size);
 		sc->sc_bgscan_arg = NULL;
 		sc->sc_bgscan_arg_size = 0;
-		if (sc->sc_flags & MWX_FLAG_SCANNING) {
+		if (sc->sc_flags & (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN)) {
 			mt7921_mcu_hw_scan_cancel(sc);
-			sc->sc_flags &= ~MWX_FLAG_SCANNING;
+			sc->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
+			/*
+			 * The cancel is asynchronous. Removing the vif while
+			 * the firmware is still leaving the scan channel makes
+			 * it coredump (power off while associated + bgscan).
+			 */
+			delay(200 * 1000);
 		}
+		mt7921_mac_sta_remove(sc);
 
 		mn = &sc->sc_vif.vif_mn;
 		mt7921_mcu_uni_add_dev(sc, &sc->sc_vif, mn, 0);
@@ -1120,6 +1130,7 @@ mwx_stop(struct ifnet *ifp)
 
 	sc->sc_newstate(ic, IEEE80211_S_INIT, -1);
 	sc->sc_ns_state = IEEE80211_S_INIT;
+	sc->sc_sta_wcid = 0;
 	ifp->if_timer = 0;
 
 #ifdef AIRPORT_WCL
@@ -1430,6 +1441,13 @@ mwx_newstate_task(void *ptr)
 	DPRINTF("%s: %s %d -> %d\n", DEVNAME(sc), __func__, ostate, nstate);
 	MWX_DEV_LOG(sc, "newstate task %d -> %d arg=%d\n", ostate, nstate, arg);
 
+	/*
+	 * Leaving the BSS: drop the AP STA_REC (and the Block Ack sessions
+	 * on it) like mac80211 does before the vif goes away.
+	 */
+	if (ostate >= IEEE80211_S_AUTH && nstate < IEEE80211_S_AUTH)
+		mt7921_mac_sta_remove(sc);
+
 	/* Scan, auth and assoc run on the primary 20 MHz channel. */
 	if (nstate != IEEE80211_S_RUN) {
 		sc->sc_bss_bw = CMD_CBW_20MHZ;
@@ -1450,7 +1468,14 @@ mwx_newstate_task(void *ptr)
 		if (rv)
 			break;
 		mwx_mcu_set_deep_sleep(sc, 0);
-		mt7921_mac_sta_update(sc, sc->sc_ic.ic_bss, 1, 1);
+		if (sc->sc_sta_wcid != 0 &&
+		    sc->sc_sta_wcid != ((struct mwx_node *)ic->ic_bss)->wcid)
+			mt7921_mac_sta_remove(sc);
+		if (mt7921_mac_sta_update(sc, ic->ic_bss, 1, 1) == 0) {
+			sc->sc_sta_wcid = ((struct mwx_node *)ic->ic_bss)->wcid;
+			IEEE80211_ADDR_COPY(sc->sc_sta_addr,
+			    ic->ic_bss->ni_macaddr);
+		}
 		break;
 	case IEEE80211_S_ASSOC:
 		mwx_mcu_set_deep_sleep(sc, 1);
@@ -6991,6 +7016,50 @@ mt7921_mcu_wtbl_ht_tlv(struct mbuf *m, uint16_t *tlvnum,
 	//smps->smps = (sta->deflink.smps_mode == IEEE80211_SMPS_DYNAMIC);
 
 	return len + sizeof(*smps);
+}
+
+/*
+ * Delete the AP STA_REC added at AUTH. Uses the saved WCID and address
+ * because ic_bss may already describe the next BSS.
+ */
+int
+mt7921_mac_sta_remove(struct mwx_softc *sc)
+{
+	struct mwx_vif *mvif = &sc->sc_vif;
+	struct sta_rec_basic *basic;
+	struct sta_rec_wtbl *wtbl;
+	struct mbuf *m;
+	uint16_t tlvnum = 0, wcid = sc->sc_sta_wcid;
+	int rv;
+
+	if (wcid == 0)
+		return 0;
+	sc->sc_sta_wcid = 0;
+
+	m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr));
+	if (m == NULL)
+		return ENOBUFS;
+
+	basic = (struct sta_rec_basic *)mwx_append_tlv(m, &tlvnum,
+	    STA_REC_BASIC, sizeof(*basic));
+	basic->extra_info = htole16(EXTRA_INFO_VER);
+	basic->conn_state = CONN_STATE_DISCONNECT;
+	basic->conn_type = htole32(STA_TYPE_AP | NETWORK_INFRA);
+	memcpy(basic->peer_addr, sc->sc_sta_addr, IEEE80211_ADDR_LEN);
+
+	wtbl = (struct sta_rec_wtbl *)mwx_append_tlv(m, &tlvnum,
+	    STA_REC_WTBL, sizeof(*wtbl));
+	wtbl->wlan_idx_lo = wcid & 0xff;
+	wtbl->wlan_idx_hi = wcid >> 8;
+	wtbl->operation = WTBL_RESET_AND_SET;
+
+	m = mwx_fill_sta_req_hdr(m, mvif, mvif->omac_idx, wcid, tlvnum);
+	if (m == NULL)
+		return ENOBUFS;
+
+	rv = mwx_mcu_send_mbuf_wait(sc, MCU_UNI_CMD_STA_REC_UPDATE, m);
+	MWX_DEV_LOG(sc, "sta remove wcid=%u rv=%d\n", wcid, rv);
+	return rv;
 }
 
 int
