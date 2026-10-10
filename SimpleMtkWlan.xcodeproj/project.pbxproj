@@ -129,6 +129,66 @@
 		F8F92586240974EF0088B8D5 /* types.h in Headers */ = {isa = PBXBuildFile; fileRef = F8F9257B240974EF0088B8D5 /* types.h */; };
 		F8F9EDE1240B7415009CB8E7 /* _task.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F8F9EDE0240B7415009CB8E7 /* _task.cpp */; };
 		F8FA0EEC2501E7EE00B1822E /* zutil.h in Headers */ = {isa = PBXBuildFile; fileRef = F8FA0EEB2501E7EE00B1822E /* zutil.h */; };
+		A1B2C3D40000000000000011 /* MtkPCIe.cpp in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4000000000000000C /* MtkPCIe.cpp */; };
+		A1B2C3D40000000000000012 /* zutil.c in Sources */ = {isa = PBXBuildFile; fileRef = F8FA0EED2501E8C100B1822E /* zutil.c */; };
+		A1B2C3D40000000000000013 /* FwBinary.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 5076FA7F24CC71E40011B2BB /* FwBinary.cpp */; };
+		A1B2C3D40000000000000014 /* MtkMwx.cpp in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000002 /* MtkMwx.cpp */; };
+		A1B2C3D40000000000000015 /* compat.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 024A07BA23FCBC6C009FBA6C /* compat.cpp */; };
+		A1B2C3D40000000000000016 /* poly1305.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07ED23FCBC6C009FBA6C /* poly1305.c */; };
+		A1B2C3D40000000000000017 /* sha2.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07CB23FCBC6C009FBA6C /* sha2.c */; };
+		A1B2C3D40000000000000018 /* arc4.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07EB23FCBC6C009FBA6C /* arc4.c */; };
+		A1B2C3D40000000000000019 /* hmac.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07CA23FCBC6C009FBA6C /* hmac.c */; };
+		A1B2C3D4000000000000001A /* ieee80211_crypto_ccmp.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC3D24080319007A9422 /* ieee80211_crypto_ccmp.c */; };
+		A1B2C3D4000000000000001B /* ieee80211_input.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC3524080319007A9422 /* ieee80211_input.c */; };
+		A1B2C3D4000000000000001C /* ieee80211_crypto_wep.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC462408031A007A9422 /* ieee80211_crypto_wep.c */; };
+		A1B2C3D4000000000000001D /* CTimeout.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC492408031A007A9422 /* CTimeout.cpp */; };
+		A1B2C3D4000000000000001E /* ieee80211_crypto.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC482408031A007A9422 /* ieee80211_crypto.c */; };
+		A1B2C3D4000000000000001F /* ieee80211_amrr.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC4024080319007A9422 /* ieee80211_amrr.c */; };
+		A1B2C3D40000000000000020 /* ieee80211_regdomain.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC4B2408031A007A9422 /* ieee80211_regdomain.c */; };
+		A1B2C3D40000000000000021 /* ieee80211_crypto_bip.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC3B24080319007A9422 /* ieee80211_crypto_bip.c */; };
+		A1B2C3D40000000000000022 /* timeout.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC3724080319007A9422 /* timeout.c */; };
+		A1B2C3D40000000000000023 /* sha1-pbkdf2.c in Sources */ = {isa = PBXBuildFile; fileRef = F88D2B3B2414E64000BBE700 /* sha1-pbkdf2.c */; };
+		A1B2C3D40000000000000024 /* _ifq.cpp in Sources */ = {isa = PBXBuildFile; fileRef = A5FA2AE328A797B200847103 /* _ifq.cpp */; };
+		A1B2C3D40000000000000025 /* MtkHalService.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F8D364F624F93AFD0029340B /* MtkHalService.cpp */; };
+		A1B2C3D40000000000000026 /* ieee80211_node.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC4C2408031A007A9422 /* ieee80211_node.c */; };
+		A1B2C3D40000000000000027 /* cast.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07CF23FCBC6C009FBA6C /* cast.c */; };
+		A1B2C3D40000000000000028 /* _string.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC3024080319007A9422 /* _string.c */; };
+		A1B2C3D40000000000000029 /* aes.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07C923FCBC6C009FBA6C /* aes.c */; };
+		A1B2C3D4000000000000002A /* ieee80211_proto.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC2F24080319007A9422 /* ieee80211_proto.c */; };
+		A1B2C3D4000000000000002B /* ecb_enc.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07E423FCBC6C009FBA6C /* ecb_enc.c */; };
+		A1B2C3D4000000000000002C /* md5.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07EA23FCBC6C009FBA6C /* md5.c */; };
+		A1B2C3D4000000000000002D /* michael.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07D123FCBC6C009FBA6C /* michael.c */; };
+		A1B2C3D4000000000000002E /* ieee80211_output.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC472408031A007A9422 /* ieee80211_output.c */; };
+		A1B2C3D4000000000000002F /* _mbuf.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F8D257732495A33500872E4F /* _mbuf.cpp */; };
+		A1B2C3D40000000000000030 /* sha1.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07D823FCBC6C009FBA6C /* sha1.c */; };
+		A1B2C3D40000000000000031 /* idgen.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07F423FCBC6C009FBA6C /* idgen.c */; };
+		A1B2C3D40000000000000032 /* ieee80211_ioctl.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC3224080319007A9422 /* ieee80211_ioctl.c */; };
+		A1B2C3D40000000000000033 /* ieee80211_ra.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C594D125FD935B0007D19C /* ieee80211_ra.c */; };
+		A1B2C3D40000000000000034 /* rmd160.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07F323FCBC6C009FBA6C /* rmd160.c */; };
+		A1B2C3D40000000000000035 /* cmac.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07DD23FCBC6C009FBA6C /* cmac.c */; };
+		A1B2C3D40000000000000036 /* ieee80211.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC3324080319007A9422 /* ieee80211.c */; };
+		A1B2C3D40000000000000037 /* chachapoly.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07E923FCBC6C009FBA6C /* chachapoly.c */; };
+		A1B2C3D40000000000000038 /* _task.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F8F9EDE0240B7415009CB8E7 /* _task.cpp */; };
+		A1B2C3D40000000000000039 /* key_wrap.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07F023FCBC6C009FBA6C /* key_wrap.c */; };
+		A1B2C3D4000000000000003A /* MtkWlanUserClient.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F8E49A12249B923500BE6868 /* MtkWlanUserClient.cpp */; };
+		A1B2C3D4000000000000003B /* ieee80211_pae_output.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC4D2408031A007A9422 /* ieee80211_pae_output.c */; };
+		A1B2C3D4000000000000003C /* ieee80211_pae_input.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC3E24080319007A9422 /* ieee80211_pae_input.c */; };
+		A1B2C3D4000000000000003D /* rijndael.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07CC23FCBC6C009FBA6C /* rijndael.c */; };
+		A1B2C3D4000000000000003E /* gmac.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07F223FCBC6C009FBA6C /* gmac.c */; };
+		A1B2C3D4000000000000003F /* ieee80211_mira.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC3924080319007A9422 /* ieee80211_mira.c */; };
+		A1B2C3D40000000000000040 /* ecb3_enc.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07CD23FCBC6C009FBA6C /* ecb3_enc.c */; };
+		A1B2C3D40000000000000041 /* arp.c in Sources */ = {isa = PBXBuildFile; fileRef = A5A0C5232A501E6800EF9328 /* arp.c */; };
+		A1B2C3D40000000000000042 /* ieee80211_rssadapt.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC3424080319007A9422 /* ieee80211_rssadapt.c */; };
+		A1B2C3D40000000000000043 /* set_key.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07CE23FCBC6C009FBA6C /* set_key.c */; };
+		A1B2C3D40000000000000044 /* ieee80211_crypto_tkip.c in Sources */ = {isa = PBXBuildFile; fileRef = F8C2EC3C24080319007A9422 /* ieee80211_crypto_tkip.c */; };
+		A1B2C3D40000000000000045 /* blf.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07EC23FCBC6C009FBA6C /* blf.c */; };
+		A1B2C3D40000000000000046 /* MtkPCIe.cpp in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4000000000000000C /* MtkPCIe.cpp */; };
+		A1B2C3D40000000000000047 /* AirportMtkWlan.cpp in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D40000000000000001 /* AirportMtkWlan.cpp */; };
+		A1B2C3D40000000000000048 /* AirportMtkSkywalkInterface.cpp in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D40000000000000003 /* AirportMtkSkywalkInterface.cpp */; };
+		A1B2C3D40000000000000049 /* AirportMtkEthernetInterface.cpp in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D40000000000000005 /* AirportMtkEthernetInterface.cpp */; };
+		A1B2C3D4000000000000004A /* MtkPCIEDeviceWrapper.cpp in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D40000000000000007 /* MtkPCIEDeviceWrapper.cpp */; };
+		A1B2C3D4000000000000004B /* WCL.cpp in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4000000000000000A /* WCL.cpp */; };
+		A1B2C3D4000000000000004C /* libkmod.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 5088ECBC252884870068A63D /* libkmod.a */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -260,6 +320,20 @@
 		F8F9EDE0240B7415009CB8E7 /* _task.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = _task.cpp; sourceTree = "<group>"; };
 		F8FA0EEB2501E7EE00B1822E /* zutil.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = zutil.h; sourceTree = "<group>"; };
 		F8FA0EED2501E8C100B1822E /* zutil.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = zutil.c; sourceTree = "<group>"; };
+		A1B2C3D40000000000000001 /* AirportMtkWlan.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = AirportMtkWlan.cpp; sourceTree = "<group>"; };
+		A1B2C3D40000000000000002 /* AirportMtkWlan.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = AirportMtkWlan.hpp; sourceTree = "<group>"; };
+		A1B2C3D40000000000000003 /* AirportMtkSkywalkInterface.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = AirportMtkSkywalkInterface.cpp; sourceTree = "<group>"; };
+		A1B2C3D40000000000000004 /* AirportMtkSkywalkInterface.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = AirportMtkSkywalkInterface.hpp; sourceTree = "<group>"; };
+		A1B2C3D40000000000000005 /* AirportMtkEthernetInterface.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = AirportMtkEthernetInterface.cpp; sourceTree = "<group>"; };
+		A1B2C3D40000000000000006 /* AirportMtkEthernetInterface.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = AirportMtkEthernetInterface.hpp; sourceTree = "<group>"; };
+		A1B2C3D40000000000000007 /* MtkPCIEDeviceWrapper.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = MtkPCIEDeviceWrapper.cpp; sourceTree = "<group>"; };
+		A1B2C3D40000000000000008 /* MtkPCIEDeviceWrapper.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MtkPCIEDeviceWrapper.hpp; sourceTree = "<group>"; };
+		A1B2C3D40000000000000009 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A1B2C3D4000000000000000A /* WCL.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = WCL.cpp; sourceTree = "<group>"; };
+		A1B2C3D4000000000000000B /* WCL.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = WCL.hpp; sourceTree = "<group>"; };
+		A1B2C3D4000000000000000C /* MtkPCIe.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = MtkPCIe.cpp; sourceTree = "<group>"; };
+		A1B2C3D4000000000000000D /* MtkPCIe.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MtkPCIe.hpp; sourceTree = "<group>"; };
+		A1B2C3D4000000000000000E /* AirportMtkWlan.kext */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AirportMtkWlan.kext; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -268,6 +342,14 @@
 			buildActionMask = 2147483647;
 			files = (
 				5088ECBD252884870068A63D /* libkmod.a in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A1B2C3D4000000000000004E /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1B2C3D4000000000000004C /* libkmod.a in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -282,6 +364,7 @@
 				F8D6CD4F2442E0D100D2A454 /* mtk80211 */,
 				024A07AD23FCBC3C009FBA6C /* Products */,
 				5088ECBB252884870068A63D /* Frameworks */,
+				A1B2C3D40000000000000010 /* AirportMtkWlan */,
 			);
 			sourceTree = "<group>";
 		};
@@ -289,6 +372,7 @@
 			isa = PBXGroup;
 			children = (
 				024A07AC23FCBC3C009FBA6C /* SimpleMtkWlan.kext */,
+				A1B2C3D4000000000000000E /* AirportMtkWlan.kext */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -303,6 +387,8 @@
 				F8D76361244F21BB00DEA040 /* pm.cpp */,
 				F8E49A12249B923500BE6868 /* MtkWlanUserClient.cpp */,
 				F8E49A13249B923500BE6868 /* MtkWlanUserClient.hpp */,
+				A1B2C3D4000000000000000C /* MtkPCIe.cpp */,
+				A1B2C3D4000000000000000D /* MtkPCIe.hpp */,
 			);
 			path = SimpleMtkWlan;
 			sourceTree = "<group>";
@@ -512,6 +598,32 @@
 			path = linux;
 			sourceTree = "<group>";
 		};
+		A1B2C3D4000000000000000F /* WCL */ = {
+			isa = PBXGroup;
+			children = (
+				A1B2C3D4000000000000000A /* WCL.cpp */,
+				A1B2C3D4000000000000000B /* WCL.hpp */,
+			);
+			path = WCL;
+			sourceTree = "<group>";
+		};
+		A1B2C3D40000000000000010 /* AirportMtkWlan */ = {
+			isa = PBXGroup;
+			children = (
+				A1B2C3D4000000000000000F /* WCL */,
+				A1B2C3D40000000000000001 /* AirportMtkWlan.cpp */,
+				A1B2C3D40000000000000002 /* AirportMtkWlan.hpp */,
+				A1B2C3D40000000000000003 /* AirportMtkSkywalkInterface.cpp */,
+				A1B2C3D40000000000000004 /* AirportMtkSkywalkInterface.hpp */,
+				A1B2C3D40000000000000005 /* AirportMtkEthernetInterface.cpp */,
+				A1B2C3D40000000000000006 /* AirportMtkEthernetInterface.hpp */,
+				A1B2C3D40000000000000007 /* MtkPCIEDeviceWrapper.cpp */,
+				A1B2C3D40000000000000008 /* MtkPCIEDeviceWrapper.hpp */,
+				A1B2C3D40000000000000009 /* Info.plist */,
+			);
+			path = AirportMtkWlan;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXHeadersBuildPhase section */
@@ -603,6 +715,22 @@
 			productReference = 024A07AC23FCBC3C009FBA6C /* SimpleMtkWlan.kext */;
 			productType = "com.apple.product-type.kernel-extension";
 		};
+		A1B2C3D40000000000000052 /* AirportMtkWlan */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A1B2C3D40000000000000051 /* Build configuration list for PBXNativeTarget "AirportMtkWlan" */;
+			buildPhases = (
+				A1B2C3D4000000000000004D /* Sources */,
+				A1B2C3D4000000000000004E /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = AirportMtkWlan;
+			productName = AirportMtkWlan;
+			productReference = A1B2C3D4000000000000000E /* AirportMtkWlan.kext */;
+			productType = "com.apple.product-type.kernel-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -612,6 +740,9 @@
 				LastUpgradeCheck = 1110;
 				ORGANIZATIONNAME = "laobamac (王孝慈)";
 				TargetAttributes = {
+					A1B2C3D40000000000000052 = {
+						ProvisioningStyle = Manual;
+					};
 					024A07AB23FCBC3C009FBA6C = {
 						CreatedOnToolsVersion = 11.1;
 						ProvisioningStyle = Manual;
@@ -632,6 +763,7 @@
 			projectRoot = "";
 			targets = (
 				024A07AB23FCBC3C009FBA6C /* SimpleMtkWlan */,
+				A1B2C3D40000000000000052 /* AirportMtkWlan */,
 			);
 		};
 /* End PBXProject section */
@@ -705,6 +837,72 @@
 				024A083323FCBC6C009FBA6C /* set_key.c in Sources */,
 				F8C2EC5C2408031A007A9422 /* ieee80211_crypto_tkip.c in Sources */,
 				024A085123FCBC6C009FBA6C /* blf.c in Sources */,
+				A1B2C3D40000000000000011 /* MtkPCIe.cpp in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A1B2C3D4000000000000004D /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1B2C3D40000000000000012 /* zutil.c in Sources */,
+				A1B2C3D40000000000000013 /* FwBinary.cpp in Sources */,
+				A1B2C3D40000000000000014 /* MtkMwx.cpp in Sources */,
+				A1B2C3D40000000000000015 /* compat.cpp in Sources */,
+				A1B2C3D40000000000000016 /* poly1305.c in Sources */,
+				A1B2C3D40000000000000017 /* sha2.c in Sources */,
+				A1B2C3D40000000000000018 /* arc4.c in Sources */,
+				A1B2C3D40000000000000019 /* hmac.c in Sources */,
+				A1B2C3D4000000000000001A /* ieee80211_crypto_ccmp.c in Sources */,
+				A1B2C3D4000000000000001B /* ieee80211_input.c in Sources */,
+				A1B2C3D4000000000000001C /* ieee80211_crypto_wep.c in Sources */,
+				A1B2C3D4000000000000001D /* CTimeout.cpp in Sources */,
+				A1B2C3D4000000000000001E /* ieee80211_crypto.c in Sources */,
+				A1B2C3D4000000000000001F /* ieee80211_amrr.c in Sources */,
+				A1B2C3D40000000000000020 /* ieee80211_regdomain.c in Sources */,
+				A1B2C3D40000000000000021 /* ieee80211_crypto_bip.c in Sources */,
+				A1B2C3D40000000000000022 /* timeout.c in Sources */,
+				A1B2C3D40000000000000023 /* sha1-pbkdf2.c in Sources */,
+				A1B2C3D40000000000000024 /* _ifq.cpp in Sources */,
+				A1B2C3D40000000000000025 /* MtkHalService.cpp in Sources */,
+				A1B2C3D40000000000000026 /* ieee80211_node.c in Sources */,
+				A1B2C3D40000000000000027 /* cast.c in Sources */,
+				A1B2C3D40000000000000028 /* _string.c in Sources */,
+				A1B2C3D40000000000000029 /* aes.c in Sources */,
+				A1B2C3D4000000000000002A /* ieee80211_proto.c in Sources */,
+				A1B2C3D4000000000000002B /* ecb_enc.c in Sources */,
+				A1B2C3D4000000000000002C /* md5.c in Sources */,
+				A1B2C3D4000000000000002D /* michael.c in Sources */,
+				A1B2C3D4000000000000002E /* ieee80211_output.c in Sources */,
+				A1B2C3D4000000000000002F /* _mbuf.cpp in Sources */,
+				A1B2C3D40000000000000030 /* sha1.c in Sources */,
+				A1B2C3D40000000000000031 /* idgen.c in Sources */,
+				A1B2C3D40000000000000032 /* ieee80211_ioctl.c in Sources */,
+				A1B2C3D40000000000000033 /* ieee80211_ra.c in Sources */,
+				A1B2C3D40000000000000034 /* rmd160.c in Sources */,
+				A1B2C3D40000000000000035 /* cmac.c in Sources */,
+				A1B2C3D40000000000000036 /* ieee80211.c in Sources */,
+				A1B2C3D40000000000000037 /* chachapoly.c in Sources */,
+				A1B2C3D40000000000000038 /* _task.cpp in Sources */,
+				A1B2C3D40000000000000039 /* key_wrap.c in Sources */,
+				A1B2C3D4000000000000003A /* MtkWlanUserClient.cpp in Sources */,
+				A1B2C3D4000000000000003B /* ieee80211_pae_output.c in Sources */,
+				A1B2C3D4000000000000003C /* ieee80211_pae_input.c in Sources */,
+				A1B2C3D4000000000000003D /* rijndael.c in Sources */,
+				A1B2C3D4000000000000003E /* gmac.c in Sources */,
+				A1B2C3D4000000000000003F /* ieee80211_mira.c in Sources */,
+				A1B2C3D40000000000000040 /* ecb3_enc.c in Sources */,
+				A1B2C3D40000000000000041 /* arp.c in Sources */,
+				A1B2C3D40000000000000042 /* ieee80211_rssadapt.c in Sources */,
+				A1B2C3D40000000000000043 /* set_key.c in Sources */,
+				A1B2C3D40000000000000044 /* ieee80211_crypto_tkip.c in Sources */,
+				A1B2C3D40000000000000045 /* blf.c in Sources */,
+				A1B2C3D40000000000000046 /* MtkPCIe.cpp in Sources */,
+				A1B2C3D40000000000000047 /* AirportMtkWlan.cpp in Sources */,
+				A1B2C3D40000000000000048 /* AirportMtkSkywalkInterface.cpp in Sources */,
+				A1B2C3D40000000000000049 /* AirportMtkEthernetInterface.cpp in Sources */,
+				A1B2C3D4000000000000004A /* MtkPCIEDeviceWrapper.cpp in Sources */,
+				A1B2C3D4000000000000004B /* WCL.cpp in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -910,6 +1108,86 @@
 			};
 			name = Release;
 		};
+		A1B2C3D4000000000000004F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = YES;
+				FRAMEWORK_SEARCH_PATHS = "";
+				GCC_PRECOMPILE_PREFIX_HEADER = YES;
+				GCC_PREFIX_HEADER = SimpleMtkWlan/PrivateSPI.pch;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					AIRPORT,
+					AIRPORT_WCL,
+					IO80211FAMILY_V2,
+					"__IO80211_TARGET=__MAC_15_2",
+					"$(inherited)",
+					__PRIVATE_SPI__,
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/MacKernelSDK/Headers",
+					"$(PROJECT_DIR)/include/Airport",
+					"$(PROJECT_DIR)/AirportMtkWlan",
+					"$(PROJECT_DIR)/SimpleMtkWlan",
+					"$(PROJECT_DIR)/SimpleMtkWlan/hal_mwx",
+				);
+				INFOPLIST_FILE = AirportMtkWlan/Info.plist;
+				KERNEL_EXTENSION_HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/MacKernelSDK/Headers";
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/mtk80211",
+					"$(PROJECT_DIR)/mtk80211/openbsd",
+					"$(PROJECT_DIR)/mtk80211/linux",
+					"$(PROJECT_DIR)/MacKernelSDK/Library/x86_64",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 15.2;
+				MODULE_NAME = com.laobamac.AirportMtkWlan;
+				PRODUCT_BUNDLE_IDENTIFIER = com.laobamac.AirportMtkWlan;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SYSTEM_HEADER_SEARCH_PATHS = "mtk80211/openbsd mtk80211 include";
+				WRAPPER_EXTENSION = kext;
+			};
+			name = Debug;
+		};
+		A1B2C3D40000000000000050 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = YES;
+				FRAMEWORK_SEARCH_PATHS = "";
+				GCC_PRECOMPILE_PREFIX_HEADER = YES;
+				GCC_PREFIX_HEADER = SimpleMtkWlan/PrivateSPI.pch;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					AIRPORT,
+					AIRPORT_WCL,
+					IO80211FAMILY_V2,
+					"__IO80211_TARGET=__MAC_15_2",
+					__PRIVATE_SPI__,
+					"$(inherited)",
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/MacKernelSDK/Headers",
+					"$(PROJECT_DIR)/include/Airport",
+					"$(PROJECT_DIR)/AirportMtkWlan",
+					"$(PROJECT_DIR)/SimpleMtkWlan",
+					"$(PROJECT_DIR)/SimpleMtkWlan/hal_mwx",
+				);
+				INFOPLIST_FILE = AirportMtkWlan/Info.plist;
+				KERNEL_EXTENSION_HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/MacKernelSDK/Headers";
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/mtk80211",
+					"$(PROJECT_DIR)/mtk80211/openbsd",
+					"$(PROJECT_DIR)/mtk80211/linux",
+					"$(PROJECT_DIR)/MacKernelSDK/Library/x86_64",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 15.2;
+				MODULE_NAME = com.laobamac.AirportMtkWlan;
+				PRODUCT_BUNDLE_IDENTIFIER = com.laobamac.AirportMtkWlan;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SYSTEM_HEADER_SEARCH_PATHS = "mtk80211/openbsd mtk80211 include";
+				WRAPPER_EXTENSION = kext;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -927,6 +1205,15 @@
 			buildConfigurations = (
 				024A07B723FCBC3C009FBA6C /* Debug */,
 				024A07B823FCBC3C009FBA6C /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A1B2C3D40000000000000051 /* Build configuration list for PBXNativeTarget "AirportMtkWlan" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A1B2C3D4000000000000004F /* Debug */,
+				A1B2C3D40000000000000050 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

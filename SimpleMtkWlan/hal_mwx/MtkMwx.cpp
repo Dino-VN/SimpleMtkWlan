@@ -902,8 +902,33 @@ mwx_poll(struct mwx_softc *sc, uint32_t reg, uint32_t val, uint32_t mask,
 /*
  * ifp specific functions
  */
+static int mwx_init_running(struct ifnet *);
+
 int
 mwx_init(struct ifnet *ifp)
+{
+	struct ieee80211com *ic = &((struct mwx_softc *)ifp->if_softc)->sc_ic;
+	int rv;
+
+#ifdef AIRPORT_WCL
+	if (ic->ic_event_handler)
+		ic->ic_event_handler(ic, IEEE80211_EVT_DRIVER_RESET_BEGIN, NULL);
+#endif
+	rv = mwx_init_running(ifp);
+#ifdef AIRPORT_WCL
+	/* WCL marks the adapter available only once the HAL is running. */
+	if (rv != 0)
+		ic->ic_wcl_mac_reconfig = false;
+	if (ic->ic_event_handler)
+		ic->ic_event_handler(ic, rv == 0 ?
+		    IEEE80211_EVT_DRIVER_READY : IEEE80211_EVT_DRIVER_STOPPED,
+		    NULL);
+#endif
+	return rv;
+}
+
+static int
+mwx_init_running(struct ifnet *ifp)
 {
 	struct mwx_softc *sc = (struct mwx_softc *)ifp->if_softc;
 	struct ieee80211com *ic = &sc->sc_ic;
@@ -1078,6 +1103,18 @@ mwx_stop(struct ifnet *ifp)
 	sc->sc_ns_state = IEEE80211_S_INIT;
 	ifp->if_timer = 0;
 
+#ifdef AIRPORT_WCL
+	if (was_running) {
+		/* The firmware scan was cancelled above; no completion will
+		 * clear these. Clear them before advertising the stop. */
+		ic->ic_flags &= ~(IEEE80211_F_BGSCAN | IEEE80211_F_ASCAN);
+		ic->ic_wcl_scan_requested = false;
+		ic->ic_wcl_scan_active = false;
+		ic->ic_wcl_scan_ssid_length = 0;
+		if (ic->ic_event_handler)
+			ic->ic_event_handler(ic, IEEE80211_EVT_DRIVER_STOPPED, NULL);
+	}
+#endif
 	splx(s);
 }
 
@@ -4736,6 +4773,19 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 		n_ssids++;
 	}
 #endif
+#ifdef AIRPORT_WCL
+	/* A directed WCL scan probes for its SSID (hidden networks). */
+	if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_active &&
+	    ic->ic_wcl_scan_ssid_length > 0 &&
+	    ic->ic_wcl_scan_ssid_length <= IEEE80211_NWID_LEN) {
+		req->ssids[0].ssid_len = htole32(ic->ic_wcl_scan_ssid_length);
+		memcpy(req->ssids[0].ssid, ic->ic_wcl_scan_ssid,
+		    ic->ic_wcl_scan_ssid_length);
+		n_ssids = 1;
+		req->scan_type = 1;
+		req->probe_req_num = 2;
+	}
+#endif
 
 	req->ssid_type = n_ssids ? 0x4 : 0x1;
 	req->ssid_type_ext = n_ssids ? 1 : 0;
@@ -4749,6 +4799,15 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 
 		if (c->ic_flags == 0)
 			continue;
+#ifdef AIRPORT_WCL
+		/* Restrict to the channels WCL asked for, if any. */
+		if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted) {
+			unsigned int chn = ieee80211_chan2ieee(ic, c);
+			if (chn >= 256 || !(ic->ic_wcl_scan_channels[chn / 8] &
+			    (1U << (chn % 8))))
+				continue;
+		}
+#endif
 
 		if (nchan < 32)
 			chan = &req->channels[nchan];

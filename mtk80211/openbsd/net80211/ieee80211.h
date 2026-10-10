@@ -2196,6 +2196,17 @@ static inline uint64_t airport_up_time()
 }
 #endif
 
+static inline uint16_t
+ieee80211_he_mcs_intersection(uint16_t a, uint16_t b)
+{
+    uint16_t result = 0;
+    for (unsigned i = 0; i < 8; i++) {
+        unsigned x = (a >> (2 * i)) & 3, y = (b >> (2 * i)) & 3;
+        result |= ((x == 3 || y == 3) ? 3 : (x < y ? x : y)) << (2 * i);
+    }
+    return result;
+}
+
 #endif /* _NET80211_IEEE80211_H_ */
 
 

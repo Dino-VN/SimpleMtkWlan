@@ -57,14 +57,19 @@ bool MtkWlanUserClient::start(IOService *provider)
 //    IOLog("start\n");
     if( !super::start( provider ))
         return false;
-    fDriver = OSDynamicCast(SimpleMtkWlan, provider);
-    fInf = fDriver->getNetworkInterface();
-    fIfp = fDriver->getIfp();
-    fDriverInfo = fDriver->fHalService->getDriverInfo();
-    fDriverController = fDriver->fHalService->getDriverController();
-    if (fDriver == NULL) {
+    fDriver = OSDynamicCast(MtkUserClientProvider, provider);
+    if (fDriver == NULL || fDriver->fHalService == NULL) {
         return false;
     }
+#ifdef AIRPORT
+    fIfp = &fDriver->fHalService->get80211Controller()->ic_ac.ac_if;
+    fInf = fIfp->iface;
+#else
+    fInf = fDriver->getNetworkInterface();
+    fIfp = fDriver->getIfp();
+#endif
+    fDriverInfo = fDriver->fHalService->getDriverInfo();
+    fDriverController = fDriver->fHalService->getDriverController();
     return true;
 }
 
@@ -119,7 +124,8 @@ sDRIVER_INFO(OSObject* target, void* data, bool isSet)
     ioctl_driver_info *drv_info = (ioctl_driver_info *)data;
     memset(drv_info, 0, sizeof(*drv_info));
     drv_info->version = IOCTL_VERSION;
-    snprintf(drv_info->bsd_name, sizeof(drv_info->bsd_name), "%s%d", ifnet_name(that->fInf->getIfnet()), ifnet_unit(that->fInf->getIfnet()));
+    if (that->fInf && that->fInf->getIfnet())
+        snprintf(drv_info->bsd_name, sizeof(drv_info->bsd_name), "%s%d", ifnet_name(that->fInf->getIfnet()), ifnet_unit(that->fInf->getIfnet()));
     strncpy(drv_info->fw_version, that->fDriverInfo->getFirmwareVersion(), sizeof(drv_info->fw_version));
     snprintf(drv_info->driver_version, sizeof(drv_info->driver_version), "%s%s", SMTW_VERSION, GIT_COMMIT);
     return kIOReturnSuccess;
@@ -222,12 +228,16 @@ sPOWER(OSObject* target, void* data, bool isSet)
     MtkWlanUserClient *that = OSDynamicCast(MtkWlanUserClient, target);
     struct ioctl_power *ip = (struct ioctl_power *)data;
     if (isSet) {
+#ifdef AIRPORT
+        return kIOReturnUnsupported;
+#else
         if (ip->enabled) {
             that->fDriver->enable(that->fInf);
         } else {
             net80211_ifstats(that->fDriver->fHalService->get80211Controller());
             that->fDriver->disable(that->fInf);
         }
+#endif
     } else {
         memset(ip, 0, sizeof(*ip));
         ip->version = IOCTL_VERSION;
@@ -344,7 +354,11 @@ sASSOCIATE(OSObject* target, void* data, bool isSet)
 {
     MtkWlanUserClient *that = OSDynamicCast(MtkWlanUserClient, target);
     struct ioctl_associate *as = (struct ioctl_associate *)data;
+#ifdef AIRPORT
+    return kIOReturnUnsupported;
+#else
     that->fDriver->associateSSID(as->nwid.nwid, as->wpa_key.key);
+#endif
     return kIOReturnSuccess;
 }
 
@@ -370,7 +384,11 @@ sJOIN(OSObject* target, void* data, bool isSet)
 {
     MtkWlanUserClient *that = OSDynamicCast(MtkWlanUserClient, target);
     struct ioctl_join *join = (struct ioctl_join *)data;
+#ifdef AIRPORT
+    return kIOReturnUnsupported;
+#else
     that->fDriver->joinSSID(join->nwid.nwid, join->wpa_key.key);
+#endif
     return kIOReturnSuccess;
 }
 

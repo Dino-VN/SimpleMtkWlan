@@ -27,7 +27,13 @@
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/network/IOEthernetInterface.h>
+#ifdef AIRPORT
+#include "MtkPCIEDeviceWrapper.hpp"
+typedef MtkPCIEDeviceWrapper MtkUserClientProvider;
+#else
 #include "SimpleMtkWlan.hpp"
+typedef SimpleMtkWlan MtkUserClientProvider;
+#endif
 #include <ClientKit/Common.h>
 
 typedef IOReturn (*IOControlMethodAction)(OSObject * target, void *data, bool isSet);
@@ -66,7 +72,7 @@ private:
     
 private:
     task_t fTask;
-    SimpleMtkWlan *fDriver;
+    MtkUserClientProvider *fDriver;
     IOEthernetInterface *fInf;
     struct _ifnet *fIfp;
     MtkDriverController *fDriverController;
