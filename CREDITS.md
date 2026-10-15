@@ -34,6 +34,14 @@ files.
 - MediaTek MT7921/MT7922 attach, firmware load, DMA, scan, and TX/authentication path
   development continues in this repository.
 
+## Contributors
+
+- Raboebie (Dihan Kapp): RZ616 (`14c3:0616`) support (`rz616` branch).
+- mavizao: TX and association path fixes.
+- eiyuumiru: RZ616 bring-up fixes (MSI interrupts, TX DMA, firmware RA),
+  802.11n/ac, RX/TX Block Ack, and the AirportMtkWlan target. AirportMtkWlan is
+  based on laobamac's AirportItlwm Sequoia/WCL code in their itlwm fork.
+
 ## License Notes
 
 The top-level project is distributed under GPLv2. Individual files may include
