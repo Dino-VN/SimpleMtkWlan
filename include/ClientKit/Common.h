@@ -227,6 +227,10 @@ struct ioctl_debug {
     uint32_t ba_agreements, ba_below_winstart, ba_above_winend;
     uint32_t ba_window_slide, ba_window_jump, ba_no_buf;
     uint32_t ba_frame_lost, ba_gap_timeout, ba_gap_timeout_ms;
+    /* TX flow control */
+    uint32_t rx_batches;
+    uint32_t tx_stalls, tx_nobufs, tx_ring_full;
+    uint32_t txwi_inuse, txwi_peak, tx_oactive;
 };
 
 enum {

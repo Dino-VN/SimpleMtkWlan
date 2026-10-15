@@ -136,6 +136,9 @@ static void cmd_debug(io_connect_t c)
         d.ba_window_jump, d.ba_no_buf);
     printf("rx ba gap_timeouts=%u frames_lost=%u gap_timeout=%u ms\n",
         d.ba_gap_timeout, d.ba_frame_lost, d.ba_gap_timeout_ms);
+    printf("rx batches=%u\n", d.rx_batches);
+    printf("tx stalls=%u nobufs=%u ring_full=%u txwi_inuse=%u peak=%u oactive=%u\n",
+        d.tx_stalls, d.tx_nobufs, d.tx_ring_full, d.txwi_inuse, d.txwi_peak, d.tx_oactive);
 }
 
 static void cmd_debug_set(io_connect_t c, uint32_t op, uint32_t val)

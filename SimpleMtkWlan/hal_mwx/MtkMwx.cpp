@@ -334,6 +334,8 @@ struct mwx_txwi_desc {
 	struct mwx_txwi			*mt_data;
 
 	u_int				mt_count;
+	u_int				mt_inuse;
+	u_int				mt_peak;
 	bus_dmamap_t			mt_map;
 	bus_dma_segment_t		mt_seg;
 	LIST_HEAD(, mwx_txwi)		mt_freelist;
@@ -543,6 +545,10 @@ struct mwx_softc {
 	uint32_t		sc_rx_delivered;
 	uint32_t		sc_rx_ctl;
 	uint32_t		sc_rx_bar;
+	uint32_t		sc_rx_batches;
+	uint32_t		sc_tx_stalls;
+	uint32_t		sc_tx_nobufs;
+	uint32_t		sc_tx_ring_full;
 	uint32_t		sc_scan_done_count;
 	uint32_t		sc_scan_last_ieee80211_nodes;
 	/* Bring-up counters, read through IOCTL_80211_DEBUG. */
@@ -675,6 +681,8 @@ void	mwx_delete_key(struct ieee80211com *, struct ieee80211_node *,
 void	mwx_setkey_task(void *);
 
 int	mwx_tx(struct mwx_softc *, struct mbuf *, struct ieee80211_node *);
+int	mwx_tx_full(struct mwx_softc *);
+void	mwx_tx_resume(struct mwx_softc *);
 void	mwx_rx(struct mwx_softc *, struct mbuf *, struct mbuf_list *);
 int	mwx_count_nodes(struct ieee80211com *);
 int	mwx_intr(void *);
@@ -1171,9 +1179,16 @@ mwx_start(struct ifnet *ifp)
 		return;
 
 	for (;;) {
-		/* XXX TODO handle oactive
+		/*
+		 * Stop before a frame would be dropped for lack of a TXWI or
+		 * a ring slot. mwx_tx_resume() restarts output once the
+		 * firmware hands TXWIs back.
+		 */
+		if (mwx_tx_full(sc)) {
 			ifq_set_oactive(&ifp->if_snd);
-		*/
+			sc->sc_tx_stalls++;
+			break;
+		}
 
 		/* need to send management frames even if we're not RUNning */
 		m = mq_dequeue(&ic->ic_mgtq);
@@ -1754,6 +1769,7 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 	}
 
 	if ((mt = mwx_txwi_get(sc)) == NULL) {
+		sc->sc_tx_nobufs++;
 		m_freem(m);
 		return ENOBUFS;
 	}
@@ -1816,8 +1832,10 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 	}
 
 	rv = mwx_dma_txwi_enqueue(sc, &sc->sc_txq, mt);
-	if (rv != 0)
+	if (rv != 0) {
+		sc->sc_tx_ring_full++;
 		mwx_txwi_put(sc, mt);
+	}
 	return rv;
 }
 
@@ -2470,6 +2488,8 @@ mwx_txwi_alloc(struct mwx_softc *sc, int count)
 	    count, (size_t)size);
 	LIST_INIT(&q->mt_freelist);
 	q->mt_count = count;
+	q->mt_inuse = 0;
+	q->mt_peak = 0;
 
 	error = bus_dmamap_create(sc->sc_dmat, size, 1, size, 0,
 	    BUS_DMA_NOWAIT, &q->mt_map);
@@ -2581,6 +2601,8 @@ mwx_txwi_get(struct mwx_softc *sc)
 		return NULL;
 	LIST_REMOVE(mt, mt_entry);
 	mt->mt_busy = 1;
+	if (++sc->sc_txwi.mt_inuse > sc->sc_txwi.mt_peak)
+		sc->sc_txwi.mt_peak = sc->sc_txwi.mt_inuse;
 	return mt;
 }
 
@@ -2604,6 +2626,7 @@ mwx_txwi_put(struct mwx_softc *sc, struct mwx_txwi *mt)
 	if (mt->mt_idx < MT_PACKET_ID_FIRST)
 		return;
 	LIST_INSERT_HEAD(&sc->sc_txwi.mt_freelist, mt, mt_entry);
+	sc->sc_txwi.mt_inuse--;
 }
 
 int
@@ -2986,6 +3009,29 @@ mwx_dma_free_slots(struct mwx_queue *q)
 	return free;
 }
 
+int
+mwx_tx_full(struct mwx_softc *sc)
+{
+	return LIST_EMPTY(&sc->sc_txwi.mt_freelist) ||
+	    mwx_dma_free_slots(&sc->sc_txq) < 1;
+}
+
+void
+mwx_tx_resume(struct mwx_softc *sc)
+{
+	struct ifnet *ifp = &sc->sc_ic.ic_if;
+
+	if (!ifq_is_oactive(&ifp->if_snd) || mwx_tx_full(sc))
+		return;
+	ifq_clr_oactive(&ifp->if_snd);
+	(*ifp->if_start)(ifp);
+#ifdef __PRIVATE_SPI__
+	/* outputStart() stopped pulling when it saw oactive. */
+	if (ifp->iface != NULL)
+		ifp->iface->signalOutputThread();
+#endif
+}
+
 static int
 mwx_dma_tx_enqueue_locked(struct mwx_softc *sc, struct mwx_queue *q,
     struct mbuf *m)
@@ -3222,8 +3268,7 @@ mwx_dma_tx_done(struct mwx_softc *sc)
 	mwx_dma_tx_cleanup(sc, &sc->sc_txq);
 	mwx_dma_tx_cleanup(sc, &sc->sc_txmcuq);
 	mwx_dma_tx_cleanup(sc, &sc->sc_txfwdlq);
-
-	/* XXX do we need to wakeup someone */
+	mwx_tx_resume(sc);
 }
 
 /* XXX wrong place */
@@ -3316,6 +3361,8 @@ mwx_dma_rx_process(struct mwx_softc *sc, struct mbuf_list *ml)
 		sc->sc_rx_process_events++;
 	}
 
+	if (!ml_empty(&mlout))
+		sc->sc_rx_batches++;
 	if_input(&sc->sc_ic.ic_if, &mlout);
 }
 
@@ -6585,6 +6632,7 @@ mwx_mac_tx_free(struct mwx_softc *sc, struct mbuf *m)
 
 out:
 	m_freem(m);
+	mwx_tx_resume(sc);
 }
 
 int
@@ -7609,6 +7657,13 @@ MtkMwx::fillDebug(void *out)
 	d->ba_gap_timeout = st->is_ht_rx_ba_window_gap_timeout;
 	d->ba_gap_timeout_ms = sc->sc_ic.ic_ba_gap_timeout_ms > 0 ?
 	    sc->sc_ic.ic_ba_gap_timeout_ms : IEEE80211_BA_GAP_TIMEOUT;
+	d->rx_batches = sc->sc_rx_batches;
+	d->tx_stalls = sc->sc_tx_stalls;
+	d->tx_nobufs = sc->sc_tx_nobufs;
+	d->tx_ring_full = sc->sc_tx_ring_full;
+	d->txwi_inuse = sc->sc_txwi.mt_inuse;
+	d->txwi_peak = sc->sc_txwi.mt_peak;
+	d->tx_oactive = ifq_is_oactive(&sc->sc_ic.ic_if.if_snd);
 	d->pci_status = pci_conf_read(sc->sc_pc, sc->sc_tag, 0x04);
 
 	/* The descriptor the TX data DMA engine is stuck on, if any. */
