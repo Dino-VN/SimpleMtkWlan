@@ -833,6 +833,13 @@ ieee80211_defrag_timeout(void *arg)
  * Process a received data MPDU related to a specific HT-immediate Block Ack
  * agreement (see 9.10.7.6).
  */
+static int
+ieee80211_ba_gap_timeout(struct ieee80211com *ic)
+{
+    return ic->ic_ba_gap_timeout_ms > 0 ?
+        ic->ic_ba_gap_timeout_ms : IEEE80211_BA_GAP_TIMEOUT;
+}
+
 void
 ieee80211_input_ba(struct ieee80211com *ic, mbuf_t m,
                    struct ieee80211_node *ni, int tid, struct ieee80211_rxinfo *rxi,
@@ -914,7 +921,7 @@ ieee80211_input_ba(struct ieee80211com *ic, mbuf_t m,
     ba->ba_gapwait++;
 
     if (ba->ba_buf[ba->ba_head].m == NULL && ba->ba_gapwait == 1)
-        timeout_add_msec(&ba->ba_gap_to, IEEE80211_BA_GAP_TIMEOUT);
+        timeout_add_msec(&ba->ba_gap_to, ieee80211_ba_gap_timeout(ic));
     
     ieee80211_input_ba_flush(ic, ni, ba, ml);
 }
@@ -984,7 +991,7 @@ ieee80211_input_ba_flush(struct ieee80211com *ic, struct ieee80211_node *ni,
     if (timeout_pending(&ba->ba_gap_to))
         timeout_del(&ba->ba_gap_to);
     if (ba->ba_gapwait)
-        timeout_add_msec(&ba->ba_gap_to, IEEE80211_BA_GAP_TIMEOUT);
+        timeout_add_msec(&ba->ba_gap_to, ieee80211_ba_gap_timeout(ic));
 }
 
 /* 

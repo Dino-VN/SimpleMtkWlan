@@ -130,6 +130,12 @@ static void cmd_debug(io_connect_t c)
     printf("dummy_cr=0x%08x mcu_cmd=0x%08x mcu_cmd_irqs=%u last_mcu_cmd=0x%08x\n",
         d.dummy_cr, d.mcu_cmd, d.mcu_cmd_irqs, d.last_mcu_cmd);
     printf("knobs=0x%x dma_stalls=%u full_resets=%u\n", d.knobs, d.dma_stalls, d.full_resets);
+    printf("rx ctl=%u bar=%u dup=%u\n", d.rx_ctl, d.rx_bar, d.rx_dup);
+    printf("rx ba agreements=%u below_winstart=%u above_winend=%u slide=%u jump=%u no_buf=%u\n",
+        d.ba_agreements, d.ba_below_winstart, d.ba_above_winend, d.ba_window_slide,
+        d.ba_window_jump, d.ba_no_buf);
+    printf("rx ba gap_timeouts=%u frames_lost=%u gap_timeout=%u ms\n",
+        d.ba_gap_timeout, d.ba_frame_lost, d.ba_gap_timeout_ms);
 }
 
 static void cmd_debug_set(io_connect_t c, uint32_t op, uint32_t val)
@@ -183,7 +189,7 @@ static void cmd_join(io_connect_t c, const char *ssid, const char *pass)
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: mtkctl info|state|debug|log|knob <hex>|reset|dump|scan [seconds]|results|join <ssid> [password]\n");
+        fprintf(stderr, "usage: mtkctl info|state|debug|log|knob <hex>|gap <ms>|reset|dump|scan [seconds]|results|join <ssid> [password]\n");
         return 2;
     }
     io_connect_t c = open_driver();
@@ -197,6 +203,8 @@ int main(int argc, char **argv)
         cmd_debug_set(c, IOCTL_DEBUG_OP_KNOBS, (uint32_t)strtoul(argv[2], NULL, 0));
     else if (!strcmp(argv[1], "reset")) cmd_debug_set(c, IOCTL_DEBUG_OP_RESET, 0);
     else if (!strcmp(argv[1], "dump")) cmd_debug_set(c, IOCTL_DEBUG_OP_DUMP, 0);
+    else if (!strcmp(argv[1], "gap") && argc >= 3)
+        cmd_debug_set(c, IOCTL_DEBUG_OP_BA_GAP, (uint32_t)strtoul(argv[2], NULL, 0));
     else if (!strcmp(argv[1], "join") && argc >= 3) cmd_join(c, argv[2], argc > 3 ? argv[3] : NULL);
     else { fprintf(stderr, "unknown command\n"); return 2; }
     IOServiceClose(c);

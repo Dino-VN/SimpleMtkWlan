@@ -222,12 +222,18 @@ struct ioctl_debug {
     uint32_t txdata_txp[4];
     uint32_t dummy_cr, mcu_cmd;
     uint32_t knobs, dma_stalls, full_resets, mcu_cmd_irqs, last_mcu_cmd;
+    /* RX Block Ack reordering (net80211 ic_stats) */
+    uint32_t rx_ctl, rx_bar, rx_dup;
+    uint32_t ba_agreements, ba_below_winstart, ba_above_winend;
+    uint32_t ba_window_slide, ba_window_jump, ba_no_buf;
+    uint32_t ba_frame_lost, ba_gap_timeout, ba_gap_timeout_ms;
 };
 
 enum {
     IOCTL_DEBUG_OP_KNOBS = 1,   /* val = MWX_KNOB_* bits */
     IOCTL_DEBUG_OP_RESET = 2,   /* WFSYS reset + firmware reload */
     IOCTL_DEBUG_OP_DUMP = 3,    /* write DMA state to the log */
+    IOCTL_DEBUG_OP_BA_GAP = 4,  /* val = RX BA gap timeout in ms, 0 = default */
 };
 
 struct ioctl_debug_set {

@@ -16,3 +16,6 @@ build/
 *.zip
 *.tar.gz
 MacKernelSDK/
+
+# Local MacKernelSDK checkout (acidanthera/MacKernelSDK), not part of this repo
+/MacKernelSDK

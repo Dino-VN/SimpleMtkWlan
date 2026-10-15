@@ -541,6 +541,8 @@ struct mwx_softc {
 	uint32_t		sc_rx_pkt_unknown;
 	uint32_t		sc_rx_fill_fail;
 	uint32_t		sc_rx_delivered;
+	uint32_t		sc_rx_ctl;
+	uint32_t		sc_rx_bar;
 	uint32_t		sc_scan_done_count;
 	uint32_t		sc_scan_last_ieee80211_nodes;
 	/* Bring-up counters, read through IOCTL_80211_DEBUG. */
@@ -1868,6 +1870,12 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
 		}
 	}
 	sc->sc_rx_delivered++;
+	if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_CTL) {
+		sc->sc_rx_ctl++;
+		if ((wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK) ==
+		    IEEE80211_FC0_SUBTYPE_BAR)
+			sc->sc_rx_bar++;
+	}
 
 	{
 		uint16_t ki;
@@ -7586,6 +7594,21 @@ MtkMwx::fillDebug(void *out)
 	d->full_resets = sc->sc_full_resets;
 	d->mcu_cmd_irqs = sc->sc_mcu_cmd_irqs;
 	d->last_mcu_cmd = sc->sc_last_mcu_cmd;
+
+	struct ieee80211_stats *st = &sc->sc_ic.ic_stats;
+	d->rx_ctl = sc->sc_rx_ctl;
+	d->rx_bar = sc->sc_rx_bar;
+	d->rx_dup = st->is_rx_dup;
+	d->ba_agreements = st->is_ht_rx_ba_agreements;
+	d->ba_below_winstart = st->is_ht_rx_frame_below_ba_winstart;
+	d->ba_above_winend = st->is_ht_rx_frame_above_ba_winend;
+	d->ba_window_slide = st->is_ht_rx_ba_window_slide;
+	d->ba_window_jump = st->is_ht_rx_ba_window_jump;
+	d->ba_no_buf = st->is_ht_rx_ba_no_buf;
+	d->ba_frame_lost = st->is_ht_rx_ba_frame_lost;
+	d->ba_gap_timeout = st->is_ht_rx_ba_window_gap_timeout;
+	d->ba_gap_timeout_ms = sc->sc_ic.ic_ba_gap_timeout_ms > 0 ?
+	    sc->sc_ic.ic_ba_gap_timeout_ms : IEEE80211_BA_GAP_TIMEOUT;
 	d->pci_status = pci_conf_read(sc->sc_pc, sc->sc_tag, 0x04);
 
 	/* The descriptor the TX data DMA engine is stuck on, if any. */
@@ -7629,6 +7652,13 @@ MtkMwx::debugSet(uint32_t op, uint32_t val)
 		return kIOReturnSuccess;
 	case IOCTL_DEBUG_OP_DUMP:
 		mwx_dump_dma_state(sc, "user");
+		return kIOReturnSuccess;
+	case IOCTL_DEBUG_OP_BA_GAP:
+		if (val > 1000)
+			return kIOReturnBadArgument;
+		MWX_DEV_LOG(sc, "ba gap timeout %d -> %u ms\n",
+		    sc->sc_ic.ic_ba_gap_timeout_ms, val);
+		sc->sc_ic.ic_ba_gap_timeout_ms = val;
 		return kIOReturnSuccess;
 	default:
 		return kIOReturnBadArgument;

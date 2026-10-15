@@ -534,6 +534,7 @@ struct ieee80211com {
 	int			ic_igtk_kid;	/* IGTK key index */
 	u_int32_t		ic_iv;		/* initial vector for wep */
 	struct ieee80211_stats	ic_stats;	/* statistics */
+	int			ic_ba_gap_timeout_ms;	/* 0 = IEEE80211_BA_GAP_TIMEOUT */
 	struct timeval		ic_last_merge_print;	/* for rate-limiting
 							 * IBSS merge print-outs
 							 */
