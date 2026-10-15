@@ -77,6 +77,73 @@ xcodebuild -project SimpleMtkWlan.xcodeproj -target AirportMtkWlan -configuratio
 join for SimpleMtkWlan, and the driver log ring, debug counters and knobs for
 both.
 
+## Installing
+
+Prebuilt kexts are on the [Releases](https://github.com/eiyuumiru/SimpleMtkWlan/releases) page. Download only one of
+them: `AirportMtkWlan` (native Wi-Fi menu, recommended) or `SimpleMtkWlan`
+(Ethernet-style, join with `mtkctl join`).
+
+Before you start, remove itlwm, AirportItlwm, or any other driver for the card,
+and any SSDT that disables the Wi-Fi PCI device. Check that the card shows up
+in `ioreg -l | grep pci14c3`. Bluetooth is not handled by these kexts.
+
+### Load after boot (tested)
+
+```sh
+sudo mkdir -p "/Library/Application Support/MtkWlan"
+sudo cp -R AirportMtkWlan.kext "/Library/Application Support/MtkWlan/"
+sudo chown -R root:wheel "/Library/Application Support/MtkWlan/AirportMtkWlan.kext"
+sudo kmutil load -p "/Library/Application Support/MtkWlan/AirportMtkWlan.kext"
+```
+
+The first load is usually refused:
+1. Click **Allow** in System Settings › Privacy & Security.
+2. Reboot.
+3. Run the `kmutil load` command again.
+
+Every new build needs approving again. To load the kext at every boot, run the
+same `kmutil load` command from a LaunchDaemon with `RunAtLoad`, a few seconds
+after boot.
+
+If you also run other unsigned kexts from the Auxiliary Kernel Collection (for
+example NullMoth), approving a new kext makes macOS rebuild that collection,
+and it can leave the others out. Check that they are all still loaded after
+the reboot.
+
+To uninstall, remove the LaunchDaemon and
+`/Library/Application Support/MtkWlan`, then reboot.
+
+### OpenCore (untested)
+
+Add the kext to `EFI/OC/Kexts` with a `Kernel › Add` entry:
+- `ExecutablePath` = `Contents/MacOS/AirportMtkWlan`
+- `MinKernel` = `24.0.0`, `MaxKernel` = `24.99.99`
+
+It does not depend on Lilu. Keep a backup EFI.
+
+### Boot arguments
+
+| Boot-arg | Effect |
+|---|---|
+| `-novht` | disable 802.11ac |
+| `-noht40` | disable 40 MHz channels |
+| `amtk_cc=XX` | AirportMtkWlan: override the country code |
+| `amtk_he=1` | AirportMtkWlan: offer 802.11ax (experimental, untested) |
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `kmutil load` says "not approved" | Approve the kext in Privacy & Security, then reboot. Also check that SIP allows unsigned kexts. |
+| The kext loads but there is no Wi-Fi | Another driver owns the card, or an SSDT hides it. |
+| Wi-Fi died and does not come back after a restart | The firmware crashed. Shut down fully, wait 10-15 s, then power on. |
+| Bluetooth disappeared together with Wi-Fi | A chip reset (`mtkctl reset`) also takes down Bluetooth. Reboot. |
+
+When reporting a problem, include:
+- your PCI ID;
+- your macOS version;
+- the output of `mtkctl debug` and `mtkctl log`.
+
 ## Building
 
 Requirements:
