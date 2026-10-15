@@ -708,8 +708,6 @@ IOReturn AirportMtkWlan::networkInterfaceNotification(
 }
 #endif
 
-extern const char* hexdump(uint8_t *buf, size_t len);
-
 #ifdef AIRPORT_WCL
 UInt32 AirportMtkWlan::outputPacket(mbuf_t m, void *param)
 {
@@ -765,14 +763,6 @@ UInt32 AirportMtkWlan::outputPacket(mbuf_t m, void *param)
         XYLog("%s mbuf is FREE!!\n", __FUNCTION__);
         ifp->netStat->outputErrors++;
         ret = kIOReturnOutputDropped;
-    }
-    size_t len = mbuf_len(m);
-    ether_header_t *eh = (ether_header_t *)mbuf_data(m);
-    if (len >= sizeof(ether_header_t) && eh->ether_type == htons(ETHERTYPE_PAE)) { // EAPOL packet
-        const char* dump = hexdump((uint8_t*)mbuf_data(m), len);
-        XYLog("output EAPOL packet, len: %zu, data: %s\n", len, dump ? dump : "Failed to allocate memory");
-        if (dump)
-            IOFree((void*)dump, 3 * len + 1);
     }
     if (!ifp->if_snd.queue->lockEnqueue(m)) {
         freePacket(m);

@@ -198,16 +198,7 @@ void SimpleMtkWlan::joinSSID(const char *ssid_name, const char *ssid_pwd)
         psk.i_enabled = 1;
         pbkdf2_sha1(ssid_pwd, (const uint8_t*)ssid_name, strlen(ssid_name),
                     4096, psk.i_psk , 32);
-        {
-            SHA1_CTX ctx;
-            uint8_t d[SHA1_DIGEST_LENGTH];
-
-            SHA1Init(&ctx);
-            SHA1Update(&ctx, psk.i_psk, sizeof(psk.i_psk));
-            SHA1Final(d, &ctx);
-            mtk_printf("SimpleMtkWlan: join ssid_len=%zu pw_len=%zu psk_fp=%02x%02x%02x%02x\n",
-                       strlen(ssid_name), strlen(ssid_pwd), d[0], d[1], d[2], d[3]);
-        }
+        mtk_printf("SimpleMtkWlan: join ssid_len=%zu\n", strlen(ssid_name));
         memset(&nwkey, 0, sizeof(ieee80211_nwkey));
         nwkey.i_wepon = 0;
         nwkey.i_defkid = 0;

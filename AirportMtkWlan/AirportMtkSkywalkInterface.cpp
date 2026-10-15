@@ -21,17 +21,6 @@ extern IOCommandGate *_fCommandGate;
 #define super IO80211InfraProtocol
 OSDefineMetaClassAndStructors(AirportMtkSkywalkInterface, IO80211InfraProtocol);
 
-const char* hexdump(uint8_t *buf, size_t len) {
-    ssize_t str_len = len * 3 + 1;
-    char *str = (char*)IOMalloc(str_len);
-    if (!str)
-        return nullptr;
-    for (size_t i = 0; i < len; i++)
-    snprintf(str + 3 * i, (len - i) * 3, "%02x ", buf[i]);
-    str[MAX(str_len - 2, 0)] = 0;
-    return str;
-}
-
 static int ieeeChanFlag2appleScanFlagVentura(int flags)
 {
     int ret = 0;
@@ -348,26 +337,11 @@ setCIPHER_KEY(struct apple80211_key *key)
 #else
 
     XYLog("%s\n", __FUNCTION__);
-    const char* keydump = hexdump(key->key, key->key_len);
-    const char* rscdump = hexdump(key->key_rsc, key->key_rsc_len);
-    const char* eadump = hexdump(key->key_ea.octet, APPLE80211_ADDR_LEN);
     static_assert(__offsetof(struct apple80211_key, key_ea) == 92, "struct corrupted");
     static_assert(__offsetof(struct apple80211_key, key_rsc_len) == 80, "struct corrupted");
     static_assert(__offsetof(struct apple80211_key, wowl_kck_len) == 100, "struct corrupted");
     static_assert(__offsetof(struct apple80211_key, wowl_kek_len) == 120, "struct corrupted");
     static_assert(__offsetof(struct apple80211_key, wowl_kck_key) == 104, "struct corrupted");
-    if (keydump && rscdump && eadump)
-        XYLog("Set key request: len=%d cipher_type=%d flags=%d index=%d key=%s rsc_len=%d rsc=%s ea=%s\n",
-              key->key_len, key->key_cipher_type, key->key_flags, key->key_index, keydump, key->key_rsc_len, rscdump, eadump);
-    else
-        XYLog("Set key request, but failed to allocate memory for hexdump\n");
-    
-    if (keydump)
-        IOFree((void*)keydump, 3 * key->key_len + 1);
-    if (rscdump)
-        IOFree((void*)rscdump, 3 * key->key_rsc_len + 1);
-    if (eadump)
-        IOFree((void*)eadump, 3 * APPLE80211_ADDR_LEN + 1);
     
     switch (key->key_cipher_type) {
         case APPLE80211_CIPHER_NONE:
