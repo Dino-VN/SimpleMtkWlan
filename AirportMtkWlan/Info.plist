@@ -29,7 +29,7 @@
 		<key>NetworkController</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
-			<string>com.laobamac.AirportMtkWlan</string>
+			<string>com.eiyuumiru.AirportMtkWlan</string>
 			<key>IOClass</key>
 			<string>AirportMtkWlan</string>
 			<key>IOMatchCategory</key>
@@ -46,7 +46,7 @@
 		<key>MtkPCIEDeviceWrapper</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
-			<string>com.laobamac.AirportMtkWlan</string>
+			<string>com.eiyuumiru.AirportMtkWlan</string>
 			<key>IOClass</key>
 			<string>MtkPCIEDeviceWrapper</string>
 			<key>IOPCIPrimaryMatch</key>

@@ -1140,8 +1140,8 @@
 					"$(PROJECT_DIR)/MacKernelSDK/Library/x86_64",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.2;
-				MODULE_NAME = com.laobamac.AirportMtkWlan;
-				PRODUCT_BUNDLE_IDENTIFIER = com.laobamac.AirportMtkWlan;
+				MODULE_NAME = com.eiyuumiru.AirportMtkWlan;
+				PRODUCT_BUNDLE_IDENTIFIER = com.eiyuumiru.AirportMtkWlan;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SYSTEM_HEADER_SEARCH_PATHS = "mtk80211/openbsd mtk80211 include";
 				WRAPPER_EXTENSION = kext;
@@ -1180,8 +1180,8 @@
 					"$(PROJECT_DIR)/MacKernelSDK/Library/x86_64",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.2;
-				MODULE_NAME = com.laobamac.AirportMtkWlan;
-				PRODUCT_BUNDLE_IDENTIFIER = com.laobamac.AirportMtkWlan;
+				MODULE_NAME = com.eiyuumiru.AirportMtkWlan;
+				PRODUCT_BUNDLE_IDENTIFIER = com.eiyuumiru.AirportMtkWlan;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SYSTEM_HEADER_SEARCH_PATHS = "mtk80211/openbsd mtk80211 include";
 				WRAPPER_EXTENSION = kext;
