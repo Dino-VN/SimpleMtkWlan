@@ -92,7 +92,10 @@ both.
 
 Prebuilt kexts are on the [Releases](https://github.com/eiyuumiru/SimpleMtkWlan/releases) page. Download only one of
 them: `AirportMtkWlan` (native Wi-Fi menu, recommended) or `SimpleMtkWlan`
-(Ethernet-style, join with `mtkctl join`).
+(Ethernet-style, join with `mtkctl join`). For AirportMtkWlan, pick the zip for
+your macOS version: `AirportMtkWlan-Sequoia` for macOS 15,
+`AirportMtkWlan-Tahoe` for macOS 26. Both contain a kext named
+`AirportMtkWlan.kext`.
 
 Before you start, remove itlwm, AirportItlwm, or any other driver for the card,
 and any SSDT that disables the Wi-Fi PCI device. Check that the card shows up
@@ -128,7 +131,8 @@ To uninstall, remove the LaunchDaemon and
 
 Add the kext to `EFI/OC/Kexts` with a `Kernel › Add` entry:
 - `ExecutablePath` = `Contents/MacOS/AirportMtkWlan`
-- `MinKernel` = `24.0.0`, `MaxKernel` = `24.99.99`
+- macOS 15 build: `MinKernel` = `24.0.0`, `MaxKernel` = `24.99.99`
+- macOS 26 build: `MinKernel` = `25.0.0`, `MaxKernel` = `25.99.99`
 
 It does not depend on Lilu. Keep a backup EFI.
 
