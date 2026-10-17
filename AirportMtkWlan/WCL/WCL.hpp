@@ -213,6 +213,56 @@ static_assert(sizeof(ConnectionEvent) == 0xa4, "ConnectionEvent size");
 static_assert(sizeof(DeauthEvent) == 0x14, "DeauthEvent size");
 static_assert(sizeof(ChannelInfo) == 0xc86, "ChannelInfo size");
 
+// Layout of apple80211_channels_info (APPLE80211_IOC_CHANNELS_INFO), from
+// laobamac/itlwm 36d5e28.
+struct NativeChannelInfo {
+    uint8_t reserved0[8];
+    uint8_t country[4];
+    uint16_t count;
+    uint16_t channelSpec[400];
+    uint8_t channel[400];
+    uint8_t indoor[400];
+    uint8_t dfs[400];
+    uint8_t passive[400];
+    uint8_t supports40MHz[400];
+    uint8_t supports80MHz[400];
+    uint8_t reserved1[2];
+    uint32_t firmwareChannelSpec[400];
+    uint32_t channelBitmap[400];
+    uint8_t reserved2[0x2720 - 0x1910];
+};
+static_assert(sizeof(NativeChannelInfo) == 0x2720, "CHANNELS_INFO native size");
+static_assert(offsetof(NativeChannelInfo, country) == 8, "CHANNELS_INFO country");
+static_assert(offsetof(NativeChannelInfo, count) == 0xc, "CHANNELS_INFO count");
+static_assert(offsetof(NativeChannelInfo, channelSpec) == 0xe, "CHANNELS_INFO chanspec");
+static_assert(offsetof(NativeChannelInfo, channel) == 0x32e, "CHANNELS_INFO channel");
+static_assert(offsetof(NativeChannelInfo, indoor) == 0x4be, "CHANNELS_INFO indoor");
+static_assert(offsetof(NativeChannelInfo, dfs) == 0x64e, "CHANNELS_INFO DFS");
+static_assert(offsetof(NativeChannelInfo, passive) == 0x7de, "CHANNELS_INFO passive");
+static_assert(offsetof(NativeChannelInfo, supports40MHz) == 0x96e, "CHANNELS_INFO 40 MHz");
+static_assert(offsetof(NativeChannelInfo, supports80MHz) == 0xafe, "CHANNELS_INFO 80 MHz");
+static_assert(offsetof(NativeChannelInfo, firmwareChannelSpec) == 0xc90, "CHANNELS_INFO firmware chanspec");
+static_assert(offsetof(NativeChannelInfo, channelBitmap) == 0x12d0, "CHANNELS_INFO bitmap");
+
+inline bool appendChannel(NativeChannelInfo &info, unsigned channel, bool fiveGHz,
+                          bool dfs, bool passive, bool supports40MHz, bool supports80MHz)
+{
+    if (!channel || channel > 255 || info.count >= 400)
+        return false;
+    unsigned index = info.count++;
+    uint16_t spec = uint16_t(channel | (fiveGHz ? 0xd000 : 0x1000));
+    info.channelSpec[index] = spec;
+    info.firmwareChannelSpec[index] = spec;
+    info.channel[index] = channel;
+    info.dfs[index] = dfs;
+    info.passive[index] = passive;
+    info.supports40MHz[index] = supports40MHz;
+    info.supports80MHz[index] = supports80MHz;
+    info.channelBitmap[index] = 3U | (fiveGHz ? 4U : 0U) |
+        (dfs ? 8U : 0U) | (passive ? 32U : 0U);
+    return true;
+}
+
 inline uint16_t read16(const uint8_t *p) {
     return uint16_t(p[0]) | uint16_t(p[1]) << 8;
 }
