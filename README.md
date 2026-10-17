@@ -36,7 +36,7 @@ Currently targeted device:
 
 Other MediaTek devices are not currently supported.
 
-## AirportMtkWlan (native Wi-Fi menu, macOS 15)
+## AirportMtkWlan (native Wi-Fi menu, macOS 15 and 26)
 
 This fork adds a second target, `AirportMtkWlan`. It puts the same MediaTek
 driver core behind IO80211/Skywalk, using laobamac's AirportItlwm Sequoia/WCL
@@ -45,7 +45,9 @@ menu, System Settings › Wi-Fi and `airportd`, with no helper app. It replaces
 SimpleMtkWlan: **never load both at the same time.**
 
 Tested on one machine only (Lenovo Legion Slim 5 16APH8, RZ616 `14c3:0616`,
-macOS 15.8.1).
+macOS 15.8.1 and macOS 26.7.1). Sequoia and Tahoe use different IO80211 ABIs, so
+each needs its own build (see below). A build only starts on the macOS major
+version it was built for.
 
 Works:
 - scan on 2.4 and 5 GHz;
@@ -67,11 +69,20 @@ Known problems:
 The kext is unsigned. SIP must allow unsigned and unapproved kexts
 (`CSR_ALLOW_UNTRUSTED_KEXTS` | `CSR_ALLOW_UNAPPROVED_KEXTS`).
 
-Build:
+Build for macOS 15 (Sequoia 15.2 and later):
 
 ```sh
 xcodebuild -project SimpleMtkWlan.xcodeproj -target AirportMtkWlan -configuration Debug ARCHS=x86_64 CODE_SIGNING_ALLOWED=NO build
 ```
+
+Build for macOS 26 (Tahoe):
+
+```sh
+xcodebuild -project SimpleMtkWlan.xcodeproj -target AirportMtkWlan -configuration Debug ARCHS=x86_64 CODE_SIGNING_ALLOWED=NO AMTK_IO80211_TARGET=__MAC_26_0 build
+```
+
+A Sequoia build loads on Tahoe but never attaches (`AirportMtkWlan::probe`
+fails right after `init`), so no Wi-Fi interface appears.
 
 `tools/mtkctl` (see `tools/mtkctl.c`) talks to either kext. It provides scan and
 join for SimpleMtkWlan, and the driver log ring, debug counters and knobs for
@@ -166,7 +177,7 @@ The debug kext will be produced by Xcode as `SimpleMtkWlan.kext`.
 - `SimpleMtkWlan/hal_mwx/` - MT7921/MT7922 driver implementation
 - `mtk80211/` - compatibility, OpenBSD net80211, and support code
 - `include/` - shared driver interfaces and generated firmware table
-- `AirportMtkWlan/` - IO80211/Skywalk (WCL) front end for macOS 15
+- `AirportMtkWlan/` - IO80211/Skywalk (WCL) front end for macOS 15 and 26
 - `include/Airport/` - IO80211Family and Skywalk headers
 - `tools/` - `mtkctl` command-line client
 - `scripts/` - firmware generation helpers

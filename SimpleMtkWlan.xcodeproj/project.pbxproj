@@ -1112,6 +1112,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = YES;
+				AMTK_IO80211_TARGET = __MAC_15_2;
 				FRAMEWORK_SEARCH_PATHS = "";
 				GCC_PRECOMPILE_PREFIX_HEADER = YES;
 				GCC_PREFIX_HEADER = SimpleMtkWlan/PrivateSPI.pch;
@@ -1119,7 +1120,7 @@
 					AIRPORT,
 					AIRPORT_WCL,
 					IO80211FAMILY_V2,
-					"__IO80211_TARGET=__MAC_15_2",
+					"__IO80211_TARGET=$(AMTK_IO80211_TARGET)",
 					"$(inherited)",
 					__PRIVATE_SPI__,
 				);
@@ -1152,6 +1153,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = YES;
+				AMTK_IO80211_TARGET = __MAC_15_2;
 				FRAMEWORK_SEARCH_PATHS = "";
 				GCC_PRECOMPILE_PREFIX_HEADER = YES;
 				GCC_PREFIX_HEADER = SimpleMtkWlan/PrivateSPI.pch;
@@ -1159,7 +1161,7 @@
 					AIRPORT,
 					AIRPORT_WCL,
 					IO80211FAMILY_V2,
-					"__IO80211_TARGET=__MAC_15_2",
+					"__IO80211_TARGET=$(AMTK_IO80211_TARGET)",
 					__PRIVATE_SPI__,
 					"$(inherited)",
 				);
