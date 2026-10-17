@@ -1297,9 +1297,13 @@ ieee80211_amsdu_decap(struct ieee80211com *ic, mbuf_t m,
     
     while (mbuf_pkthdr_len(m) >= ETHER_HDR_LEN + LLC_SNAPFRAMELEN) {
         /* process an A-MSDU subframe */
-        mbuf_pullup(&m, ETHER_HDR_LEN + LLC_SNAPFRAMELEN);
-        if (m == NULL)
-            break;
+        /* mbuf_pullup() frees m on failure */
+        if (mbuf_len(m) < ETHER_HDR_LEN + LLC_SNAPFRAMELEN &&
+            mbuf_pullup(&m, ETHER_HDR_LEN + LLC_SNAPFRAMELEN)) {
+            ic->ic_stats.is_rx_decap++;
+            ml_purge(&subframes);
+            return;
+        }
         eh = mtod(m, struct ether_header *);
         /* examine 802.3 header */
         len = ntohs(eh->ether_type);
@@ -1337,9 +1341,9 @@ ieee80211_amsdu_decap(struct ieee80211com *ic, mbuf_t m,
             return;
         }
         
-        /* "detach" our A-MSDU subframe from the others */
-        mbuf_split(m, len, MBUF_DONTWAIT, &n);
-        if (n == NULL) {
+        /* Validate before splitting, so a bad subframe does not leak the
+         * rest of the A-MSDU (n) on the error path. */
+        if (ieee80211_amsdu_decap_validate(ic, m, ni)) {
             /* stop processing A-MSDU subframes */
             ic->ic_stats.is_rx_decap++;
             ml_purge(&subframes);
@@ -1347,7 +1351,9 @@ ieee80211_amsdu_decap(struct ieee80211com *ic, mbuf_t m,
             return;
         }
         
-        if (ieee80211_amsdu_decap_validate(ic, m, ni)) {
+        /* "detach" our A-MSDU subframe from the others */
+        mbuf_split(m, len, MBUF_DONTWAIT, &n);
+        if (n == NULL) {
             /* stop processing A-MSDU subframes */
             ic->ic_stats.is_rx_decap++;
             ml_purge(&subframes);
