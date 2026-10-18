@@ -462,8 +462,12 @@ int bus_dmamap_load(bus_dmamap_t map, mbuf_t mb) {
 				map->dm_bounce_mem = 0;
 				map->dm_bounce_size = 0;
 			}
+			/* Cacheable: PCIe DMA is cache-coherent on x86, and every
+			 * packet is copied through here, which is very slow on
+			 * uncached memory. */
 			IOBufferMemoryDescriptor *mem =
-			    alloc_dma_memory(bounce_size, PAGE_SIZE);
+			    alloc_dma_memory(bounce_size, PAGE_SIZE,
+			    kIOMemoryPhysicallyContiguous);
 			if (mem == 0)
 				return 1;
 			map->dm_bounce_mem = mem;

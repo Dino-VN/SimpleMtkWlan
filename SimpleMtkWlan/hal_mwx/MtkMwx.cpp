@@ -3401,16 +3401,19 @@ mwx_dma_rx_dequeue(struct mwx_softc *sc, struct mwx_queue *q,
 		md = &q->mq_data[idx];
 		desc = &q->mq_desc[idx];
 
+		/* only buf0 is used on RX rings */
+		ctrl = le32toh(desc->ctrl);
+
+		/* only copy back what the device wrote */
 		bus_dmamap_sync(sc->sc_dmat, md->md_map, 0,
-		    md->md_map->dm_mapsize, BUS_DMASYNC_POSTREAD);
+		    MIN(MT_DNA_CTL_SD_GET_LEN0(ctrl), md->md_map->dm_mapsize),
+		    BUS_DMASYNC_POSTREAD);
 		bus_dmamap_unload(sc->sc_dmat, md->md_map);
 
 		/* dequeue mbuf */
 		m = md->md_mbuf;
 		md->md_mbuf = NULL;
 
-		/* only buf0 is used on RX rings */
-		ctrl = le32toh(desc->ctrl);
 		mbuf_setlen(m, MT_DNA_CTL_SD_GET_LEN0(ctrl));
 
 		if (m0 == NULL) {
