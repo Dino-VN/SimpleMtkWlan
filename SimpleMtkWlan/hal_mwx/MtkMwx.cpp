@@ -445,6 +445,8 @@ struct mwx_softc {
 	CTimeout		*sc_scan_to;
 	CTimeout		*sc_dma_to;
 	struct task		sc_fullreset_task;
+	uint32_t		sc_bgscan_dwell;	/* ms per channel while associated */
+#define MWX_BGSCAN_DWELL_AUTO	0xffffffffU	/* from WCL away time, else firmware */
 	uint32_t		sc_knobs;
 #define MWX_KNOB_LINEARIZE	0x01	/* copy TX frames into one segment */
 #define MWX_KNOB_DATA_RA	0x02	/* unicast data uses firmware rate control */
@@ -468,6 +470,8 @@ struct mwx_softc {
 	uint32_t		sc_rx_mode_cnt[16];	/* data frames per PHY mode */
 	uint32_t		sc_rx_cur_rate;		/* RXV word 0, current frame */
 	uint32_t		sc_rx_data_rate;	/* RXV word 0, last data frame */
+	struct timeval		sc_txs_last;	/* last data frame sent with TX status */
+	uint32_t		sc_txs_count;
 	uint32_t		sc_rx_data_cnt;
 	uint32_t		sc_dma_stalls;
 	uint32_t		sc_full_resets;
@@ -791,6 +795,7 @@ int		mt7921_mac_fill_rx(struct mwx_softc *, struct mbuf *,
 uint32_t	mt7921_mac_tx_rate_val(struct mwx_softc *);
 void		mt7921_mac_write_txwi_80211(struct mwx_softc *, struct mbuf *,
 		    struct ieee80211_node *, struct mt76_txwi *);
+void		mt7921_mac_add_txs(struct mwx_softc *, const uint32_t *);
 void		mt7921_mac_write_txwi(struct mwx_softc *, struct mbuf *,
 		    struct ieee80211_node *, struct mt76_txwi *);
 void		mwx_mac_tx_free(struct mwx_softc *, struct mbuf *);
@@ -2017,6 +2022,8 @@ mwx_intr(void *arg)
 			MWX_DEV_LOG(sc, "mcu interrupt status=0x%08x\n", intr_sw);
 		/* ack MCU2HOST_SW_INT_STA */
 		mwx_write(sc, MT_MCU_CMD, intr_sw);
+		if (intr_sw & MT_MCU_CMD_ERROR_MASK)
+			mwx_dump_dma_state(sc, "firmware error");
 		if (intr_sw & MT_MCU_CMD_WAKE_RX_PCIE)
 			intr |= MT_INT_RX_DONE_DATA;
 	}
@@ -2364,6 +2371,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	timeout_set(&sc->sc_scan_to, mwx_scan_timeo, sc);
 	timeout_set(&sc->sc_dma_to, mwx_dma_timeo, sc);
 	sc->sc_knobs = MWX_KNOB_DATA_RA;
+	sc->sc_bgscan_dwell = MWX_BGSCAN_DWELL_AUTO;
 	task_set(&sc->sc_fullreset_task, mwx_fullreset_task, sc, "mwx_fullreset");
 	task_set(&sc->sc_ba_task, mwx_ba_task, sc, "mwx_ba");
 
@@ -3302,13 +3310,15 @@ mwx_dma_rx_process(struct mwx_softc *sc, struct mbuf_list *ml)
 			notify_count++;
 			mwx_mac_tx_free(sc, m);
 			break;
-		case PKT_TYPE_TXS:
-#if TODO
-			for (rxd += 2; rxd + 8 <= end; rxd += 8)
-				mt7921_mac_add_txs(dev, rxd);
-#endif
+		case PKT_TYPE_TXS: {
+			size_t words = mbuf_len(m) / sizeof(uint32_t);
+			size_t i;
+
+			for (i = 2; i + 8 <= words; i += 8)
+				mt7921_mac_add_txs(sc, &data[i]);
 			m_freem(m);
 			break;
+		}
 		case PKT_TYPE_NORMAL_MCU:
 			normal_mcu_count++;
 			mwx_rx(sc, m, &mlout);
@@ -4898,6 +4908,47 @@ mt7921_mcu_tx_done_event(struct mwx_softc *sc, struct mbuf *m)
 	// TODO mt7921_mac_add_txs(dev, event->txs);
 }
 
+/*
+ * TX status of a data frame: record the rate the firmware sent it at
+ * (mt76_connac2_mac_fill_txs) so getRATE/getMCS report the real link.
+ * TXS does not carry the guard interval.
+ */
+void
+mt7921_mac_add_txs(struct mwx_softc *sc, const uint32_t *txs_data)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni = ic->ic_bss;
+	uint32_t txs = le32toh(txs_data[0]);
+	uint32_t pid = le32toh(txs_data[3]) >> 24;
+	uint32_t rate, mode, mcs, nss;
+
+	if (pid < MT_PACKET_ID_FIRST || ni == NULL ||
+	    ic->ic_state != IEEE80211_S_RUN ||
+	    (txs & 0x00070000) != 0)		/* MT_TXS0_ACK_ERROR_MASK */
+		return;
+	rate = txs & 0x3fff;			/* MT_TXS0_TX_RATE */
+	mode = (rate & MT_TX_RATE_MODE_MASK) >> MT_TX_RATE_MODE_SHIFT;
+	mcs = rate & MT_TX_RATE_IDX_MASK;
+	nss = ((rate & MT_TX_RATE_NSS_MASK) >> MT_TX_RATE_NSS_SHIFT) + 1;
+	if ((rate & MT_TX_RATE_STBC) && nss > 1)
+		nss >>= 1;
+	switch (mode) {
+	case MT_PHY_TYPE_HT:
+	case MT_PHY_TYPE_HT_GF:
+		ni->ni_txmcs = (mcs & 7) + (nss - 1) * 8;
+		break;
+	case MT_PHY_TYPE_VHT:
+		ni->ni_txmcs = mcs;
+		ni->ni_vht_ss = nss;
+		break;
+	default:
+		return;
+	}
+	if ((sc->sc_txs_count++ & 0x3ff) == 0)
+		MWX_DEV_LOG(sc, "tx rate mode=%u mcs=%u nss=%u bw=%u\n",
+		    mode, mcs, nss, (txs >> 29) & 0x3);
+}
+
 int
 mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 {
@@ -4908,6 +4959,7 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	int n_ssids = 0;
 	int rv;
 	uint8_t nchan, n_2g = 0, n_5g = 0;
+	uint16_t dwell;
 
 	m = mwx_mcu_alloc_msg(sizeof(*req));
 	if (m == NULL)
@@ -4997,9 +5049,29 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	}
 
 	req->channel_type = nchan ? 4 : 0;
-	req->timeout_value = htole16(nchan * 120);
-	req->channel_min_dwell_time = htole16(120);
-	req->channel_dwell_time = htole16(120);
+	/*
+	 * Off-channel time is dead time for the link we are on, so background
+	 * scans leave the dwell to the firmware (0) as Linux mt7921 does for
+	 * every scan; split scan then returns to the operating channel between
+	 * channel groups.  When airportd sets a home/away time, stay within it:
+	 * the firmware visits about three channels per trip off channel
+	 * (measured: 110 ms dwell gave ~300 ms gaps, 40 ms gave ~135 ms).
+	 * Unassociated scans keep the longer fixed dwell.
+	 */
+	if (!bgscan)
+		dwell = 120;
+	else if (sc->sc_bgscan_dwell != MWX_BGSCAN_DWELL_AUTO)
+		dwell = sc->sc_bgscan_dwell;
+	else {
+		dwell = 0;
+#ifdef AIRPORT_WCL
+		if (ic->ic_wcl_scan_away_time_ms != 0)
+			dwell = MIN(MAX(ic->ic_wcl_scan_away_time_ms / 3, 20), 120);
+#endif
+	}
+	req->timeout_value = htole16(nchan * dwell);
+	req->channel_min_dwell_time = htole16(dwell);
+	req->channel_dwell_time = htole16(dwell);
 
 
 #ifdef NOTYET
@@ -5087,6 +5159,36 @@ mwx_dump_dma_state(struct mwx_softc *sc, const char *why)
 	    mwx_read(sc, sc->sc_txmcuq.mq_regbase + MT_DMA_CPU_IDX),
 	    mwx_read(sc, sc->sc_txmcuq.mq_regbase + MT_DMA_DMA_IDX),
 	    sc->sc_mcu_cmd_irqs, sc->sc_last_mcu_cmd);
+
+	/*
+	 * The firmware stops TX DMA on a descriptor it does not accept; log
+	 * the one it stopped at and the one before it so the frame is known.
+	 */
+	if (q->mq_desc == NULL || q->mq_data == NULL || q->mq_count == 0)
+		return;
+	uint32_t dma = mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX) % q->mq_count;
+	for (int back = 1; back >= 0; back--) {
+		uint32_t idx = (dma + q->mq_count - back) % q->mq_count;
+		struct mwx_desc *desc = &q->mq_desc[idx];
+		struct mwx_txwi *mt = q->mq_data[idx].md_txwi;
+		struct mt76_txwi *w;
+
+		MWX_DEV_LOG(sc, "dma state (%s): desc[%u] buf0=0x%08x ctrl=0x%08x "
+		    "buf1=0x%08x info=0x%08x\n", why, idx, le32toh(desc->buf0),
+		    le32toh(desc->ctrl), le32toh(desc->buf1), le32toh(desc->info));
+		if (mt == NULL || (w = mt->mt_desc) == NULL)
+			continue;
+		MWX_DEV_LOG(sc, "dma state (%s): txwi[%u] %08x %08x %08x %08x %08x "
+		    "%08x %08x %08x txp %08x/%u/%u/%08x %08x/%u/%u/%08x mbuf=%p\n",
+		    why, mt->mt_idx, le32toh(w->txwi[0]), le32toh(w->txwi[1]),
+		    le32toh(w->txwi[2]), le32toh(w->txwi[3]), le32toh(w->txwi[4]),
+		    le32toh(w->txwi[5]), le32toh(w->txwi[6]), le32toh(w->txwi[7]),
+		    le32toh(w->ptr[0].buf0), le16toh(w->ptr[0].len0),
+		    le16toh(w->ptr[0].len1), le32toh(w->ptr[0].buf1),
+		    le32toh(w->ptr[1].buf0), le16toh(w->ptr[1].len0),
+		    le16toh(w->ptr[1].len1), le32toh(w->ptr[1].buf1),
+		    (void *)mt->mt_mbuf);
+	}
 }
 
 void
@@ -6534,11 +6636,20 @@ mt7921_mac_write_txwi(struct mwx_softc *sc, struct mbuf *m,
 	uint32_t val, p_fmt, omac_idx;
 	uint8_t q_idx, wmm_idx, band_idx;
 	uint8_t phy_idx = 0;
-	/* XXX hardcoded and wrong */
-	int pid = MT_PACKET_ID_FIRST;
+	static const struct timeval txs_interval = { 0, 250000 };
+	int pid = MT_PACKET_ID_NO_SKB;
 	enum mt76_txq_id qid = MT_TXQ_BE;
 
 	wh = mtod(m, struct ieee80211_frame *);
+	/*
+	 * Ask for TX status on a unicast data frame about four times a
+	 * second; it carries the rate the firmware rate control picked.
+	 * Asking on every frame doubled the RX ring traffic for nothing.
+	 */
+	if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA &&
+	    !IEEE80211_IS_MULTICAST(wh->i_addr1) &&
+	    ratecheck(&sc->sc_txs_last, &txs_interval))
+		pid = MT_PACKET_ID_FIRST;
 	omac_idx = sc->sc_vif.omac_idx << MT_TXD1_OWN_MAC_SHIFT;
 	wmm_idx = sc->sc_vif.wmm_idx;
 	band_idx = sc->sc_vif.band_idx;
@@ -7744,6 +7855,13 @@ MtkMwx::debugSet(uint32_t op, uint32_t val)
 		MWX_DEV_LOG(sc, "ba gap timeout %d -> %u ms\n",
 		    sc->sc_ic.ic_ba_gap_timeout_ms, val);
 		sc->sc_ic.ic_ba_gap_timeout_ms = val;
+		return kIOReturnSuccess;
+	case IOCTL_DEBUG_OP_BGSCAN_DWELL:
+		if (val > 200 && val != MWX_BGSCAN_DWELL_AUTO)
+			return kIOReturnBadArgument;
+		MWX_DEV_LOG(sc, "bgscan dwell %u -> %u ms\n",
+		    sc->sc_bgscan_dwell, val);
+		sc->sc_bgscan_dwell = val;
 		return kIOReturnSuccess;
 	default:
 		return kIOReturnBadArgument;

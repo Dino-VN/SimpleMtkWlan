@@ -29,12 +29,13 @@ print <<'CPP'
 #define le16toh(x) (x)
 #define le32toh(x) (x)
 #define MWX_DEV_LOG(...) ((void)0)
+#define MWX_BGSCAN_DWELL_AUTO 0xffffffffU
 CPP
 puts structs
 print <<'CPP'
 struct ieee80211_channel {unsigned ic_flags,ic_freq;};
 struct ieee80211com {ieee80211_channel ic_channels[256];};
-struct mwx_softc {ieee80211com sc_ic;unsigned sc_flags;uint8_t sc_scan_seq_num;};
+struct mwx_softc {ieee80211com sc_ic;unsigned sc_flags;uint8_t sc_scan_seq_num;uint32_t sc_bgscan_dwell;};
 struct mbuf {unsigned char bytes[sizeof(mt76_connac_hw_scan_req)];};
 #define mtod(m,T) reinterpret_cast<T>((m)->bytes)
 #define IEEE80211_IS_CHAN_2GHZ(c) ((c)->ic_freq<100)
@@ -54,7 +55,8 @@ static void zeros(const void*p,size_t n,const char*reason){auto b=static_cast<co
 int main(){
  unsigned cases=0;
  for(unsigned seed: {0x00,0xbd,0xfb,0xff}) for(unsigned n: {0,1,14,32,33,41,64,65}) for(int bg: {0,1}) {
-  poison=seed; mwx_softc sc={}; sc.sc_scan_seq_num=127;
+  poison=seed; mwx_softc sc={}; sc.sc_scan_seq_num=127; sc.sc_bgscan_dwell=seed==0xff?60:seed==0xbd?MWX_BGSCAN_DWELL_AUTO:0;
+  unsigned dwell=!bg?120:sc.sc_bgscan_dwell==MWX_BGSCAN_DWELL_AUTO?0:sc.sc_bgscan_dwell;
   for(unsigned i=1;i<=n;i++){sc.sc_ic.ic_channels[i].ic_flags=1;sc.sc_ic.ic_channels[i].ic_freq=i<=14?i:100+i;}
   check(mt7921_mcu_hw_scan(&sc,bg)==0,"scan return");
   check(captured.scan_func==SCAN_FUNC_SPLIT_SCAN,"scan_func contains stale allocation bits");
@@ -64,8 +66,8 @@ int main(){
   check(captured.seq_num==0,"sequence wrap");
   check(captured.channels_num==std::min(n,32u),"primary channel count");
   check(captured.ext_channels_num==(n>32?std::min(n,64u)-32:0),"extra channel count");
-  check(captured.timeout_value==std::min(n,64u)*120,"timeout");
-  check(captured.channel_dwell_time==120 && captured.channel_min_dwell_time==120,"dwell");
+  check(captured.timeout_value==std::min(n,64u)*dwell,"timeout");
+  check(captured.channel_dwell_time==dwell && captured.channel_min_dwell_time==dwell,"dwell");
   check(captured.channel_type==(n?4:0),"channel type");
   check(captured.ssid_type==1 && captured.ssid_type_ext==0 && captured.ssids_num==0,"SSID mode");
   check(captured.version==1 && captured.scan_type==0 && captured.probe_req_num==0,"scan mode");

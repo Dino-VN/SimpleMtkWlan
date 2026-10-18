@@ -464,6 +464,7 @@ struct ieee80211com {
     uint8_t ic_wcl_scan_ssid[32];
     bool ic_wcl_scan_restricted;
     uint8_t ic_wcl_scan_channels[32];
+    uint32_t ic_wcl_scan_away_time_ms; /* SET_SCAN_HOME_AWAY_TIME, 0 = unset */
 #endif
 	CTimeout*		ic_bgscan_timeout;
 	uint32_t		ic_bgscan_fail;

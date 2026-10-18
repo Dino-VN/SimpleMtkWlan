@@ -578,7 +578,9 @@ getRATE(struct apple80211_rate_data *rd)
         if (ic->ic_curmode == IEEE80211_MODE_11AC) {
             if (sgi)
                 index += 1;
-            nss = fHalService->getDriverInfo()->getTxNSS();
+            /* ni_vht_ss comes from firmware TX status once data flows. */
+            nss = ic->ic_bss->ni_vht_ss > 0 ? ic->ic_bss->ni_vht_ss :
+                fHalService->getDriverInfo()->getTxNSS();
             switch (ic->ic_bss->ni_chw) {
                 case IEEE80211_CHAN_WIDTH_40:
                     index += 4;

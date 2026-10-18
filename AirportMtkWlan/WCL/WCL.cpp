@@ -202,8 +202,26 @@ IOReturn AirportMtkSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1, 
         case 4:
             self->finishWCLScan(kIOReturnAborted);
             return kIOReturnSuccess;
+        case 15: {
+            // First word is the longest time airportd lets a background
+            // scan stay off the operating channel (laobamac/itlwm 572f195).
+            if (!a2)
+                return kIOReturnBadArgument;
+            auto ic = self->fHalService->get80211Controller();
+            uint32_t away = AirportWCL::read32(static_cast<const uint8_t *>(a2));
+            if (away != ic->ic_wcl_scan_away_time_ms)
+                XYLog("AirportMtkWlan-wcl: scan away time %u -> %u ms\n",
+                      ic->ic_wcl_scan_away_time_ms, away);
+            ic->ic_wcl_scan_away_time_ms = away;
+            return kIOReturnSuccess;
+        }
     }
     return kIOReturnUnsupported;
+}
+
+IOReturn AirportMtkSkywalkInterface::setWCL_SET_SCAN_HOME_AWAY_TIME(scanHomeAndAwayTime *request)
+{
+    return _fCommandGate->runAction(wclCommand, this, reinterpret_cast<void *>(15), request);
 }
 
 IOReturn AirportMtkSkywalkInterface::setWCL_SCAN_REQ(apple80211ScanRequest *request)

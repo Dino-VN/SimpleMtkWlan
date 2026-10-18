@@ -382,7 +382,7 @@ public:
     virtual IOReturn setWCL_ASSOCIATE(apple80211_assoc_candidates *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setWCL_PROTECT_IP(apple80211_wcl_protect_ip_mode *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setWCL_LINK_UP_DONE(void *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-    virtual IOReturn setWCL_SET_SCAN_HOME_AWAY_TIME(scanHomeAndAwayTime *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+    virtual IOReturn setWCL_SET_SCAN_HOME_AWAY_TIME(scanHomeAndAwayTime *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setWCL_VOLUNTARY_NETWORK_DISCONNECT(apple80211_wcl_voluntary_network_disconnect *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
 #ifdef AIRPORT_WCL
     virtual IOReturn setWCL_LINK_STATE_UPDATE(apple80211_wcl_update_link_state *) override;

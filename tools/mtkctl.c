@@ -192,7 +192,7 @@ static void cmd_join(io_connect_t c, const char *ssid, const char *pass)
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: mtkctl info|state|debug|log|knob <hex>|gap <ms>|reset|dump|scan [seconds]|results|join <ssid> [password]\n");
+        fprintf(stderr, "usage: mtkctl info|state|debug|log|knob <hex>|gap <ms>|dwell <ms|auto>|reset|dump|scan [seconds]|results|join <ssid> [password]\n");
         return 2;
     }
     io_connect_t c = open_driver();
@@ -208,6 +208,9 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "dump")) cmd_debug_set(c, IOCTL_DEBUG_OP_DUMP, 0);
     else if (!strcmp(argv[1], "gap") && argc >= 3)
         cmd_debug_set(c, IOCTL_DEBUG_OP_BA_GAP, (uint32_t)strtoul(argv[2], NULL, 0));
+    else if (!strcmp(argv[1], "dwell") && argc >= 3)
+        cmd_debug_set(c, IOCTL_DEBUG_OP_BGSCAN_DWELL,
+            !strcmp(argv[2], "auto") ? 0xffffffffU : (uint32_t)strtoul(argv[2], NULL, 0));
     else if (!strcmp(argv[1], "join") && argc >= 3) cmd_join(c, argv[2], argc > 3 ? argv[3] : NULL);
     else { fprintf(stderr, "unknown command\n"); return 2; }
     IOServiceClose(c);
