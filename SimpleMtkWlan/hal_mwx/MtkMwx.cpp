@@ -3695,12 +3695,12 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 	case MCU_EVENT_SCAN_DONE:
 		mt7921_mcu_scan_event(sc, m);
 		break;
+	case MCU_EVENT_BSS_ABSENCE:
+		/* AP absence (NoA) notices; only matter for P2P power save. */
+		break;
 #if 0
 	case MCU_EVENT_BSS_BEACON_LOSS:
 		mt7921_mcu_connection_loss_event(dev, skb);
-		break;
-	case MCU_EVENT_BSS_ABSENCE:
-		mt7921_mcu_bss_event(dev, skb);
 		break;
 	case MCU_EVENT_DBG_MSG:
 		mt7921_mcu_debug_msg_event(dev, skb);
