@@ -143,7 +143,7 @@ It does not depend on Lilu. Keep a backup EFI.
 | `-novht` | disable 802.11ac |
 | `-noht40` | disable 40 MHz channels |
 | `amtk_cc=XX` | AirportMtkWlan: override the country code |
-| `amtk_he=1` | AirportMtkWlan: offer 802.11ax (experimental, untested) |
+| `amtk_he=1` | AirportMtkWlan: offer 802.11ax (experimental, 80 MHz, no 160 MHz). `mtkctl knob 0x1002` turns it off again from the next join. |
 
 ### Troubleshooting
 

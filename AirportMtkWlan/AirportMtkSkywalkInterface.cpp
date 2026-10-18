@@ -599,6 +599,30 @@ getRATE(struct apple80211_rate_data *rd)
             index += 2 * (nss - 1);
             const struct ieee80211_vht_rateset *rs = &ieee80211_std_ratesets_11ac[index];
             rd->rate[0] = rs->rates[ic->ic_bss->ni_txmcs % rs->nrates] / 2;
+        } else if (ic->ic_curmode == IEEE80211_MODE_11AX) {
+            /* HE rates with the 0.8 us guard interval. */
+            nss = ic->ic_bss->ni_vht_ss > 0 ? ic->ic_bss->ni_vht_ss :
+                fHalService->getDriverInfo()->getTxNSS();
+            nss = nss > 1 ? 2 : 1;
+            switch (ic->ic_bss->ni_chw) {
+                case IEEE80211_CHAN_WIDTH_40:
+                    index = IEEE80211_HE_RATESET_SISO_40;
+                    break;
+                case IEEE80211_CHAN_WIDTH_80:
+                    index = IEEE80211_HE_RATESET_SISO_80;
+                    break;
+                case IEEE80211_CHAN_WIDTH_80P80:
+                case IEEE80211_CHAN_WIDTH_160:
+                    index = IEEE80211_HE_RATESET_SISO_160;
+                    break;
+
+                default:
+                    index = IEEE80211_HE_RATESET_SISO;
+                    break;
+            }
+            index += nss - 1;
+            const struct ieee80211_he_rateset *rs = &ieee80211_std_ratesets_11ax[index];
+            rd->rate[0] = rs->rates[ic->ic_bss->ni_txmcs % rs->nrates] / 2;
         } else if (ic->ic_curmode == IEEE80211_MODE_11N) {
             int is_40mhz = ic->ic_bss->ni_chw == IEEE80211_CHAN_WIDTH_40;
             if (sgi)

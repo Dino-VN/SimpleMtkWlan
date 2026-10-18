@@ -460,7 +460,9 @@ struct mwx_softc {
 #define MWX_KNOB_OLD_STA	0x200	/* legacy-only STA_REC PHY/RA/STATE */
 #define MWX_KNOB_NO_QBSS	0x400	/* no QBSS TLV in BSS_INFO */
 #define MWX_KNOB_NO_TXBA	0x800	/* do not set up TX Block Ack (A-MPDU) */
+#define MWX_KNOB_NO_HE		0x1000	/* do not offer 11ax (next join) */
 	uint8_t			sc_bss_bw;	/* CMD_CBW_* used by the BSS */
+	uint8_t			sc_bss_he;	/* HE BSS info sent to firmware */
 	uint8_t			sc_bss_center;	/* center channel for sc_bss_bw */
 	uint16_t		sc_sta_wcid;	/* AP STA_REC in firmware, 0 = none */
 	uint8_t			sc_sta_addr[IEEE80211_ADDR_LEN];
@@ -803,6 +805,9 @@ int		mt7921_set_channel(struct mwx_softc *);
 int mt7921_mcu_set_associated_bss(struct mwx_softc *, int);
 int mt7921_mcu_set_associated_peer(struct mwx_softc *);
 void		mwx_apply_phy_knobs(struct mwx_softc *);
+void		mwx_setup_he_caps(struct mwx_softc *);
+int		mt7921_mcu_set_bss_he(struct mwx_softc *,
+		    struct ieee80211_node *, int);
 void		mwx_set_bss_bw(struct mwx_softc *, struct ieee80211_node *);
 int		mwx_ampdu_rx_start(struct ieee80211com *,
 		    struct ieee80211_node *, uint8_t);
@@ -827,6 +832,8 @@ void		 mt7921_mcu_add_basic_tlv(struct mbuf *, uint16_t *,
 		    struct mwx_softc *, struct ieee80211_node *, int, int);
 void		 mt7921_mcu_add_sta_tlv(struct mbuf *, uint16_t *,
 		    struct mwx_softc *, struct ieee80211_node *, int);
+void		 mt7921_mcu_add_sta_he_tlv(struct mbuf *, uint16_t *,
+		    struct mwx_softc *, struct ieee80211_node *);
 int		 mt7921_mcu_wtbl_generic_tlv(struct mbuf *, uint16_t *,
 		    struct mwx_softc *, struct ieee80211_node *);
 int		 mt7921_mcu_wtbl_hdr_trans_tlv(struct mbuf *, uint16_t *,
@@ -2086,6 +2093,7 @@ mwx_preinit(struct mwx_softc *sc)
 	ic->ic_vht_tx_mcs_map = ic->ic_vht_rx_mcs_map;
 	ic->ic_vht_rx_highest = ic->ic_vht_tx_highest = 0;
 	ic->ic_tx_mcs_set = IEEE80211_TX_MCS_SET_DEFINED;
+	mwx_setup_he_caps(sc);
 	MWX_DEV_LOG(sc, "preinit capability 2ghz=%d 5ghz=%d 6ghz=%d streams=%u antenna_mask=0x%x\n",
 	    sc->sc_capa.has_2ghz, sc->sc_capa.has_5ghz,
 	    sc->sc_capa.has_6ghz, sc->sc_capa.num_streams,
@@ -4944,6 +4952,17 @@ mt7921_mac_add_txs(struct mwx_softc *sc, const uint32_t *txs_data)
 		ni->ni_txmcs = mcs;
 		ni->ni_vht_ss = nss;
 		break;
+	case MT_PHY_TYPE_HE_SU:
+	case MT_PHY_TYPE_HE_EXT_SU:
+	case MT_PHY_TYPE_HE_TB:
+	case MT_PHY_TYPE_HE_MU:
+		/* HE uses bits 3:0; bit 4 is DCM, bit 5 SU extended tone. */
+		mcs &= 0xf;
+		if (mcs > 11)
+			return;
+		ni->ni_txmcs = mcs;
+		ni->ni_vht_ss = nss;
+		break;
 	default:
 		return;
 	}
@@ -6595,11 +6614,13 @@ mt7921_mac_write_txwi_80211(struct mwx_softc *sc, struct mbuf *m,
 		tap->wt_chan_freq = htole16(ni->ni_chan->ic_freq);
 		chan_flags = ni->ni_chan->ic_flags;
 		if (ic->ic_curmode != IEEE80211_MODE_11N &&
-			ic->ic_curmode != IEEE80211_MODE_11AC) {
+			ic->ic_curmode != IEEE80211_MODE_11AC &&
+			ic->ic_curmode != IEEE80211_MODE_11AX) {
 			chan_flags &= ~IEEE80211_CHAN_HT;
 			chan_flags &= ~IEEE80211_CHAN_40MHZ;
 		}
-		if (ic->ic_curmode != IEEE80211_MODE_11AC)
+		if (ic->ic_curmode != IEEE80211_MODE_11AC &&
+		    ic->ic_curmode != IEEE80211_MODE_11AX)
 			chan_flags &= ~IEEE80211_CHAN_VHT;
 		tap->wt_chan_flags = htole16(chan_flags);
 #ifdef NOTYET
@@ -6968,6 +6989,111 @@ mwx_vht_mcs_map(uint16_t peer, uint16_t own)
 	return map;
 }
 
+#define MWX_HE_FIELD(v, mask)	(((v) & (mask)) >> __builtin_ctz(mask))
+
+/*
+ * STA_REC_HE and STA_REC_HE_V2 for an HE AP, as in
+ * mt76_connac_mcu_sta_he_tlv() and _v2(). The capabilities are the AP's;
+ * the MCS map is what the AP receives limited to what we transmit.
+ * No 160 MHz, so only the BW80 map is set.
+ */
+void
+mt7921_mcu_add_sta_he_tlv(struct mbuf *m, uint16_t *tlvnum,
+    struct mwx_softc *sc, struct ieee80211_node *ni)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	const struct ieee80211_he_cap_elem *elem = &ni->ni_he_cap_elem;
+	const uint8_t *mac = elem->mac_cap_info, *phy = elem->phy_cap_info;
+	struct sta_rec_he *he;
+	struct sta_rec_he_v2 *he2;
+	uint32_t cap = 0;
+	uint16_t mcs80;
+
+	mcs80 = htole16(ieee80211_he_mcs_intersection(
+	    le16toh(ni->ni_he_mcs_nss_supp.rx_mcs_80),
+	    le16toh(ic->ic_he_mcs_nss_supp.tx_mcs_80)));
+
+	if (mac[0] & IEEE80211_HE_MAC_CAP0_HTC_HE)
+		cap |= STA_REC_HE_CAP_HTC;
+	if (mac[2] & IEEE80211_HE_MAC_CAP2_BSR)
+		cap |= STA_REC_HE_CAP_BSR;
+	if (mac[3] & IEEE80211_HE_MAC_CAP3_OMI_CONTROL)
+		cap |= STA_REC_HE_CAP_OM;
+	if (mac[4] & IEEE80211_HE_MAC_CAP4_AMDSU_IN_AMPDU)
+		cap |= STA_REC_HE_CAP_AMSDU_IN_AMPDU;
+	if (mac[4] & IEEE80211_HE_MAC_CAP4_BQR)
+		cap |= STA_REC_HE_CAP_BQR;
+	if (phy[0] & (IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_RU_MAPPING_IN_2G |
+	    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_RU_MAPPING_IN_5G))
+		cap |= STA_REC_HE_CAP_BW20_RU242_SUPPORT;
+	if (phy[1] & IEEE80211_HE_PHY_CAP1_LDPC_CODING_IN_PAYLOAD)
+		cap |= STA_REC_HE_CAP_LDPC;
+	if (phy[1] & IEEE80211_HE_PHY_CAP1_HE_LTF_AND_GI_FOR_HE_PPDUS_0_8US)
+		cap |= STA_REC_HE_CAP_SU_PPDU_1LTF_8US_GI;
+	if (phy[2] & IEEE80211_HE_PHY_CAP2_NDP_4x_LTF_AND_3_2US)
+		cap |= STA_REC_HE_CAP_NDP_4LTF_3DOT2MS_GI;
+	if (phy[2] & IEEE80211_HE_PHY_CAP2_STBC_TX_UNDER_80MHZ)
+		cap |= STA_REC_HE_CAP_LE_EQ_80M_TX_STBC;
+	if (phy[2] & IEEE80211_HE_PHY_CAP2_STBC_RX_UNDER_80MHZ)
+		cap |= STA_REC_HE_CAP_LE_EQ_80M_RX_STBC;
+	if (phy[6] & IEEE80211_HE_PHY_CAP6_PARTIAL_BW_EXT_RANGE)
+		cap |= STA_REC_HE_CAP_PARTIAL_BW_EXT_RANGE;
+	if (phy[7] & IEEE80211_HE_PHY_CAP7_HE_SU_MU_PPDU_4XLTF_AND_08_US_GI)
+		cap |= STA_REC_HE_CAP_SU_MU_PPDU_4LTF_8US_GI;
+	if (phy[7] & IEEE80211_HE_PHY_CAP7_STBC_TX_ABOVE_80MHZ)
+		cap |= STA_REC_HE_CAP_GT_80M_TX_STBC;
+	if (phy[7] & IEEE80211_HE_PHY_CAP7_STBC_RX_ABOVE_80MHZ)
+		cap |= STA_REC_HE_CAP_GT_80M_RX_STBC;
+	if (phy[8] & IEEE80211_HE_PHY_CAP8_HE_ER_SU_PPDU_4XLTF_AND_08_US_GI)
+		cap |= STA_REC_HE_CAP_ER_SU_PPDU_4LTF_8US_GI;
+	if (phy[8] & IEEE80211_HE_PHY_CAP8_HE_ER_SU_1XLTF_AND_08_US_GI)
+		cap |= STA_REC_HE_CAP_ER_SU_PPDU_1LTF_8US_GI;
+	if (phy[9] & IEEE80211_HE_PHY_CAP9_NON_TRIGGERED_CQI_FEEDBACK)
+		cap |= STA_REC_HE_CAP_TRIG_CQI_FK;
+	if (phy[9] & IEEE80211_HE_PHY_CAP9_TX_1024_QAM_LESS_THAN_242_TONE_RU)
+		cap |= STA_REC_HE_CAP_TX_1024QAM_UNDER_RU242;
+	if (phy[9] & IEEE80211_HE_PHY_CAP9_RX_1024_QAM_LESS_THAN_242_TONE_RU)
+		cap |= STA_REC_HE_CAP_RX_1024QAM_UNDER_RU242;
+
+	he = (struct sta_rec_he *)mwx_append_tlv(m, tlvnum, STA_REC_HE,
+	    sizeof(*he));
+	he->he_cap = htole32(cap);
+	he->max_nss_mcs[CMD_HE_MCS_BW80] = mcs80;
+	he->t_frame_dur = MWX_HE_FIELD(mac[1],
+	    IEEE80211_HE_MAC_CAP1_TF_MAC_PAD_DUR_MASK);
+	he->max_ampdu_exp = MWX_HE_FIELD(mac[3],
+	    IEEE80211_HE_MAC_CAP3_MAX_AMPDU_LEN_EXP_MASK);
+	he->bw_set = MWX_HE_FIELD(phy[0],
+	    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_MASK);
+	he->device_class = MWX_HE_FIELD(phy[1],
+	    IEEE80211_HE_PHY_CAP1_DEVICE_CLASS_A);
+	he->punc_pream_rx = MWX_HE_FIELD(phy[1],
+	    IEEE80211_HE_PHY_CAP1_PREAMBLE_PUNC_RX_MASK);
+	he->dcm_tx_mode = MWX_HE_FIELD(phy[3],
+	    IEEE80211_HE_PHY_CAP3_DCM_MAX_CONST_TX_MASK);
+	he->dcm_tx_max_nss = MWX_HE_FIELD(phy[3],
+	    IEEE80211_HE_PHY_CAP3_DCM_MAX_TX_NSS_2);
+	he->dcm_rx_mode = MWX_HE_FIELD(phy[3],
+	    IEEE80211_HE_PHY_CAP3_DCM_MAX_CONST_RX_MASK);
+	he->dcm_rx_max_nss = MWX_HE_FIELD(phy[3],
+	    IEEE80211_HE_PHY_CAP3_DCM_MAX_RX_NSS_2);
+	he->dcm_max_ru = MWX_HE_FIELD(phy[8],
+	    IEEE80211_HE_PHY_CAP8_DCM_MAX_RU_MASK);
+	he->pkt_ext = 2;
+
+	he2 = (struct sta_rec_he_v2 *)mwx_append_tlv(m, tlvnum, STA_REC_HE_V2,
+	    sizeof(*he2));
+	memcpy(he2->he_mac_cap, mac, sizeof(he2->he_mac_cap));
+	memcpy(he2->he_phy_cap, phy, sizeof(he2->he_phy_cap));
+	he2->max_nss_mcs[CMD_HE_MCS_BW80] = mcs80;
+	he2->pkt_ext = 2;
+
+	MWX_DEV_LOG(sc, "sta HE cap=0x%06x mac=%02x%02x%02x%02x phy=%02x%02x%02x "
+	    "mcs80=0x%04x/0x%04x\n", cap, mac[0], mac[1], mac[2], mac[3],
+	    phy[0], phy[1], phy[2], le16toh(ni->ni_he_mcs_nss_supp.rx_mcs_80),
+	    le16toh(mcs80));
+}
+
 /*
  * Station record TLVs (HT, VHT, PHY, RA, STATE) as in
  * mt76_connac_mcu_sta_tlv(). HT/VHT information is only sent once the
@@ -6983,11 +7109,13 @@ mt7921_mcu_add_sta_tlv(struct mbuf *m, uint16_t *tlvnum, struct mwx_softc *sc,
 	struct sta_rec_state *state;
 	struct sta_rec_phy *phy;
 	uint16_t supp_rates = 0, basic_rates = 0;
-	int is_2g, ht, vht, i, idx;
+	int is_2g, ht, vht, he, i, idx;
 
 	is_2g = IEEE80211_IS_CHAN_2GHZ(ni->ni_chan);
 	ht = assoc && (ni->ni_flags & IEEE80211_NODE_HT) != 0;
 	vht = ht && !is_2g && (ni->ni_flags & IEEE80211_NODE_VHT) != 0;
+	he = ht && (ic->ic_flags & IEEE80211_F_HEON) != 0 &&
+	    (ni->ni_flags & IEEE80211_NODE_HE) != 0;
 
 	if (sc->sc_knobs & MWX_KNOB_OLD_STA) {
 		/* What d9b69bb sent: fixed legacy PHY/RA, state NONE. */
@@ -7038,6 +7166,9 @@ mt7921_mcu_add_sta_tlv(struct mbuf *m, uint16_t *tlvnum, struct mwx_softc *sc,
 		    ic->ic_vht_rx_mcs_map));
 	}
 
+	if (he)
+		mt7921_mcu_add_sta_he_tlv(m, tlvnum, sc, ni);
+
 	/* Legacy rate bitmaps, indexed like the mt76 band rate tables. */
 	for (i = 0; i < ni->ni_rates.rs_nrates; i++) {
 		uint8_t r = ni->ni_rates.rs_rates[i];
@@ -7059,6 +7190,8 @@ mt7921_mcu_add_sta_tlv(struct mbuf *m, uint16_t *tlvnum, struct mwx_softc *sc,
 		phy->phy_type |= PHY_TYPE_BIT_HT;
 	if (vht)
 		phy->phy_type |= PHY_TYPE_BIT_VHT;
+	if (he)
+		phy->phy_type |= PHY_TYPE_BIT_HE;
 	/* A-MPDU factor (bits 1:0) and density (bits 4:2) */
 	if (ht)
 		phy->ampdu = ni->ni_ampdu_param &
@@ -8000,7 +8133,7 @@ mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
 			uint8_t sco, band, pad[2];
 		} __packed rlm;
 	} __packed channel = {};
-	int rv, is_2g, ht, vht;
+	int rv, is_2g, ht, vht, he;
 
 	if (ic->ic_opmode != IEEE80211_M_STA)
 		return 0;
@@ -8010,6 +8143,8 @@ mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
 	is_2g = IEEE80211_IS_CHAN_2GHZ(ni->ni_chan);
 	ht = (ni->ni_flags & IEEE80211_NODE_HT) != 0;
 	vht = !is_2g && (ni->ni_flags & IEEE80211_NODE_VHT) != 0;
+	he = ht && (ic->ic_flags & IEEE80211_F_HEON) != 0 &&
+	    (ni->ni_flags & IEEE80211_NODE_HE) != 0;
 	bss.bss_idx = mvif->idx;
 	bss.basic.tag = htole16(UNI_BSS_INFO_BASIC);
 	bss.basic.len = htole16(sizeof(bss.basic));
@@ -8026,15 +8161,13 @@ mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
 	bss.basic.sta_idx = htole16(mvif->vif_mn.wcid);
 	bss.basic.bcn_interval = htole16(ni->ni_intval);
 	bss.basic.dtim_period = ni->ni_dtimperiod;
-	/*
-	 * BSS phymode uses PHY_MODE bits: A(0) B(1) G(2) GN(3) AN(4) AC(5);
-	 * nonht_basic_phy uses PHY_TYPE bits.
-	 */
+	/* BSS phymode uses PHY_MODE bits, nonht_basic_phy PHY_TYPE bits. */
 	if (is_2g)
-		bss.basic.phymode = (1U << 1) | (1U << 2) | (ht ? (1U << 3) : 0);
+		bss.basic.phymode = PHY_MODE_B | PHY_MODE_G |
+		    (ht ? PHY_MODE_GN : 0) | (he ? PHY_MODE_AX_24G : 0);
 	else
-		bss.basic.phymode = (1U << 0) | (ht ? (1U << 4) : 0) |
-		    (vht ? (1U << 5) : 0);
+		bss.basic.phymode = PHY_MODE_A | (ht ? PHY_MODE_AN : 0) |
+		    (vht ? PHY_MODE_AC : 0) | (he ? PHY_MODE_AX_5G : 0);
 	bss.basic.nonht_basic_phy = htole16(is_2g ?
 	    PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP : PHY_TYPE_BIT_OFDM);
 	bss.qos.tag = htole16(UNI_BSS_INFO_QBSS);
@@ -8052,6 +8185,12 @@ mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
 	    ni->ni_dtimperiod, bss.basic.phymode, bss.qos.qos, rv);
 	if (rv != 0 || !associated)
 		return rv;
+
+	/* Also clears the BSS color left by an earlier HE association. */
+	if (he || sc->sc_bss_he) {
+		rv = mt7921_mcu_set_bss_he(sc, ni, he);
+		sc->sc_bss_he = he && rv == 0;
+	}
 
 	channel.bss_idx = mvif->idx;
 	channel.rlm.tag = htole16(UNI_BSS_INFO_RLM);
@@ -8081,6 +8220,108 @@ mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
 }
 
 /*
+ * HE BSS parameters from the AP's HE Operation element, as in
+ * mt76_connac_mcu_uni_add_bss(): PE duration, TXOP RTS threshold, our
+ * TX MCS maps and the BSS color. enable=0 turns the BSS color off.
+ */
+int
+mt7921_mcu_set_bss_he(struct mwx_softc *sc, struct ieee80211_node *ni,
+    int enable)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct {
+		uint8_t bss_idx;
+		uint8_t pad[3];
+		struct bss_info_uni_he he;
+		struct bss_info_uni_bss_color bss_color;
+	} __packed req = {};
+	uint32_t params = enable ? ni->ni_he_oper_params : 0;
+	int rv;
+
+	req.bss_idx = sc->sc_vif.idx;
+	req.he.tag = htole16(UNI_BSS_INFO_HE_BASIC);
+	req.he.len = htole16(sizeof(req.he));
+	req.he.he_pe_duration =
+	    params & IEEE80211_HE_OPERATION_DFLT_PE_DURATION_MASK;
+	if (req.he.he_pe_duration == 0)
+		req.he.he_pe_duration = DEFAULT_HE_PE_DURATION;
+	req.he.he_rts_thres = htole16((params &
+	    IEEE80211_HE_OPERATION_RTS_THRESHOLD_MASK) >>
+	    IEEE80211_HE_OPERATION_RTS_THRESHOLD_OFFSET);
+	if (req.he.he_rts_thres == 0)
+		req.he.he_rts_thres = htole16(DEFAULT_HE_DURATION_RTS_THRES);
+	/* Already little endian, unsupported widths are 0xffff. */
+	req.he.max_nss_mcs[CMD_HE_MCS_BW80] = ic->ic_he_mcs_nss_supp.tx_mcs_80;
+	req.he.max_nss_mcs[CMD_HE_MCS_BW160] =
+	    ic->ic_he_mcs_nss_supp.tx_mcs_160;
+	req.he.max_nss_mcs[CMD_HE_MCS_BW8080] =
+	    ic->ic_he_mcs_nss_supp.tx_mcs_80p80;
+
+	req.bss_color.tag = htole16(UNI_BSS_INFO_BSS_COLOR);
+	req.bss_color.len = htole16(sizeof(req.bss_color));
+	if (enable && (params & IEEE80211_HE_OPERATION_BSS_COLOR_DISABLED) == 0) {
+		req.bss_color.enable = 1;
+		req.bss_color.bss_color = (params &
+		    IEEE80211_HE_OPERATION_BSS_COLOR_MASK) >>
+		    IEEE80211_HE_OPERATION_BSS_COLOR_OFFSET;
+	}
+
+	rv = mwx_send_assoc_status(sc, MCU_UNI_CMD_BSS_INFO_UPDATE,
+	    &req, sizeof(req));
+	MWX_DEV_LOG(sc, "associated BSS HE enable=%d oper=0x%08x pe=%u rts=%u "
+	    "color=%u/%u rv=%d\n", enable, params, req.he.he_pe_duration,
+	    le16toh(req.he.he_rts_thres), req.bss_color.enable,
+	    req.bss_color.bss_color, rv);
+	return rv;
+}
+
+/*
+ * HE (802.11ax) station capabilities, offered only with the amtk_he=1
+ * boot-arg (IEEE80211_F_HEON in ic_userflags). A conservative profile
+ * like itlwm's: no TWT, OMI, STBC, beamforming, PPE thresholds or
+ * A-MSDU in A-MPDU, and no 160 MHz since VHT does not offer it either.
+ * mwx_apply_phy_knobs() sets the channel width bits for each join.
+ */
+void
+mwx_setup_he_caps(struct mwx_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_he_cap_elem *he = &ic->ic_he_cap_elem;
+	uint16_t map = 0xffff;
+	int i;
+
+	ic->ic_caps &= ~IEEE80211_C_HE;
+	memset(he, 0, sizeof(*he));
+	memset(&ic->ic_he_mcs_nss_supp, 0xff, sizeof(ic->ic_he_mcs_nss_supp));
+	memset(ic->ic_ppe_thres, 0, sizeof(ic->ic_ppe_thres));
+	if ((ic->ic_userflags & IEEE80211_F_HEON) == 0)
+		return;
+
+	he->mac_cap_info[0] = IEEE80211_HE_MAC_CAP0_HTC_HE;
+	he->mac_cap_info[1] = IEEE80211_HE_MAC_CAP1_TF_MAC_PAD_DUR_16US;
+	he->phy_cap_info[1] = IEEE80211_HE_PHY_CAP1_DEVICE_CLASS_A |
+	    IEEE80211_HE_PHY_CAP1_LDPC_CODING_IN_PAYLOAD;
+	he->phy_cap_info[2] = IEEE80211_HE_PHY_CAP2_NDP_4x_LTF_AND_3_2US;
+	he->phy_cap_info[7] =
+	    IEEE80211_HE_PHY_CAP7_HE_SU_MU_PPDU_4XLTF_AND_08_US_GI;
+	/* 16us padding for every RU, so no PPE Thresholds field. */
+	he->phy_cap_info[9] = IEEE80211_HE_PHY_CAP9_NOMIMAL_PKT_PADDING_16US |
+	    IEEE80211_HE_PHY_CAP9_RX_FULL_BW_SU_USING_MU_WITH_COMP_SIGB |
+	    IEEE80211_HE_PHY_CAP9_RX_FULL_BW_SU_USING_MU_WITH_NON_COMP_SIGB;
+
+	/* HE MCS 0-11 for each spatial stream, like VHT in mwx_preinit(). */
+	for (i = 0; i < MAX(1, MIN(sc->sc_capa.num_streams, 2)); i++) {
+		map &= ~(0x3 << (2 * i));
+		map |= IEEE80211_HE_MCS_SUPPORT_0_11 << (2 * i);
+	}
+	ic->ic_he_mcs_nss_supp.rx_mcs_80 = htole16(map);
+	ic->ic_he_mcs_nss_supp.tx_mcs_80 = htole16(map);
+	ic->ic_caps |= IEEE80211_C_HE;
+	MWX_DEV_LOG(sc, "HE capability offered (amtk_he=1): mcs80=0x%04x\n",
+	    map);
+}
+
+/*
  * Select what the next association offers. Knob changes take effect on
  * the next join; net80211 reads these flags when it builds the
  * association request and negotiates HT/VHT from the response.
@@ -8089,6 +8330,7 @@ void
 mwx_apply_phy_knobs(struct mwx_softc *sc)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
+	uint8_t *he0;
 
 	ic->ic_flags &= ~(IEEE80211_F_HTON | IEEE80211_F_VHTON |
 	    IEEE80211_F_HEON);
@@ -8104,10 +8346,27 @@ mwx_apply_phy_knobs(struct mwx_softc *sc)
 		if ((sc->sc_knobs & (MWX_KNOB_NO_VHT | MWX_KNOB_NO_40)) == 0 &&
 		    (ic->ic_modecaps & (1 << IEEE80211_MODE_11AC)))
 			ic->ic_flags |= IEEE80211_F_VHTON;
+		/* net80211 adds the HE Capabilities element when HEON. */
+		if ((sc->sc_knobs & MWX_KNOB_NO_HE) == 0 &&
+		    (ic->ic_caps & IEEE80211_C_HE) &&
+		    (ic->ic_modecaps & (1 << IEEE80211_MODE_11AX)))
+			ic->ic_flags |= IEEE80211_F_HEON;
 	}
-	MWX_DEV_LOG(sc, "phy knobs 0x%x: ht=%d vht=%d htcaps=0x%04x modecaps=0x%x\n",
+	he0 = &ic->ic_he_cap_elem.phy_cap_info[0];
+	*he0 &= ~(IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G |
+	    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G);
+	if ((ic->ic_flags & IEEE80211_F_HEON) &&
+	    (sc->sc_knobs & MWX_KNOB_NO_40) == 0) {
+		if (sc->sc_capa.has_2ghz)
+			*he0 |= IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G;
+		if (sc->sc_capa.has_5ghz)
+			*he0 |=
+			    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G;
+	}
+	MWX_DEV_LOG(sc, "phy knobs 0x%x: ht=%d vht=%d he=%d htcaps=0x%04x modecaps=0x%x\n",
 	    sc->sc_knobs, (ic->ic_flags & IEEE80211_F_HTON) != 0,
-	    (ic->ic_flags & IEEE80211_F_VHTON) != 0, ic->ic_htcaps,
+	    (ic->ic_flags & IEEE80211_F_VHTON) != 0,
+	    (ic->ic_flags & IEEE80211_F_HEON) != 0, ic->ic_htcaps,
 	    ic->ic_modecaps);
 }
 

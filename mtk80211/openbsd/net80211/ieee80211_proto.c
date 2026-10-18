@@ -854,6 +854,13 @@ ieee80211_he_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
     
     if (!(htole32(ni->ni_he_oper_params) & IEEE80211_HE_OPERATION_VHT_OPER_INFO))
         return;
+
+    /*
+     * The widths below come from the AP's capabilities only. Without
+     * 160 MHz support of our own, keep the width VHT/HT negotiated.
+     */
+    if ((ic->ic_vhtcaps & IEEE80211_VHTCAP_SUPP_CHAN_WIDTH_MASK) == 0)
+        return;
     
     support_160 = (ni->ni_vhtcaps & (IEEE80211_VHTCAP_SUPP_CHAN_WIDTH_MASK |
                   IEEE80211_VHTCAP_EXT_NSS_BW_MASK));
