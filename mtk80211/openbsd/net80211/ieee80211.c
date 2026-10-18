@@ -928,6 +928,9 @@ ieee80211_watchdog(struct _ifnet *ifp)
             if (ISSET(ic->ic_flags, IEEE80211_F_AUTO_JOIN))
                 ieee80211_deselect_ess(ic);
         }
+        if (ic->ic_state == IEEE80211_S_RUN)
+            XYLog("%s: AP %s did not answer the probe after beacon loss\n",
+                  ifp->if_xname, ether_sprintf(ic->ic_bss->ni_macaddr));
         ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
     }
     

@@ -760,6 +760,7 @@ int		mt7921_mcu_set_rts_thresh(struct mwx_softc *, uint32_t,
 		    uint8_t);
 int		mwx_mcu_set_deep_sleep(struct mwx_softc *, int);
 void		mt7921_mcu_low_power_event(struct mwx_softc *, struct mbuf *);
+void		mt7921_mcu_beacon_loss_event(struct mwx_softc *, struct mbuf *);
 void		mt7921_mcu_tx_done_event(struct mwx_softc *, struct mbuf *);
 void		mwx_end_scan_task(void *);
 void		mwx_scan_timeo(void *);
@@ -3695,13 +3696,13 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 	case MCU_EVENT_SCAN_DONE:
 		mt7921_mcu_scan_event(sc, m);
 		break;
+	case MCU_EVENT_BSS_BEACON_LOSS:
+		mt7921_mcu_beacon_loss_event(sc, m);
+		break;
 	case MCU_EVENT_BSS_ABSENCE:
 		/* AP absence (NoA) notices; only matter for P2P power save. */
 		break;
 #if 0
-	case MCU_EVENT_BSS_BEACON_LOSS:
-		mt7921_mcu_connection_loss_event(dev, skb);
-		break;
 	case MCU_EVENT_DBG_MSG:
 		mt7921_mcu_debug_msg_event(dev, skb);
 		break;
@@ -4835,6 +4836,35 @@ mt7921_mcu_low_power_event(struct mwx_softc *sc, struct mbuf *m)
 		return;
 	event = mtod(m, struct mt7921_mcu_lp_event *);
 	DPRINTF("%s: low power event state %d\n", DEVNAME(sc), event->state);
+}
+
+/*
+ * The firmware reports that beacons from the AP stopped arriving. Like
+ * mac80211 and iwm(4), probe the AP before giving up: a probe response or
+ * beacon clears ic_mgt_timer, otherwise ieee80211_watchdog() moves us to
+ * SCAN and the link goes down so macOS can rejoin.
+ */
+void
+mt7921_mcu_beacon_loss_event(struct mwx_softc *sc, struct mbuf *m)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct mt7921_mcu_beacon_loss_event {
+		uint8_t bss_idx;
+		uint8_t reason;
+		uint8_t pad[2];
+	} __packed *event;
+
+	if (mbuf_len(m) < sizeof(*event))
+		return;
+	event = mtod(m, struct mt7921_mcu_beacon_loss_event *);
+	MWX_DEV_LOG(sc, "beacon loss bss_idx=%u reason=%u state=%d mgt_timer=%d\n",
+	    event->bss_idx, event->reason, ic->ic_state, ic->ic_mgt_timer);
+
+	if (sc->sc_resetting || ic->ic_opmode != IEEE80211_M_STA ||
+	    ic->ic_state != IEEE80211_S_RUN ||
+	    (ic->ic_flags & IEEE80211_F_BGSCAN) || ic->ic_mgt_timer != 0)
+		return;
+	IEEE80211_SEND_MGMT(ic, ic->ic_bss, IEEE80211_FC0_SUBTYPE_PROBE_REQ, 0);
 }
 
 void
