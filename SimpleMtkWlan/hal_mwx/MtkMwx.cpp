@@ -1509,7 +1509,12 @@ mwx_newstate_task(void *ptr)
 		}
 		break;
 	case IEEE80211_S_ASSOC:
-		mwx_mcu_set_deep_sleep(sc, 1);
+		/*
+		 * Stay in full power until RUN. Deep sleep here made the
+		 * firmware miss Association Responses from APs that take
+		 * more than a few ms to answer (Linux keeps the chip awake
+		 * with a JOIN ROC for the whole auth/assoc exchange).
+		 */
 		break;
 	case IEEE80211_S_RUN:
 		if (ic->ic_opmode == IEEE80211_M_MONITOR)
