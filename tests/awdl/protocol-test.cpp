@@ -5,6 +5,54 @@
 #include <vector>
 using namespace mtkawdl;
 static const uint8_t local[6]={2,1,2,3,4,5}, remote[6]={2,1,2,3,4,6};
+static void aggregateTests()
+{
+    for(size_t size=54;size<=1514;++size) {
+        uint8_t eth[1514]={},wire[1542]={};memcpy(eth,local,6);memcpy(eth+6,remote,6);
+        eth[12]=0x86;eth[13]=0xdd;eth[14]=0x60;eth[18]=(size-54)>>8;eth[19]=size-54;
+        size_t wn=encodeData(wire,sizeof(wire),eth,size,65535);
+        std::vector<uint8_t> f(wire,wire+24);f[0]=0x88;f.push_back(0x80);f.push_back(0);
+        size_t second=0;
+        for(unsigned i=0;i<2;++i) {
+            if(i) second=f.size();
+            f.insert(f.end(),eth,eth+12);f.push_back((wn-24)>>8);f.push_back(wn-24);
+            size_t p=f.size();f.insert(f.end(),wire+24,wire+wn);put16(f.data()+p+10,65535+i);
+            if(!i) while((f.size()-26)%4) f.push_back(0);
+        }
+        assert(validDataFrame(f.data(),f.size()));
+        size_t at=26;uint8_t out[1514];
+        for(unsigned i=0;i<2;++i) {
+            DataView v={};size_t used=dataView(f.data(),f.size(),at,v);assert(used);
+            assert(v.sequence==uint16_t(65535+i));assert(decodeDataView(out,sizeof(out),v)==size);
+            assert(!memcmp(out,eth,size));assert(!decodeDataView(out,size-1,v));at+=used;
+        }
+        assert(at==f.size());
+        auto bad=f;bad[second+12]=0xff;assert(!validDataFrame(bad.data(),bad.size()));
+        bad=f;bad[second+6]^=4;assert(!validDataFrame(bad.data(),bad.size()));
+        bad=f;bad.pop_back();assert(!validDataFrame(bad.data(),bad.size()));
+        bad=f;bad[second+14+14]=0;assert(!validDataFrame(bad.data(),bad.size()));
+        // Hardware supplies an individual subframe with two bytes following
+        // its QoS header. Relocation plus pull must recover the original bytes.
+        std::vector<uint8_t> sub(f.begin(),f.begin()+26);
+        sub.insert(sub.end(),{0xcc,0xdd});sub.insert(sub.end(),f.begin()+second,f.end());
+        assert(relocateDeaggregatedHeader(sub.data(),sub.size()));sub.erase(sub.begin(),sub.begin()+2);
+        assert(validDataFrame(sub.data(),sub.size()));
+        DataView v={};assert(dataView(sub.data(),sub.size(),26,v));
+        assert(decodeDataView(out,sizeof(out),v)==size&&!memcmp(out,eth,size));
+        if(size==1514) {
+            for(size_t len=0;len<f.size();++len) {
+                std::vector<uint8_t> shortFrame(f.begin(),f.begin()+len);
+                validDataFrame(shortFrame.data(),shortFrame.size());
+                relocateDeaggregatedHeader(shortFrame.data(),shortFrame.size());
+            }
+            uint32_t rng=7921;
+            for(unsigned i=0;i<100000;++i) {
+                auto mutated=f;rng=rng*1664525+1013904223;mutated[rng%mutated.size()]^=rng>>24;
+                validDataFrame(mutated.data(),mutated.size());
+            }
+        }
+    }
+}
 static void scheduleTests()
 {
     for(unsigned presence=1;presence<=64;presence*=2) {
@@ -217,7 +265,7 @@ static void applePaddingElectionTests()
 }
 int main()
 {
-    capturedIphoneTests(); scheduleTests(); roleTests(); templateTests(); nativeTemplateTests(); nativePeriodTests(); applePaddingElectionTests();
+    aggregateTests(); capturedIphoneTests(); scheduleTests(); roleTests(); templateTests(); nativeTemplateTests(); nativePeriodTests(); applePaddingElectionTests();
     State tx,rx; tx.init(remote,1000000); rx.init(local,1000000); tx.metric=10;
     for(unsigned i=0;i<16;++i) tx.sequence.channels[i]=i%2 ? 44 : 6;
     tx.ownSequence=tx.sequence; tx.elect(1024000);
@@ -328,5 +376,5 @@ int main()
         uint8_t out[1514]; uint16_t seq;
         decodeData(out,sizeof(out),packet.data(),packet.size(),seq);
     }
-    puts("AWDL protocol: bounded templates, variable presence/wrap, forced roles, malformed/fragmented frames, election/expiry, replay, grants, IPv6 round trips and 100000 mutations passed");
+    puts("AWDL protocol: bounded templates, presence/wrap, roles, malformed frames, election/expiry, replay, grants, IPv6 and A-MSDU round trips across every MTU size, hardware padding and 200000 mutations passed");
 }

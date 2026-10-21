@@ -14,6 +14,7 @@ def fn(text, signature):
     begin=text.index(signature)
     return text[begin:text.index('\n}\n',begin)+3]
 functions='\n'.join(fn(source,s) for s in [
+ 'UInt AirportMtkAwdlInterface::getHardwareAssists(',
  'bool AirportMtkAwdlInterface::start(',
  'bool AirportMtkAwdlInterface::createDataPath(',
  'void AirportMtkAwdlInterface::releaseDataPath(',
@@ -44,6 +45,7 @@ stubs=r'''
 #include <functional>
 #define XYLog(...) ((void)0)
 using IOReturn=unsigned;
+using UInt=unsigned;
 using IOThread=void*;using AbsoluteTime=uint64_t;
 constexpr unsigned kIOReturnTimeout=10,kMillisecondScale=1,THREAD_UNINT=0;
 IOThread IOThreadSelf(){static int identity;return &identity;}
@@ -125,6 +127,7 @@ uint64_t awdlNow(){return 123;}
 void *bsdAddress=nullptr;
 void ifnet_set_lladdr(void *bsd,const void *mac,unsigned length){assert(length==6);memcpy(bsd,mac,6);}
 struct NativeProtocol:IOService {
+ virtual unsigned getHardwareAssists(){return 0x37f;}
  ether_addr agentMac={}; bool agentStarted=false; unsigned macDepth=0;
  virtual IOReturn setMacAddress(ether_addr&)=0;
  virtual ether_addr getSelfMacAddr(){return agentMac;}
@@ -163,6 +166,7 @@ struct AirportMtkAwdlInterface:NativeProtocol {
  void setProperty(const char*,bool){}void setProperty(const char*,const char*){}void setProperty(const char*,const void*,unsigned){}void setProperty(const char*,uint64_t,unsigned){}
  bool initRegistrationInfo(IOSkywalkEthernetInterface::RegistrationInfo*,unsigned,unsigned){return !infoFail;}
  IOReturn registerEthernetInterface(IOSkywalkEthernetInterface::RegistrationInfo *info,IOSkywalkPacketQueue**,unsigned count,IOSkywalkPacketBufferPool*,IOSkywalkPacketBufferPool*,unsigned){const char *prefix=nullptr;uint32_t unit=1;memcpy(&prefix,info->bytes+0x30,sizeof(prefix));memcpy(&unit,info->bytes+0x38,sizeof(unit));assert(!strcmp(prefix,"awdl")&&unit==0);uint32_t subfamily=0,media=0;memcpy(&subfamily,info->bytes+0x0c,4);memcpy(&media,info->bytes+0x28,4);assert(subfamily==3&&media==0x80);assert(count==3&&queuesAdded==3&&deferred);registered=!registerFail;return registerFail?7:0;}
+ unsigned getHardwareAssists() override;
  bool start(IOService*);bool createDataPath();void releaseDataPath();void drainCompletions();void inputNative(const uint8_t*,size_t);void setDataPathEnabled(bool);void stop(IOService*);
  IOReturn enable(unsigned) override;IOReturn disable(unsigned) override;
  void enableDatapath();void disableDatapath();static IOReturn dataPathGated(OSObject*,void*,void*,void*,void*);
@@ -188,6 +192,8 @@ void reset(){assert(live==0&&outstanding==0);factory=add=nativeStarts=publicatio
 void failure(){AirportMtkWlan c;assert(!c.createAwdlInterface());assert(!c.awdlInterface&&!c.awdlCreating&&!c.awdlStarted&&!c.awdlAttached);assert(publications==0&&live==0);c.stopAwdlInterface();}
 IOSkywalkPacket *tx(){auto p=new IOSkywalkPacket;p->tx=p->prepared=true;return p;}
 int main(){
+ AirportMtkAwdlInterface offload;NativeProtocol *offloadBase=&offload;
+ assert(offloadBase->getHardwareAssists()==0);
  for(int n=1;n<=5;++n){reset();failFactory=n;failure();}
  for(int n=1;n<=3;++n){reset();failAdd=n;failure();}
  reset();resourceAvailable=false;failure();assert(factory==0&&nativeStarts==0);

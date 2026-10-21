@@ -33,7 +33,7 @@ struct IO80211Buffer{uint8_t bytes[2048]{};unsigned length=0,returned=0;
  void setLength(unsigned n){length=n;}void returnBuffer(){++returned;}};
 struct IO80211BufferPool{IO80211Buffer b;bool missing=false;IO80211Buffer*getBuffer(){return missing?nullptr:&b;}};
 struct Hal{
- bool grant=true,on=true;uint64_t observedAt=clockUS;unsigned transmitted=0;std::vector<std::vector<uint8_t>> frames;
+ bool grant=true,on=true;IOReturn txResult=0;uint64_t observedAt=clockUS;unsigned transmitted=0;std::vector<std::vector<uint8_t>> frames;
  bool awdlIsEnabled(){return on;}void awdlAbort(){}bool awdlChannelAllowed(unsigned c){return c==6||c==149;}
  bool awdlGrantSnapshot(mtkawdl::Reservation &out){
   out={};out.granted=grant;out.channel=6;out.token=1;out.grantObservedAt=observedAt;
@@ -41,7 +41,7 @@ struct Hal{
  }
  bool awdlCanTransmit(unsigned){return grant;}IOReturn awdlReserve(unsigned,unsigned){return 0;}
  IOReturn awdlPeer(const uint8_t*,bool){return 0;}
- IOReturn awdlTransmit(mbuf_t m,unsigned){++transmitted;frames.push_back(m->bytes);delete m;return 0;}
+ IOReturn awdlTransmit(mbuf_t m,unsigned){++transmitted;frames.push_back(m->bytes);delete m;return txResult;}
 };
 struct AirportMtkAwdlInterface{
  Hal radio;Hal*hal=&radio;Timer t;Timer*timer=&t;IO80211BufferPool pool;
@@ -63,10 +63,13 @@ struct AirportMtkAwdlInterface{
  actionNativeDelivered=0,actionInvalid=0,actionNoBuffer=0,nextAction=0,requestDeadline=0;
  int32_t lastActionRSSI=0;unsigned reserveDuration=0,requestedChannel=0,grantedChannel=0;
  IOReturn reserveStatus=0,actionStatus=0,miStatus=0;mbuf_t queue[64]{};
+ uint64_t dataTxSubmitted=0,dataTxFailed=0,dataTxExpired=0;IOReturn dataTxStatus=0;
+ uint64_t dataRxFrames=0,dataRxInvalid=0,dataRxUnknownPeer=0,dataRxWrongDestination=0,dataRxReplay=0,dataRxDecoded=0;
+ std::vector<std::vector<uint8_t>> received;
  uint64_t queueTime[64]{};unsigned queueCount=0,queueHead=0,nativeCalls=0;
  void setProperty(const char*,uint64_t,unsigned){}void setProperty(const char*,bool){}
  void setProperty(const char*,void*,unsigned){}
- void publishScheduler(uint64_t){}void inputNative(const uint8_t*,size_t){}
+ void publishScheduler(uint64_t){}void inputNative(const uint8_t*f,size_t n){received.emplace_back(f,f+n);}
  mbuf_t makeFrame(const uint8_t*f,size_t n){return new Packet{{f,f+n}};}
  IO80211BufferPool*getMgmtFramePool(){return &pool;}
  void bpfTapInput(IO80211Buffer*b,unsigned type,void*meta,unsigned n){
@@ -117,7 +120,53 @@ int main(){
  assert(d.receive(&d,f,n,6,-90)&&d.actionRSSIRejected==1&&d.nativeCalls==2);
  f[41]=255;assert(d.receive(&d,f,n,6,-40)&&d.actionInvalid==1&&d.nativeCalls==2);
  f[41]=9;d.pool.missing=true;assert(d.receive(&d,f,n,6,-40)&&d.actionNoBuffer==1);
- puts("PASS actual MI/control/RX: borrowed ABI/copy, bitmap validation/cancel, unchanged refresh, delayed granted-only MIF, EAW rate, PSF suppress/allow, native discovery independent of host sync parser, RSSI/framing rejects and buffer ownership.");
+ // Exercise actual data RX, including hardware-deaggregated and aggregate
+ // payloads, per-MSDU replay, malformed tails and destination/peer gates.
+ uint8_t eth[55]{},wire[128]{};memcpy(eth,local,6);memcpy(eth+6,peer,6);
+ eth[12]=0x86;eth[13]=0xdd;eth[14]=0x60;eth[19]=1;eth[54]=123;
+ size_t wn=mtkawdl::encodeData(wire,sizeof(wire),eth,sizeof(eth),40);
+ assert(d.receive(&d,wire,wn,6,-40)&&d.received.size()==1);
+ assert(d.received.back()==std::vector<uint8_t>(eth,eth+sizeof(eth)));
+ d.receive(&d,wire,wn,6,-40);assert(d.dataRxReplay==1&&d.received.size()==1);
+ std::vector<uint8_t> aggregate(wire,wire+24);aggregate[0]=0x88;
+ aggregate.push_back(0x80);aggregate.push_back(0);
+ for(unsigned seq:{41U,42U}) {
+  aggregate.insert(aggregate.end(),eth,eth+12);aggregate.push_back(0);aggregate.push_back(wn-24);
+  size_t pos=aggregate.size();aggregate.insert(aggregate.end(),wire+24,wire+wn);
+  mtkawdl::put16(aggregate.data()+pos+10,seq);
+  if(seq==41)while((aggregate.size()-26)%4)aggregate.push_back(0);
+ }
+ d.receive(&d,aggregate.data(),aggregate.size(),6,-40);assert(d.received.size()==3);
+ d.receive(&d,aggregate.data(),aggregate.size(),6,-40);assert(d.dataRxReplay==3);
+ auto malformed=aggregate;
+ // A truncated final IPv6 payload must not deliver the valid first subframe.
+ malformed=aggregate;malformed.pop_back();d.receive(&d,malformed.data(),malformed.size(),6,-40);
+ assert(d.dataRxInvalid==1&&d.received.size()==3);
+ std::vector<uint8_t> deagg(aggregate.begin(),aggregate.begin()+26);
+ deagg.push_back(0xcc);deagg.push_back(0xdd);
+ deagg.insert(deagg.end(),eth,eth+12);deagg.push_back(0);deagg.push_back(wn-24);
+ size_t dp=deagg.size();deagg.insert(deagg.end(),wire+24,wire+wn);
+ mtkawdl::put16(deagg.data()+dp+10,43);
+ assert(mtkawdl::relocateDeaggregatedHeader(deagg.data(),deagg.size()));
+ deagg.erase(deagg.begin(),deagg.begin()+2);d.receive(&d,deagg.data(),deagg.size(),6,-40);
+ assert(d.received.size()==4&&d.received.back()==std::vector<uint8_t>(eth,eth+sizeof(eth)));
+ wire[4]^=4;d.receive(&d,wire,wn,6,-40);assert(d.dataRxWrongDestination==1);wire[4]^=4;
+ wire[10]^=4;d.receive(&d,wire,wn,6,-40);assert(d.dataRxUnknownPeer==1);wire[10]^=4;
+ // Successful submissions, firmware failures, expiry without any grant.
+ d.afMode.mode=3;d.miTemplateLength=0;
+ auto enqueue=[&](uint64_t time){unsigned tail=(d.queueHead+d.queueCount)%64;
+  d.queue[tail]=d.makeFrame(wire,wn);d.queueTime[tail]=time;++d.queueCount;};
+ d.state.peers[d.state.find(peer)].advertisement.sequence.channels[0]=6;
+ memcpy(wire+4,peer,6);enqueue(clockUS);d.serviceInGate();assert(d.dataTxSubmitted==1&&!d.queueCount);
+ d.radio.txResult=kIOReturnNotReady;enqueue(clockUS);d.serviceInGate();assert(d.dataTxFailed==1&&d.dataTxStatus==kIOReturnNotReady);
+ d.radio.grant=false;enqueue(clockUS-1000000);enqueue(clockUS);d.serviceInGate();
+ assert(d.dataTxExpired==1&&d.queueCount==1);mbuf_freem(d.queue[d.queueHead]);d.queueCount=0;
+ // A full queue with alternating expired/live packets preserves live order.
+ for(unsigned i=0;i<64;++i){wire[wn-1]=i;enqueue(clockUS-(i%2 ? 0 : 1000000));}
+ d.serviceInGate();assert(d.queueCount==32&&d.dataTxExpired==33);
+ for(unsigned i=0;i<32;++i)assert(d.queue[(d.queueHead+i)%64]->bytes.back()==i*2+1);
+ clockUS+=1000000;d.serviceInGate();assert(!d.queueCount&&d.dataTxExpired==65);
+ puts("PASS actual MI/control/RX: borrowed ABI/copy, bitmap/cancel, granted MIF, PSF modes, native discovery, data/aggregate RX, per-MSDU replay, peer/destination gates, atomic malformed-tail rejection, TX submission/failure and no-grant expiry.");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='mtk-mi-discovery-') as d:

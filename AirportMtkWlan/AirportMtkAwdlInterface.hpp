@@ -27,6 +27,7 @@ public:
     void *getRxPacketPool() override;
     int getNumTxQueues() override { return 1; }
     int getTxHeadroom() override { return 0; }
+    UInt getHardwareAssists() override;
     IOReturn enable(unsigned int) override;
     IOReturn disable(unsigned int) override;
     void enableDatapath() override;
@@ -144,6 +145,10 @@ private:
     IOSkywalkPacket *completions[128] = {};
     unsigned completionCount = 0;
     uint64_t nativeTx = 0, nativeRx = 0, nativeDrops = 0;
+    uint64_t dataTxSubmitted = 0, dataTxFailed = 0, dataTxExpired = 0;
+    uint64_t dataRxFrames = 0, dataRxInvalid = 0, dataRxUnknownPeer = 0;
+    uint64_t dataRxWrongDestination = 0, dataRxReplay = 0, dataRxDecoded = 0;
+    IOReturn dataTxStatus = kIOReturnNotReady;
     uint64_t serviceTicks = 0, reserveAttempts = 0, grantObservations = 0, awStartNotifications = 0;
     uint64_t actionSubmitted = 0, actionFailed = 0, actionReceived = 0, lastDiagnostic = 0;
     uint64_t actionHostAccepted = 0, actionHostRejected = 0, actionRSSIRejected = 0;

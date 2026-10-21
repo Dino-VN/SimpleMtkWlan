@@ -58,6 +58,28 @@ def check():
     delta = {key: after['native'].get(key, 0) - before['native'].get(key, 0) for key in keys}
     bsd_delta = {key: after['bsd'][key] - before['bsd'][key] for key in before['bsd']}
     result.update(native_delta=delta, bsd_delta=bsd_delta, missing_counters=missing)
+    stages = ('MTKAWDLDataTxSubmitted', 'MTKAWDLDataTxFailed', 'MTKAWDLDataTxExpired',
+              'MTKAWDLDataRxFrames', 'MTKAWDLDataRxInvalid', 'MTKAWDLDataRxUnknownPeer',
+              'MTKAWDLDataRxWrongDestination', 'MTKAWDLDataRxReplay', 'MTKAWDLDataRxDecoded')
+    transport_delta = {key: after['native'][key] - before['native'][key] for key in stages
+                       if key in before['native'] and key in after['native']}
+    result['transport_delta'] = transport_delta
+    result['interface'] = run(['ifconfig', 'awdl0']).decode(errors='replace')
+    result['transport_findings'] = []
+    if any(value < 0 for value in transport_delta.values()):
+        result['reasons'].append('Transport counters reset during observation.')
+    else:
+        for key, finding in (
+            ('MTKAWDLDataTxFailed', 'HAL rejected data TX; inspect MTKAWDLDataTxStatus.'),
+            ('MTKAWDLDataTxExpired', 'Queued data expired while waiting for a usable radio/peer slot.'),
+            ('MTKAWDLDataRxInvalid', 'Raw AWDL data failed wire/header validation.'),
+            ('MTKAWDLDataRxUnknownPeer', 'Raw AWDL data came from a peer absent from the host schedule.'),
+            ('MTKAWDLDataRxWrongDestination', 'Raw AWDL data addressed another interface.'),
+            ('MTKAWDLDataRxReplay', 'Duplicate/old AWDL data was rejected by the replay window.')):
+            if transport_delta.get(key, 0) > 0:
+                result['transport_findings'].append(finding)
+        if transport_delta.get('MTKAWDLDataRxFrames') == 0:
+            result['transport_findings'].append('No raw AWDL data reached the receiver during this interval.')
     if not after['native'].get('MTKAWDLDataPathEnabled', False):
         result['reasons'].append('The native datapath is disabled or its diagnostic is absent.')
     if missing:
@@ -70,6 +92,8 @@ def check():
         result['reasons'].append('No new native/BSD RX was observed.')
     result['limitations'] = ['Local multicast ping replies do not prove RF traffic.',
                             'Native TX counts accepted protocol frames, not firmware ACKs.',
+                            'DataTxSubmitted counts successful HAL/DMA submissions, not firmware ACKs.',
+                            'Transport properties publish once per second; short intervals can miss updates.',
                             'Data counters do not validate an AirDrop file transfer.']
     if not result['reasons']:
         result['status'] = 'passed'

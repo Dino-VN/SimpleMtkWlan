@@ -39,6 +39,8 @@ code=r'''
 #define MT_WF_RFCR_DROP_MCAST 16
 #define MT_WF_RFCR_DROP_MCAST_FILTERED 32
 #define MT_WF_RFCR(n) (n)
+#define MT_RXD4_NORMAL_PAYLOAD_FORMAT 3
+#define mtod(m,t) ((t)((m)->bytes+(m)->offset))
 #define UNI_BSS_INFO_RLM 2
 #define CMD_CBW_20MHZ 0
 #define MCU_UNI_CMD_BSS_INFO_UPDATE 0x20002
@@ -82,7 +84,9 @@ struct mwx_softc {
 };
 static bool mwx_awdl_current(mwx_softc*,uint32_t);
 static void mwx_awdl_quiesce(mwx_softc*,bool drainCalls=true);
-struct mbuf { uint8_t bytes[256]{};size_t len=0; };
+struct mbuf { uint8_t bytes[256]{};size_t len=0,offset=0; };
+size_t mbuf_len(mbuf*m){return m->len;}
+void m_adj(mbuf*m,size_t n){assert(n<=m->len);m->offset+=n;m->len-=n;}
 using mbuf_t=mbuf*;
 std::vector<std::vector<uint8_t>> wire;
 std::vector<int> commands;
@@ -121,12 +125,20 @@ void task_add(int,int*){++scan_tasks;}
 class MtkMwx {public:mwx_softc *com;MtkMwx *mwxController(){return this;}void setProperty(const char*,const char*){}void setProperty(const char*,uint64_t,unsigned){}bool awdlChannelAllowed(uint8_t);void awdlAbort();IOReturn awdlEnable(const uint8_t*,bool);IOReturn awdlReserve(uint8_t,uint32_t);bool awdlCanTransmit(uint8_t);IOReturn awdlPeer(const uint8_t*,bool);};
 '''+structs+r'''
 mbuf*mwx_fill_sta_req_hdr(mbuf*m,mwx_vif*v,uint8_t omac,uint16_t wcid,uint16_t count){auto*p=(sta_req_hdr*)m->bytes;p->bss_idx=v->idx;p->wlan_idx_lo=wcid;p->wlan_idx_hi=wcid>>8;p->tlv_num=count;p->is_tlv_append=1;p->muar_idx=omac;return m;}
-'''+helpers+'\n'+function('bool MtkMwx::awdlChannelAllowed(')+'\n'+function('static void mwx_awdl_abort(')+'\n'+function('void MtkMwx::awdlAbort(')+'\n'+function('static int mwx_awdl_remove_station(')+'\n'+function('static int mwx_awdl_remove_context(mwx_softc')+'\n'+function('IOReturn MtkMwx::awdlEnable(')+'\n'+function('IOReturn MtkMwx::awdlReserve(')+'\n'+function('bool MtkMwx::awdlCanTransmit(')+'\n'+function('IOReturn MtkMwx::awdlPeer(')+r'''
+'''+helpers+'\n'+function('static void mwx_awdl_strip_deaggregate(')+'\n'+function('bool MtkMwx::awdlChannelAllowed(')+'\n'+function('static void mwx_awdl_abort(')+'\n'+function('void MtkMwx::awdlAbort(')+'\n'+function('static int mwx_awdl_remove_station(')+'\n'+function('static int mwx_awdl_remove_context(mwx_softc')+'\n'+function('IOReturn MtkMwx::awdlEnable(')+'\n'+function('IOReturn MtkMwx::awdlReserve(')+'\n'+function('bool MtkMwx::awdlCanTransmit(')+'\n'+function('IOReturn MtkMwx::awdlPeer(')+r'''
 IOLock lock;
 mwx_softc make(){mwx_softc sc{};sc.sc_awdl_lock=&lock;sc.sc_ic.ic_if.if_flags=1;sc.sc_capa={2,3};sc.sc_awdl_vif.idx=sc.sc_awdl_vif.omac_idx=1;sc.sc_awdl_vif.vif_mn.wcid=18;sc.sc_awdl_enabled=true;
  for(int ch:{6,44,149}){sc.sc_ic.ic_channels[ch].ic_freq=ch<=14?2407+ch*5:5000+ch*5;sc.sc_ic.ic_channels[ch].ic_flags=1;sc.sc_ic.ic_chan_active[ch/8]|=1U<<(ch%8);sc.sc_ic.ic_chan_avail[ch/8]|=1U<<(ch%8);}return sc;}
 void reset(){wire.clear();commands.clear();calls=fail_at=fw_status=0;model=false;memset(owned,0,sizeof(owned));reply_status=0;alloc_fail=false;on_wait=nullptr;on_sleep=nullptr;lock.locked=false;clock_us=100000;scan_cancel_status=scan_cancels=scan_tasks=0;}
 int main(){
+ // Production HAL padding removal is RXD4- and AWDL-specific.
+ mbuf rx{};uint8_t*hdr=rx.bytes;hdr[0]=0x88;hdr[24]=0x80;
+ memcpy(hdr+10,"\x02\x01\x02\x03\x04\x06",6);memcpy(hdr+16,mtkawdl::bssid,6);
+ rx.len=98;auto raw=rx;mwx_awdl_strip_deaggregate(&rx,0);assert(rx.offset==0);
+ mwx_awdl_strip_deaggregate(&rx,3);assert(rx.offset==2&&rx.len==96);
+ assert(!memcmp(mtod(&rx,uint8_t*),raw.bytes,26));
+ rx=raw;rx.bytes[16]^=1;mwx_awdl_strip_deaggregate(&rx,3);assert(rx.offset==0);
+ rx=raw;rx.len=50;mwx_awdl_strip_deaggregate(&rx,3);assert(rx.offset==0);
  uint8_t addr[6]={2,1,2,3,4,5};
  reset();auto sc=make();MtkMwx hal{&sc};
  assert(!hal.awdlChannelAllowed(0)&&!hal.awdlChannelAllowed(166)&&hal.awdlChannelAllowed(6));

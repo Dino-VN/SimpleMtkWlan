@@ -148,6 +148,13 @@ void *AirportMtkAwdlInterface::getTxCompQueue() { return txComplete; }
 void *AirportMtkAwdlInterface::getRxCompQueue() { return rxComplete; }
 void *AirportMtkAwdlInterface::getTxPacketPool() { return txPool; }
 void *AirportMtkAwdlInterface::getRxPacketPool() { return rxPool; }
+UInt AirportMtkAwdlInterface::getHardwareAssists()
+{
+    // Native Ethernet preparation calls this virtual before ifnet_set_offload.
+    // Raw AWDL TX neither segments TSO packets nor completes partial checksums.
+    // Let networking produce complete, MTU-sized datagrams before submission.
+    return 0;
+}
 IOReturn AirportMtkAwdlInterface::enable(unsigned int options)
 {
     if(stopping || !nativeRegistered || queuesAdded!=3 || !_fCommandGate)
@@ -605,6 +612,18 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     if(lastDiagnostic && now-lastDiagnostic<1000000) return;
     lastDiagnostic=now;
     hal->awdlPublishDiagnostics();
+    setProperty("MTKAWDLDataTxSubmitted",dataTxSubmitted,64);
+    setProperty("MTKAWDLDataTxFailed",dataTxFailed,64);
+    setProperty("MTKAWDLDataTxExpired",dataTxExpired,64);
+    setProperty("MTKAWDLDataTxStatus",static_cast<uint64_t>(dataTxStatus),32);
+    setProperty("MTKAWDLDataTxPending",static_cast<uint64_t>(queueCount),32);
+    setProperty("MTKAWDLDataRxFrames",dataRxFrames,64);
+    setProperty("MTKAWDLDataRxInvalid",dataRxInvalid,64);
+    setProperty("MTKAWDLDataRxUnknownPeer",dataRxUnknownPeer,64);
+    setProperty("MTKAWDLDataRxWrongDestination",dataRxWrongDestination,64);
+    setProperty("MTKAWDLDataRxReplay",dataRxReplay,64);
+    setProperty("MTKAWDLDataRxDecoded",dataRxDecoded,64);
+    setProperty("MTKAWDLNativeDroppedPackets",nativeDrops,64);
     setProperty("MTKAWDLServiceTicks",serviceTicks,64);
     setProperty("MTKAWDLReserveAttempts",reserveAttempts,64);
     setProperty("MTKAWDLReserveStatus",static_cast<uint64_t>(reserveStatus),32);
@@ -664,6 +683,17 @@ void AirportMtkAwdlInterface::serviceInGate()
         if(stopping || !enabled) return;
         hal->awdlAbort(); requestedChannel=grantedChannel=0;
         now=awdlNow();
+    }
+    // Expire queued data even while ROC requests fail or the slot is idle.
+    // A full queue must not remain wedged waiting for a radio grant.
+    for(unsigned pending=queueCount;pending--;) {
+        mbuf_t m=queue[queueHead]; uint64_t time=queueTime[queueHead];
+        queueHead=(queueHead+1)%64; --queueCount;
+        if(now-time>=1000000) { ++dataTxExpired; mbuf_freem(m); }
+        else {
+            unsigned tail=(queueHead+queueCount)%64;
+            queue[tail]=m; queueTime[tail]=time; ++queueCount;
+        }
     }
     state.elect(now); publishScheduler(now);
     if(trafficPeerInstalled) {
@@ -829,8 +859,11 @@ void AirportMtkAwdlInterface::serviceInGate()
             unsigned tail=(queueHead+queueCount)%64; queue[tail]=m; queueTime[tail]=time; ++queueCount;
             continue;
         }
-        if(now-time>=1000000) mbuf_freem(m);
-        else hal->awdlTransmit(m,channel);
+        if(now-time>=1000000) { ++dataTxExpired; mbuf_freem(m); }
+        else {
+            dataTxStatus=hal->awdlTransmit(m,channel);
+            if(dataTxStatus==kIOReturnSuccess) ++dataTxSubmitted; else ++dataTxFailed;
+        }
     }
     if(!hal->awdlCanTransmit(channel)) { requestedChannel=0; grantedChannel=0; }
     // Wake on the recorded radio end instead of overshooting it by a tick.
@@ -893,12 +926,33 @@ bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,ui
         } else { ++self->actionNoBuffer; buffer->returnBuffer(); }
         return true;
     }
-    uint8_t eth[1514]; uint16_t seq;
-    size_t size=mtkawdl::decodeData(eth,sizeof(eth),f,n,seq);
+    ++self->dataRxFrames;
+    if(!mtkawdl::validDataFrame(f,n)) { ++self->dataRxInvalid; return true; }
     int peer=self->state.find(f+10);
-    if(!size || peer<0 || (memcmp(eth,self->state.mac,6) && !(eth[0]&1)) ||
-       !self->state.acceptData(self->state.peers[peer],seq)) return true;
-    self->inputNative(eth,size);
+    if(peer<0) { ++self->dataRxUnknownPeer; return true; }
+    if(memcmp(f+4,self->state.mac,6) && !(f[4]&1)) {
+        ++self->dataRxWrongDestination; return true;
+    }
+    // Validate the whole aggregate before delivering any subframe. Each
+    // subframe carries its own AWDL sequence; MPDU sequence is insufficient
+    // after hardware deaggregation. Keep the peer replay window per MSDU.
+    size_t at=mtkawdl::dataHeaderLength(f,n);
+    while(at<n) {
+        mtkawdl::DataView view={};
+        size_t used=mtkawdl::dataView(f,n,at,view);
+        if(!used) { ++self->dataRxInvalid; break; }
+        at+=used;
+        if(memcmp(view.destination,self->state.mac,6) && !(view.destination[0]&1)) {
+            ++self->dataRxWrongDestination; continue;
+        }
+        if(!self->state.acceptData(self->state.peers[peer],view.sequence)) {
+            ++self->dataRxReplay; continue;
+        }
+        uint8_t eth[1514];
+        size_t size=mtkawdl::decodeDataView(eth,sizeof(eth),view);
+        ++self->dataRxDecoded;
+        self->inputNative(eth,size);
+    }
     return true;
 }
 

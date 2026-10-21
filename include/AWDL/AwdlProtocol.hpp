@@ -449,19 +449,75 @@ inline size_t encodeData(uint8_t *out,size_t capacity,const uint8_t *eth,size_t 
     put16(out+22,seq<<4); memcpy(out+24,snap,8); put16(out+32,0x0403);
     put16(out+34,seq); memcpy(out+38,eth+12,n-12); return n+26;
 }
-inline size_t decodeData(uint8_t *out,size_t capacity,const uint8_t *f,size_t n,uint16_t &seq) {
-    if(n<40 || (f[0]!=8 && f[0]!=0x88) || (f[1]&0xc7) || (f[22]&15) ||
+inline size_t dataHeaderLength(const uint8_t *f,size_t n) {
+    if(!f || n<40 || (f[0]!=8 && f[0]!=0x88) || (f[1]&0xc7) || (f[22]&15) ||
        !unicast(f+10) || memcmp(f+16,bssid,6)) return 0;
-    size_t hdr=(f[0]&0x80) ? 26 : 24;
-    // Fragment reassembly, HT-control/mesh headers and A-MSDU subframes are
-    // not implemented. A retry is permitted and handled by replay state.
-    if(hdr==26 && ((f[24]&0x80) || (f[25]&1))) return 0;
-    if(n<hdr+16 || memcmp(f+hdr,snap,8) || le16(f+hdr+8)!=0x0403 ||
-       le16(f+hdr+12)!=0 || f[hdr+14]!=0x86 || f[hdr+15]!=0xdd) return 0;
-    size_t len=n-hdr-16+14;
-    if(len>1514 || capacity<len || !validIPv6(f+hdr+16,n-hdr-16)) return 0;
-    memcpy(out,f+4,6); memcpy(out+6,f+10,6);
-    memcpy(out+12,f+hdr+14,n-hdr-14); seq=le16(f+hdr+10); return len;
+    size_t hdr=f[0]==0x88 ? 26 : 24;
+    // Fragment reassembly and HT-control/mesh headers remain unsupported.
+    if(hdr==26 && (f[25]&1)) return 0;
+    return hdr;
+}
+// MT7921 hardware deaggregation adds two bytes after the 802.11 header.
+// Called only with RXD4 payload-format != 0; the caller pulls two bytes after
+// relocating the header, as in mt76's raw (non-translated) RX path.
+inline bool relocateDeaggregatedHeader(uint8_t *f,size_t n) {
+    size_t hdr=dataHeaderLength(f,n);
+    if(hdr!=26 || !(f[24]&0x80) || n<hdr+2+14+56) return false;
+    memmove(f+2,f,hdr); return true;
+}
+struct DataView {
+    const uint8_t *destination, *source, *payload;
+    size_t length; uint16_t sequence;
+};
+inline size_t dataView(const uint8_t *f,size_t n,size_t at,DataView &out) {
+    size_t hdr=dataHeaderLength(f,n);
+    if(!hdr || at<hdr || at>=n) return 0;
+    const bool aggregate=hdr==26 && (f[24]&0x80);
+    const uint8_t *dst=f+4,*src=f+10,*p=f+at;
+    size_t len=n-at,used=len;
+    if(aggregate) {
+        if(len<14) return 0;
+        dst=p; src=p+6; size_t body=unsigned(p[12])*256+p[13];
+        if(body>len-14 || memcmp(src,f+10,6)) return 0;
+        used=14+body; p+=14; len=body;
+        if(used<n-at) {
+            size_t pad=(4-used%4)%4;
+            // Padding occurs only between complete subframes.
+            if(n-at-used<pad+14+56) return 0;
+            used+=pad;
+        }
+    } else if(at!=hdr) return 0;
+    if(len<56 || len>1516 || memcmp(p,snap,8) || le16(p+8)!=0x0403 ||
+       le16(p+12)!=0 || p[14]!=0x86 || p[15]!=0xdd || !validIPv6(p+16,len-16)) return 0;
+    out={dst,src,p,len,le16(p+10)}; return used;
+}
+inline bool validDataFrame(const uint8_t *f,size_t n) {
+    size_t at=dataHeaderLength(f,n);
+    if(!at || n>11454) return false;
+    while(at<n) {
+        DataView view={}; size_t used=dataView(f,n,at,view);
+        if(!used) return false;
+        at+=used;
+    }
+    return true;
+}
+inline size_t decodeDataView(uint8_t *out,size_t capacity,const DataView &view) {
+    if(!out || !view.payload || !view.source || !view.destination ||
+       view.length<56 || view.length>1516) return 0;
+    size_t len=view.length-2;
+    if(capacity<len) return 0;
+    memcpy(out,view.destination,6); memcpy(out+6,view.source,6);
+    memcpy(out+12,view.payload+14,view.length-14); return len;
+}
+// Single-MSDU API retained for callers expecting exactly one Ethernet frame.
+inline size_t decodeData(uint8_t *out,size_t capacity,const uint8_t *f,size_t n,uint16_t &seq) {
+    size_t hdr=dataHeaderLength(f,n);
+    if(!hdr || (hdr==26 && (f[24]&0x80))) return 0;
+    DataView view={};
+    if(!dataView(f,n,hdr,view)) return 0;
+    size_t len=decodeDataView(out,capacity,view);
+    if(len) seq=view.sequence;
+    return len;
 }
 // A matching, unexpired firmware grant is mandatory before any transmission.
 struct Reservation {

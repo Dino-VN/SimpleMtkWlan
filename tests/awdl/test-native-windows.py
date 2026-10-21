@@ -57,6 +57,7 @@ struct AirportMtkAwdlInterface{
  NativePeerSample nativePeerSamples[16]{};uint64_t advertisersRequests=0;
  uint8_t requestedChannel=0,grantedChannel=0;uint64_t requestDeadline=0;
  unsigned reserveDuration=0;IOReturn reserveStatus=0,actionStatus=0,miStatus=0;
+ uint64_t dataTxSubmitted=0,dataTxFailed=0,dataTxExpired=0;IOReturn dataTxStatus=0;
  uint64_t serviceTicks=0,reserveAttempts=0,grantObservations=0,awStartNotifications=0,
  nextAction=0,actionSubmitted=0,actionFailed=0,miStart=0,miSubmitted=0,miFailed=0;
  struct{unsigned mode=3;}afMode;struct{unsigned synchronization_frame_period=440;}syncParams;

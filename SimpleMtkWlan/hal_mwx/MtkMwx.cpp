@@ -6115,6 +6115,16 @@ mt7921_mcu_set_tx(struct mwx_softc *sc, struct mwx_vif *mvif)
 	return rv;
 }
 
+static void mwx_awdl_strip_deaggregate(struct mbuf *m,uint32_t rxd4)
+{
+    // DAMSDU_EN is enabled in mwx_mac_init. Raw AWDL deaggregated RX
+    // retains the subframe header and has two extra alignment bytes after
+    // the QoS header. Remove only RXD4-marked AWDL padding before dispatch.
+    if((rxd4 & MT_RXD4_NORMAL_PAYLOAD_FORMAT) &&
+       mtkawdl::relocateDeaggregatedHeader(mtod(m,uint8_t *),mbuf_len(m)))
+        m_adj(m,2);
+}
+
 int
 mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
     struct ieee80211_rxinfo *rxi)
@@ -6478,6 +6488,7 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 		return -1;
 	}
 	m_adj(m, hdr_gap);
+    mwx_awdl_strip_deaggregate(m,rxd4);
 #if 0
 	if (status->amsdu) {
 		memmove(skb->data + 2, skb->data,
