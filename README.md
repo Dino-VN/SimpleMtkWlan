@@ -44,25 +44,25 @@ glue, so the card shows up as a native Wi-Fi interface. You get the macOS Wi-Fi
 menu, System Settings › Wi-Fi and `airportd`, with no helper app. It replaces
 SimpleMtkWlan: **never load both at the same time.**
 
-Tested on one machine only (Lenovo Legion Slim 5 16APH8, RZ616 `14c3:0616`,
-macOS 15.8.1 and macOS 26.7.1). Sequoia and Tahoe use different IO80211 ABIs, so
-each needs its own build (see below). A build only starts on the macOS major
-version it was built for.
+Developed on one machine (Lenovo Legion Slim 5 16APH8, RZ616 `14c3:0616`,
+macOS 15.8.1 and macOS 26.7.1). One more tester ran the 802.11ax build on an
+MT7922 desktop (macOS 15.8.1) with a Wi-Fi 6 mesh AP. Sequoia and Tahoe use
+different IO80211 ABIs, so each needs its own build (see below). A build only
+starts on the macOS major version it was built for.
 
 Works:
 - scan on 2.4 and 5 GHz;
 - WPA2-PSK join from the Wi-Fi menu;
 - DHCP;
 - 802.11ac VHT80 2x2;
+- 802.11ax (HE) at up to 80 MHz, opt-in with the `amtk_he=1` boot-arg (experimental);
 - RX and TX A-MPDU (Block Ack);
 - coexistence with MT7922 Bluetooth.
 
 Known problems:
-- download is capped at about 90-100 Mbit/s even when the link supports more,
-  while upload is not (under investigation);
 - no sleep/wake;
 - no WPA3-only (SAE) networks;
-- no 802.11ax and no 6 GHz;
+- 802.11ax is experimental and off by default; no 160 MHz, no 6 GHz;
 - a firmware crash (for example, turning Wi-Fi off while connected on older
   builds) needs a cold boot to recover.
 
@@ -86,7 +86,8 @@ fails right after `init`), so no Wi-Fi interface appears.
 
 `tools/mtkctl` (see `tools/mtkctl.c`) talks to either kext. It provides scan and
 join for SimpleMtkWlan, and the driver log ring, debug counters and knobs for
-both.
+both. `mtkctl sta` prints the current link (mode, channel, width, RSSI, MCS,
+rate, BSSID) without the SSID, so it is safe to paste into a report.
 
 ## Installing
 
@@ -157,7 +158,8 @@ It does not depend on Lilu. Keep a backup EFI.
 When reporting a problem, include:
 - your PCI ID;
 - your macOS version;
-- the output of `mtkctl debug` and `mtkctl log`.
+- the output of `mtkctl sta`, `mtkctl debug` and `mtkctl log`;
+- whether `amtk_he=1` is set.
 
 ## Building
 
