@@ -13,7 +13,7 @@ pre=r'''
 #include <cstdlib>
 #include <vector>
 using UInt32=unsigned; using IOReturn=int; struct OSObject{};
-constexpr int kIOReturnSuccess=0;
+constexpr int kIOReturnSuccess=0,kIOReturnNotReady=1;
 #define XYLog(...) ((void)0)
 #define panic(...) abort()
 struct Packet { Packet* next; unsigned id; };
@@ -33,7 +33,10 @@ struct IONetworkInterface {
  }
  unsigned flushInputQueue(){++flushes;return received.size();}
 };
+using IOEthernetInterface=IONetworkInterface;
 struct _ifnet {IONetworkInterface* iface;Stats* netStat;};
+unsigned purged;
+void ml_purge(mbuf_list*l){for(auto m=l->ml_head;m;){auto next=m->next;delete m;m=next;purged++;}*l={};}
 '''
 main=r'''
 int main(){
@@ -45,6 +48,12 @@ int main(){
   assert(iface.flushes==(count?1u:0u));
   assert(!list.ml_head && !list.ml_tail && list.ml_len==0);
   for(unsigned i=0;i<count;++i)assert(iface.received[i]==i);
+ }
+ for(unsigned count: {0u,1u,64u}){
+  mbuf_list list;Stats stats;_ifnet net{nullptr,&stats};unsigned before=purged;
+  for(unsigned i=0;i<count;i++){auto m=new Packet{nullptr,i};if(list.ml_tail)list.ml_tail->next=m;else list.ml_head=m;list.ml_tail=m;list.ml_len++;}
+  assert(_if_input(nullptr,&net,&list,nullptr,nullptr)==kIOReturnNotReady);
+  assert(purged==before+count&&!list.ml_head&&!list.ml_tail&&!list.ml_len&&!stats.inputPackets);
  }
  puts("PASS: six batch sizes, exact-once ordered handoff, detached packets, no post-transfer access");
 }

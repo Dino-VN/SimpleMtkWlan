@@ -9,23 +9,84 @@
 #include "AirportMtkEthernetInterface.hpp"
 
 #include <sys/_if_ether.h>
+#include <sys/sockio.h>
 #include <net80211/ieee80211_var.h>
+#include "AirportMtkAwdlInterface.hpp"
 #ifdef AIRPORT_WCL
 #include <IOKit/IOCommandGate.h>
 extern IOCommandGate *_fCommandGate;
+#endif
+#ifdef MTK_NATIVE_AWDL
+// Native Skywalk prepareBSDInterface borrows the compat bridge's ifnet.
+// The matching finalizer disables it and clears that borrowed native handle.
+extern void awdlFinalizeBSDInterface(IOSkywalkNetworkInterface*,ifnet_t,unsigned int)
+    __asm__("__ZN25IOSkywalkNetworkInterface20finalizeBSDInterfaceEP7__ifnetj");
 #endif
 
 #define super IOEthernetInterface
 OSDefineMetaClassAndStructors(AirportMtkEthernetInterface, IOEthernetInterface);
 
+const char *AirportMtkEthernetInterface::getNamePrefix() const
+{
+#ifdef MTK_NATIVE_AWDL
+    // The native AWDL object owns the awdl0 BSD name. Keep the controller's
+    // compatibility interface on a distinct name so it cannot collide with
+    // native ifnet allocation during PeerManager startup.
+    if (interface && interface->getInterfaceRole()==6) return "awdlc";
+#endif
+    return "en";
+}
+
 bool AirportMtkEthernetInterface::
 initWithSkywalkInterfaceAndProvider(IONetworkController *controller, IO80211SkywalkInterface *interface)
 {
+    this->interface=NULL;
+    this->isAttach=false;
+    this->retainsInterface=false;
     bool ret = super::init(controller);
-    if (ret)
+    if (ret) {
         this->interface = interface;
-    this->isAttach = false;
+#ifdef MTK_NATIVE_AWDL
+        if(OSDynamicCast(AirportMtkAwdlInterface,interface)) {
+            interface->retain();
+            retainsInterface=true;
+        }
+#endif
+    }
     return ret;
+}
+
+void AirportMtkEthernetInterface::free()
+{
+    // Data-link teardown can outlive the controller's interface pointer.
+    // Keep the native owner alive until this bridge itself is released.
+    if(retainsInterface) OSSafeReleaseNULL(interface);
+    super::free();
+}
+
+SInt32 AirportMtkEthernetInterface::performCommand(IONetworkController *controller,
+    unsigned long command,void *arg0,void *arg1)
+{
+#ifdef MTK_NATIVE_AWDL
+    if(auto awdl=OSDynamicCast(AirportMtkAwdlInterface,interface)) {
+        if(!getIfnet()) return ENXIO;
+        // The AWDL peer manager and socket Apple80211 ioctls belong to the
+        // virtual interface. Ethernet's default handler would instead enable
+        // the infrastructure controller and reject those private commands.
+        SInt32 status=awdl->processBSDCommand(getIfnet(),(unsigned int)command,arg1);
+        if(status==0 && command==SIOCSIFFLAGS) {
+            // Skywalk's flags handler changes multicast/promiscuous filters;
+            // native Skywalk enable requests normally arrive separately. The
+            // compat bridge must forward that administrative transition too.
+            bool up=(ifnet_flags(getIfnet()) & IFF_UP)!=0;
+            status=awdl->setInterfaceEnable(up);
+            if(status==0 && up) startOutputThread();
+            else { stopOutputThread(); flushOutputQueue(); }
+        }
+        return status;
+    }
+#endif
+    return super::performCommand(controller,command,arg0,arg1);
 }
 
 #ifdef AIRPORT_WCL
@@ -53,19 +114,39 @@ attachToDataLinkLayer( IOOptionBits options, void *parameter )
 #endif
     IOReturn ret = super::attachToDataLinkLayer(options, parameter);
     if (ret == kIOReturnSuccess && interface) {
+#ifdef MTK_NATIVE_AWDL
+        if (auto awdl=OSDynamicCast(AirportMtkAwdlInterface,interface))
+            awdl->setBSDInterface(getIfnet());
+#endif
         UInt8 builtIn = 0;
         IOEthernetAddress addr;
         interface->setProperty("built-in", OSData::withBytes(&builtIn, sizeof(builtIn)));
         snprintf(infName, sizeof(infName), "%s%u", ifnet_name(getIfnet()), ifnet_unit(getIfnet()));
+        // The native AWDL peer manager resolves awdl0 itself. Do not publish
+        // the compatibility bridge as awdl0, or native ifnet allocation fails.
+#ifdef MTK_NATIVE_AWDL
+        if(auto awdl=OSDynamicCast(AirportMtkAwdlInterface,interface))
+            awdl->setBSDName("awdl");
+#endif
         interface->setProperty("IOInterfaceName", OSString::withCString(infName));
         interface->setProperty(kIOInterfaceUnit, OSNumber::withNumber(ifnet_unit(getIfnet()), 8));
         interface->setProperty(kIOInterfaceNamePrefix, OSString::withCString(ifnet_name(getIfnet())));
-        if (OSDynamicCast(IOEthernetController, getController())->getHardwareAddress(&addr) == kIOReturnSuccess)
+        IOReturn addressStatus;
+#ifdef MTK_NATIVE_AWDL
+        if(auto awdl=OSDynamicCast(AirportMtkAwdlInterface,interface))
+            addressStatus=awdl->getHardwareAddress(reinterpret_cast<ether_addr *>(&addr));
+        else
+#endif
+            addressStatus=OSDynamicCast(IOEthernetController, getController())->getHardwareAddress(&addr);
+        if(addressStatus == kIOReturnSuccess)
             setProperty(kIOMACAddress,  (void *) &addr,
                         kIOEthernetAddressSize);
 #ifdef AIRPORT_WCL
         ret = _fCommandGate ? _fCommandGate->runAction(prepareBSDGated, this) : kIOReturnNotReady;
         if (ret != kIOReturnSuccess) {
+#ifdef MTK_NATIVE_AWDL
+            if(auto awdl=OSDynamicCast(AirportMtkAwdlInterface,interface)) awdl->setBSDInterface(NULL);
+#endif
             super::detachFromDataLinkLayer(options, parameter);
             isAttach = false;
             return ret;
@@ -89,6 +170,11 @@ attachToDataLinkLayer( IOOptionBits options, void *parameter )
 void AirportMtkEthernetInterface::
 detachFromDataLinkLayer(IOOptionBits options, void *parameter)
 {
+#ifdef MTK_NATIVE_AWDL
+    if(auto awdl=OSDynamicCast(AirportMtkAwdlInterface,interface)) awdl->setBSDInterface(NULL);
+    if(isAttach && OSDynamicCast(AirportMtkAwdlInterface,interface))
+        awdlFinalizeBSDInterface(interface,getIfnet(),0);
+#endif
     super::detachFromDataLinkLayer(options, parameter);
     isAttach = false;
 }
@@ -120,10 +206,11 @@ bpfTap(ifnet_t interface, u_int32_t data_link_type, bpf_tap_mode direction)
 bool AirportMtkEthernetInterface::
 setLinkState(IO80211LinkState state)
 {
+    if(!getIfnet()) return false;
     if (state == kIO80211NetworkLinkUp) {
         ifnet_set_flags(getIfnet(), ifnet_flags(getIfnet()) | (IFF_UP | IFF_RUNNING), (IFF_UP | IFF_RUNNING));
     } else {
-        ifnet_set_flags(getIfnet(), ifnet_flags(getIfnet()) & ~(IFF_UP | IFF_RUNNING), 0);
+        ifnet_set_flags(getIfnet(), 0, IFF_UP | IFF_RUNNING);
     }
     return true;
 }

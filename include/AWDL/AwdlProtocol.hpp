@@ -1,0 +1,474 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Wire protocol and scheduling primitives. No IOKit dependencies: the same
+// implementation is exercised by the userspace sanitizer tests.
+#ifndef MTK_AWDL_PROTOCOL_HPP
+#define MTK_AWDL_PROTOCOL_HPP
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+
+namespace mtkawdl {
+static const uint8_t bssid[6] = {0, 0x25, 0, 0xff, 0x94, 0x73};
+static const uint8_t snap[8] = {0xaa, 0xaa, 3, 0, 0x17, 0xf2, 8, 0};
+static const unsigned maxPeers = 16, slots = 16;
+static const uint64_t peerLifetimeUs = 3000000;
+static const uint32_t awUs = 16 * 1024;
+inline uint16_t le16(const uint8_t *p) { return p[0] | uint16_t(p[1]) << 8; }
+inline uint32_t le32(const uint8_t *p) { return le16(p) | uint32_t(le16(p+2)) << 16; }
+inline uint32_t be32(const uint8_t *p) { return uint32_t(p[0])<<24 | uint32_t(p[1])<<16 | uint32_t(p[2])<<8 | p[3]; }
+inline void put16(uint8_t *p, uint16_t v) { p[0]=v; p[1]=v>>8; }
+inline void put32(uint8_t *p, uint32_t v) { put16(p,v); put16(p+2,v>>16); }
+inline void putBE32(uint8_t *p,uint32_t v) { p[0]=v>>24; p[1]=v>>16; p[2]=v>>8; p[3]=v; }
+inline bool unicast(const uint8_t *p) {
+    static const uint8_t zero[6] = {};
+    return !(p[0]&1) && memcmp(p,zero,6);
+}
+inline bool zeroPadding(const uint8_t *p,size_t n) {
+    if(n>=3) return false;
+    for(size_t i=0;i<n;++i) if(p[i]) return false;
+    return true;
+}
+struct Sequence {
+    uint8_t channels[slots];
+    uint8_t count, step;
+};
+// Power-of-two EAW sizes divide the 16-bit AW counter without a partial
+// slot at rollover. Zero (unavailable) and other presence modes are not yet
+// implemented by the scheduler and must not be advertised as supported.
+inline bool validPresence(unsigned presence) {
+    return presence && presence <= 64 && !(presence & (presence-1));
+}
+inline bool validSequence(const Sequence &s) {
+    if (!s.count || s.count > slots || !validPresence(unsigned(s.step)+1)) return false;
+    for (unsigned i=0; i<s.count; ++i) if (s.channels[i]>165) return false;
+    return true;
+}
+inline bool parseSequence(const uint8_t *p, size_t n, Sequence &out) {
+    if (n < 6 || p[0] >= slots || p[2] != 0 || !validPresence(unsigned(p[3])+1) ||
+        le16(p+4)!=0xffff) return false;
+    unsigned count = unsigned(p[0])+1;
+    unsigned width = p[1]==0 ? 1 : (p[1]==1 || p[1]==3 ? 2 : 0);
+    if (!width || count*width > n-6) return false;
+    size_t used=6+count*width;
+    // V9's captured iPhone PSF has two pad bytes in the embedded legacy
+    // schedule and three in the standalone opclass schedule. Bound padding
+    // separately from TLV framing; never accept nonzero extension bytes.
+    if (n-used>3) return false;
+    for(size_t i=used;i<n;++i) if(p[i]) return false;
+    Sequence s = {}; s.count=count; s.step=p[3];
+    for (unsigned i=0; i<count; ++i) {
+        s.channels[i] = p[6+i*width+(p[1]==1 ? 1 : 0)];
+        // 0 means an unavailable slot. A regulatory check is done by HAL.
+        if (s.channels[i] > 165) return false;
+        if (p[1]==3 && s.channels[i]) {
+            uint8_t opclass=p[7+i*width];
+            // A 6 GHz channel number must not be mistaken for a 2/5 GHz
+            // channel. This transport currently supports only those bands.
+            if (s.channels[i]<=14 ? (opclass<81 || opclass>84) :
+                                   (opclass<115 || opclass>130)) return false;
+        }
+    }
+    out=s; return true;
+}
+struct Advertisement {
+    Sequence sequence;
+    uint8_t master[6], sync[6];
+    uint16_t period, counter, down;
+    uint8_t presence;
+    uint32_t metric, distance, masterCounter, selfCounter;
+};
+// Validate framing for native peer discovery without imposing the host
+// scheduler's narrower election/sequence policy. The native peer manager owns
+// semantic validation, including MIFs without a synchronization TLV.
+inline bool validActionEnvelope(const uint8_t *f,size_t n) {
+    static const uint8_t action[6]={127,0,0x17,0xf2,8,0x10};
+    if(!f || n<40 || n>2048 || f[0]!=0xd0 || (f[1]&0xc7) ||
+       (f[22]&15) || !unicast(f+10) || memcmp(f+16,bssid,6) ||
+       memcmp(f+24,action,6) || (f[30]!=0 && f[30]!=3)) return false;
+    for(size_t at=40;at<n;) {
+        if(n-at<3) return zeroPadding(f+at,n-at);
+        size_t len=le16(f+at+1); at+=3;
+        if(len>n-at) return false;
+        at+=len;
+    }
+    return n>40;
+}
+// Input is a complete 802.11 action frame without radiotap/FCS. Parse into a
+// temporary value so a truncated last TLV cannot partially update live state.
+inline bool parseAction(const uint8_t *f, size_t n, Advertisement &out) {
+    static const uint8_t action[6]={127,0,0x17,0xf2,8,0x10};
+    if (n<40 || f[0]!=0xd0 || (f[1]&0xc7) || (f[22]&15) || !unicast(f+10) ||
+        memcmp(f+16,bssid,6) || memcmp(f+24,action,6) ||
+        (f[30]!=0 && f[30]!=3)) return false;
+    Advertisement a={}; bool sync=false, election=false, separateSequence=false;
+    Sequence extra={}; uint8_t electionMaster[6]={};
+    uint8_t embeddedEncoding=0, separateEncoding=0;
+    for (size_t at=40; at<n;) {
+        if (n-at<3) { if(zeroPadding(f+at,n-at)) break; return false; }
+        unsigned type=f[at]; size_t len=le16(f+at+1); at+=3;
+        if (len>n-at) return false;
+        const uint8_t *p=f+at;
+        if (type==4) {
+            if (sync || len<39) return false;
+            a.period=le16(p+5); a.down=le16(p+1); a.presence=p[27];
+            a.counter=le16(p+29); memcpy(a.master,p+21,6);
+            if (a.period!=16 || !validPresence(a.presence) || !a.down ||
+                a.down>unsigned(a.presence)*a.period || !unicast(a.master) ||
+                !parseSequence(p+33,len-33,a.sequence) || a.sequence.step+1!=a.presence) return false;
+            // The down-counter and AW counter must describe the same EAW.
+            if (a.counter%a.presence != (unsigned(a.presence)*a.period-a.down)/a.period) return false;
+            embeddedEncoding=p[34]; sync=true;
+        } else if (type==24) {
+            if (election || len!=40 || !unicast(p) || !unicast(p+6)) return false;
+            memcpy(a.sync,p+6,6); a.metric=le32(p+20); a.distance=le32(p+16);
+            memcpy(electionMaster,p,6); a.masterCounter=le32(p+12); a.selfCounter=le32(p+36);
+            if (a.distance>10) return false;
+            election=true;
+        } else if (type==18) {
+            if (separateSequence || !parseSequence(p,len,extra)) return false;
+            separateEncoding=p[1]; separateSequence=true;
+        }
+        at+=len;
+    }
+    if (!sync) return false;
+    if (election && memcmp(a.master,electionMaster,6)) return false;
+    if (separateSequence) {
+        if(extra.count!=a.sequence.count || extra.step!=a.sequence.step) return false;
+        // The captured PSF advertises legacy channel 151 in sync params but
+        // channel 149/opclass 128 in TLV 18. OWL consumes TLV 18 as the peer
+        // schedule. Do not invent a conversion of the legacy flags: prefer
+        // the separately validated explicit opclass schedule in this case.
+        if(embeddedEncoding!=1 || separateEncoding!=3) {
+            if(memcmp(extra.channels,a.sequence.channels,extra.count)) return false;
+        }
+        a.sequence=extra;
+    }
+    if (!election) memcpy(a.sync,f+10,6);
+    out=a; return true;
+}
+struct Peer {
+    uint8_t mac[6]; Advertisement advertisement;
+    uint64_t seen, epoch;
+    uint16_t baseCounter, lastData;
+    uint64_t replay;
+    bool used, hasData;
+    uint8_t channel(uint64_t now) const {
+        const Sequence &s=advertisement.sequence;
+        if (!used || now<epoch || now<seen || now-seen>peerLifetimeUs || !validSequence(s)) return 0;
+        uint16_t count=baseCounter+uint16_t((now-epoch)/awUs);
+        return s.channels[(count/(unsigned(s.step)+1))%s.count];
+    }
+};
+struct State {
+    uint8_t mac[6], master[6], sync[6], forcedSync[6];
+    Sequence sequence, ownSequence; Peer peers[maxPeers];
+    uint64_t epoch; uint16_t baseCounter, dataCounter, frameCounter, psfPeriod;
+    uint32_t metric, masterMetric, distance, masterCounter, selfCounter; bool synchronized;
+    uint64_t electionEpoch;
+    uint8_t presence, ownPresence, syncRole, minExtension[4];
+    bool nativeElectionManaged, nativeParentSelected;
+    uint8_t nativeParent[6];
+    void init(const uint8_t *address, uint64_t now) {
+        memset(this,0,sizeof(*this)); memcpy(mac,address,6);
+        memcpy(master,address,6); memcpy(sync,address,6);
+        epoch=electionEpoch=now; metric=masterMetric=1; presence=ownPresence=4; syncRole=1; psfPeriod=110;
+        sequence.count=slots; sequence.step=3;
+        for (unsigned i=0;i<slots;++i) sequence.channels[i]=6;
+        ownSequence=sequence;
+        for (unsigned i=0;i<4;++i) minExtension[i]=3;
+    }
+    uint16_t counter(uint64_t now) const {
+        return baseCounter+uint16_t((now>=epoch ? now-epoch : 0)/awUs);
+    }
+    uint32_t untilNext(uint64_t now) const {
+        if (!validPresence(presence)) return 0;
+        uint32_t period=unsigned(presence)*awUs;
+        uint64_t elapsed=now>=epoch ? now-epoch : 0;
+        return period-uint32_t((uint64_t(baseCounter%presence)*awUs+elapsed%period)%period);
+    }
+    uint8_t channel(uint64_t now) const {
+        if (syncRole==2 && !synchronized) return 0;
+        return validSequence(sequence) ? sequence.channels[(counter(now)/(unsigned(sequence.step)+1))%sequence.count] : 0;
+    }
+    bool setSyncRole(unsigned role,const uint8_t *address) {
+        if (role<1 || role>3 || !address || !unicast(address) ||
+            (role==2 ? !memcmp(address,mac,6) : memcmp(address,mac,6))) return false;
+        if (syncRole==role && !memcmp(forcedSync,address,6)) return true;
+        syncRole=role; memcpy(forcedSync,address,6);
+        synchronized=false; sequence=ownSequence; presence=ownPresence;
+        memcpy(master,mac,6); memcpy(sync,mac,6); masterMetric=metric;
+        masterCounter=selfCounter; distance=0; return true;
+    }
+    bool setPresence(uint8_t value,uint64_t now) {
+        if (!validPresence(value)) return false;
+        ownPresence=value; ownSequence.step=value-1;
+        if (!synchronized) {
+            // Keep the current AW counter and sub-AW phase through a change
+            // of EAW duration. untilNext() includes the base-counter phase.
+            uint64_t elapsed=now>=epoch ? now-epoch : 0;
+            baseCounter=counter(now); epoch=now-elapsed%awUs;
+            presence=value; sequence.step=value-1;
+        }
+        return true;
+    }
+    int find(const uint8_t *address) const {
+        for(unsigned i=0;i<maxPeers;++i) if(peers[i].used && !memcmp(peers[i].mac,address,6)) return i;
+        return -1;
+    }
+    void elect(uint64_t now) {
+        // Only a top master advances its own election counter. Followers
+        // advertise the counter learned from their selected master.
+        if(now<electionEpoch || synchronized) electionEpoch=now;
+        else {
+            uint64_t intervals=(now-electionEpoch)/3140000;
+            selfCounter+=uint32_t(intervals); electionEpoch+=intervals*3140000;
+        }
+        // A native interface receives its election result through advertisers.
+        // Do not adopt an independently ranked peer before that transaction.
+        if(nativeElectionManaged && !nativeParentSelected) return;
+        int best=-1;
+        for(unsigned i=0;i<maxPeers;++i) {
+            Peer &p=peers[i];
+            if(p.used && (now<p.seen || now-p.seen>peerLifetimeUs)) p.used=false;
+            if(!p.used || !memcmp(p.advertisement.master,mac,6)) continue;
+            const Advertisement &a=p.advertisement;
+            if(a.distance>=10 || !memcmp(a.sync,mac,6)) continue;
+            if(nativeElectionManaged) {
+                if(!memcmp(p.mac,nativeParent,6)) best=i;
+                continue;
+            }
+            if(syncRole==3) continue;
+            if(syncRole==2) { if(!memcmp(p.mac,forcedSync,6)) best=i; continue; }
+            // omdrop-owl's iOS 26 captures show metric precedes counter.
+            int32_t rank=int32_t(a.masterCounter-selfCounter);
+            if(a.metric<metric || (a.metric==metric && (rank<0 ||
+                (!rank && (a.distance || memcmp(p.mac,mac,6)<=0))))) continue;
+            if(best<0) { best=i; continue; }
+            const Advertisement &b=peers[best].advertisement;
+            rank=int32_t(a.masterCounter-b.masterCounter);
+            if(a.metric>b.metric || (a.metric==b.metric && (rank>0 || (!rank &&
+                (a.distance<b.distance || (a.distance==b.distance && memcmp(p.mac,peers[best].mac,6)>0)))))) best=i;
+        }
+        if(best<0) {
+            // Preserve the current AW clock when an elected master expires,
+            // but restore our own advertised channel sequence.
+            if(synchronized) { sequence=ownSequence; presence=ownPresence; }
+            synchronized=false; masterMetric=metric; masterCounter=selfCounter; distance=0;
+            memcpy(master,mac,6); memcpy(sync,mac,6); return;
+        }
+        synchronized=true;
+        const Peer &p=peers[best]; memcpy(master,p.advertisement.master,6);
+        memcpy(sync,p.mac,6); sequence=p.advertisement.sequence; presence=p.advertisement.presence;
+        masterMetric=p.advertisement.metric; masterCounter=p.advertisement.masterCounter;
+        distance=p.advertisement.distance+1;
+        epoch=p.epoch; baseCounter=p.baseCounter;
+    }
+    int receiveAction(const uint8_t *f,size_t n,uint64_t now) {
+        Advertisement a;
+        if(!parseAction(f,n,a) || !memcmp(f+10,mac,6)) return -1;
+        uint64_t elapsed=uint64_t(unsigned(a.presence)*a.period-a.down)*1024;
+        if(now<elapsed) return -1;
+        int idx=find(f+10);
+        if(idx<0) for(unsigned i=0;i<maxPeers;++i)
+            if(!peers[i].used || now<peers[i].seen || now-peers[i].seen>peerLifetimeUs) { idx=i; break; }
+        if(idx<0) return -1;
+        Peer &p=peers[idx];
+        if(!p.used || now<p.seen || now-p.seen>peerLifetimeUs || memcmp(p.mac,f+10,6)) memset(&p,0,sizeof(p));
+        memcpy(p.mac,f+10,6); p.used=true; p.seen=now; p.advertisement=a;
+        p.epoch=now-elapsed; p.baseCounter=a.counter-a.counter%a.presence;
+        elect(now); return idx;
+    }
+    bool acceptData(Peer &p,uint16_t seq) {
+        if(!p.hasData) { p.hasData=true; p.lastData=seq; p.replay=1; return true; }
+        int16_t delta=int16_t(seq-p.lastData);
+        if(delta>0) { p.replay=delta>=64 ? 1 : (p.replay<<delta)|1; p.lastData=seq; return true; }
+        unsigned back=uint16_t(p.lastData-seq);
+        if(back>=64 || (p.replay & (uint64_t(1)<<back))) return false;
+        p.replay|=uint64_t(1)<<back; return true;
+    }
+};
+inline void writeSequence(uint8_t *p,const Sequence &s) {
+    p[0]=s.count-1; p[1]=p[2]=0; p[3]=s.step; put16(p+4,0xffff);
+    memcpy(p+6,s.channels,s.count);
+}
+inline void writeSync(State &s,uint8_t *p,uint64_t now) {
+    p[0]=p[3]=s.channel(now); put16(p+1,(s.untilNext(now)+1023)/1024);
+    put16(p+5,16); put16(p+11,16); put16(p+13,16);
+    uint32_t remaining=s.untilNext(now), duration=unsigned(s.presence)*awUs;
+    uint32_t elapsed=duration-remaining;
+    put16(p+15,elapsed<awUs ? (awUs-elapsed)/1024 : 0);
+    // No advertised extension may cross the next scheduled channel change.
+    for(unsigned i=0;i<4;++i) p[17+i]=s.minExtension[i]<s.presence ? s.minExtension[i] : s.presence-1;
+    memcpy(p+21,s.master,6); p[27]=s.presence;
+    put16(p+29,s.counter(now)); put16(p+31,s.counter(now));
+    writeSequence(p+33,s.sequence);
+}
+inline void writeElection(State &s,uint8_t *p) {
+    memcpy(p,s.master,6); memcpy(p+6,s.sync,6); put32(p+12,s.masterCounter);
+    put32(p+16,s.distance); put32(p+20,s.masterMetric); put32(p+24,s.metric);
+    put32(p+36,s.selfCounter);
+}
+inline size_t buildAction(State &s,uint8_t *f,size_t capacity,uint64_t now) {
+    const size_t syncLength=39+s.sequence.count+2;
+    const size_t size=40+3+syncLength+3+40+3+15+3+2+3+9;
+    if(capacity<size || !validSequence(s.sequence) || !validPresence(s.presence) ||
+        s.sequence.step+1!=s.presence || (s.syncRole==2 && !s.synchronized)) return 0;
+    memset(f,0,size); f[0]=0xd0; memset(f+4,0xff,6);
+    memcpy(f+10,s.mac,6); memcpy(f+16,bssid,6); put16(f+22,s.frameCounter++<<4);
+    f[24]=127; f[26]=0x17; f[27]=0xf2; f[28]=8; f[29]=0x10; f[30]=3;
+    put32(f+32,uint32_t(now)); put32(f+36,uint32_t(now));
+    size_t at=40; f[at]=4; put16(f+at+1,syncLength); uint8_t *p=f+at+3;
+    writeSync(s,p,now); put16(p+7,s.psfPeriod); put16(p+9,0x1800);
+    at+=3+syncLength; f[at]=24; put16(f+at+1,40); p=f+at+3;
+    writeElection(s,p); at+=43;
+    f[at]=12; put16(f+at+1,15); p=f+at+3; put16(p,0x0304);
+    p[2]='X'; p[3]='0'; put16(p+5,7); memcpy(p+7,s.mac,6); at+=18;
+    f[at]=21; put16(f+at+1,2); f[at+3]=0x30; f[at+4]=1; at+=5;
+    f[at]=6; put16(f+at+1,9); return size;
+}
+// Tahoe's native SYNC_FRAME_TEMPLATE contains supplemental TLVs, not the
+// vendor action header or synchronization TLV. Preserve native service,
+// election and data-path advertisements alongside our scheduler's sync TLV.
+inline bool validTemplateTLVs(const uint8_t *p,size_t n) {
+    if(!p || !n || n>2048) return false;
+    bool election=false;
+    for(size_t at=0;at<n;) {
+        if(n-at<3) return false;
+        unsigned type=p[at]; size_t length=le16(p+at+1); at+=3;
+        if(length>n-at) return false;
+        if(type==4 || type==18) return false; // scheduler owns timing/sequence
+        if(type==24) { if(election || length!=40) return false; election=true; }
+        if(type==5 && length!=21) return false;
+        if(type==20 && length%6) return false;
+        at+=length;
+    }
+    return true;
+}
+inline size_t buildActionWithTemplate(State &s,uint8_t *f,size_t capacity,
+                                     uint64_t now,const uint8_t *p,size_t n) {
+    if(!validTemplateTLVs(p,n)) return 0;
+    // Validate capacity before buildAction advances counters or writes output.
+    const size_t prefix=43+39+s.sequence.count+2;
+    if(capacity<prefix || n>capacity-prefix) return 0;
+    uint8_t base[256];
+    size_t baseLength=buildAction(s,base,sizeof(base),now);
+    if(!baseLength || prefix>baseLength) return 0;
+    memcpy(f,base,prefix);
+    // The host owns RF timing/election. A native supplement may name an old
+    // master; keep its non-election fields but align the election with sync.
+    size_t dst=prefix;
+    for(size_t at=0;at<n;) {
+        unsigned type=p[at]; size_t len=le16(p+at+1);
+        if(type!=20) { // stale native sync-tree path cannot describe our clock
+            memcpy(f+dst,p+at,3+len);
+            if(type==24) writeElection(s,f+dst+3);
+            if(type==5) {
+                uint8_t *v=f+dst+3; v[3]=uint8_t(s.distance);
+                memcpy(v+5,s.master,6); put32(v+11,s.masterMetric); put32(v+15,s.metric);
+            }
+            dst+=3+len;
+        }
+        at+=3+len;
+    }
+    return dst;
+}
+// Refresh a native action-frame template without guessing legacy flag or
+// operating-class values. Channel sequences are normalized to supported
+// simple encoding, and the remaining TLVs are shifted down in the buffer.
+// Validation is a separate pass: rejection leaves the template and State
+// untouched. A template with insufficient room for our sequence is rejected.
+inline size_t refreshAction(State &s,uint8_t *f,size_t n,uint64_t now) {
+    static const uint8_t action[6]={127,0,0x17,0xf2,8,0x10};
+    if(n<40 || f[0]!=0xd0 || (f[1]&0xc7) || memcmp(f+24,action,6) ||
+        (f[30]!=0 && f[30]!=3) || !validSequence(s.sequence) ||
+        s.sequence.step+1!=s.presence || (s.syncRole==2 && !s.synchronized)) return 0;
+    bool hasSync=false,hasElection=false,hasSequence=false,hasLegacyElection=false;
+    for(size_t at=40;at<n;) {
+        if(n-at<3) return 0;
+        unsigned type=f[at]; size_t len=le16(f+at+1); at+=3;
+        if(len>n-at) return 0;
+        Sequence old={};
+        if(type==4) {
+            if(hasSync || len<39 || !parseSequence(f+at+33,len-33,old) ||
+                len<39+s.sequence.count) return 0;
+            hasSync=true;
+        } else if(type==18) {
+            if(hasSequence || !parseSequence(f+at,len,old) || len<6+s.sequence.count) return 0;
+            hasSequence=true;
+        } else if(type==24) {
+            if(hasElection || len!=40) return 0;
+            hasElection=true;
+        } else if(type==5) {
+            if(hasLegacyElection || len!=21) return 0;
+            hasLegacyElection=true;
+        } else if(type==20 && len%6) return 0;
+        at+=len;
+    }
+    if(!hasSync) return 0;
+    size_t dst=40;
+    for(size_t src=40;src<n;) {
+        unsigned type=f[src]; size_t old=le16(f+src+1),len=old;
+        if(type==4) len=39+s.sequence.count;
+        if(type==18) len=6+s.sequence.count;
+        // The template's election tree may belong to a previous master. The
+        // optional tree cannot be rebuilt without the full advertised path.
+        if(type==20) { src+=3+old; continue; }
+        memmove(f+dst,f+src,3+len); put16(f+dst+1,len);
+        uint8_t *p=f+dst+3;
+        if(type==4) writeSync(s,p,now);
+        else if(type==18) writeSequence(p,s.sequence);
+        else if(type==24) writeElection(s,p);
+        else if(type==5) {
+            p[3]=uint8_t(s.distance); memcpy(p+5,s.master,6);
+            put32(p+11,s.masterMetric); put32(p+15,s.metric);
+        }
+        src+=3+old; dst+=3+len;
+    }
+    memcpy(f+10,s.mac,6); memcpy(f+16,bssid,6);
+    put16(f+22,s.frameCounter++<<4);
+    put32(f+32,uint32_t(now)); put32(f+36,uint32_t(now));
+    return dst;
+}
+inline bool validIPv6(const uint8_t *p,size_t n) {
+    if(n<40 || (p[0]>>4)!=6) return false;
+    size_t payload=unsigned(p[4])*256+p[5];
+    // Ethernet MTU already bounds this path; IPv6 jumbograms are unsupported.
+    return n==40+payload;
+}
+inline size_t encodeData(uint8_t *out,size_t capacity,const uint8_t *eth,size_t n,uint16_t seq) {
+    if(n<54 || n>1514 || eth[12]!=0x86 || eth[13]!=0xdd || !unicast(eth+6) ||
+        !validIPv6(eth+14,n-14) || capacity<n+26) return 0;
+    memset(out,0,40); out[0]=8;
+    memcpy(out+4,eth,6); memcpy(out+10,eth+6,6); memcpy(out+16,bssid,6);
+    put16(out+22,seq<<4); memcpy(out+24,snap,8); put16(out+32,0x0403);
+    put16(out+34,seq); memcpy(out+38,eth+12,n-12); return n+26;
+}
+inline size_t decodeData(uint8_t *out,size_t capacity,const uint8_t *f,size_t n,uint16_t &seq) {
+    if(n<40 || (f[0]!=8 && f[0]!=0x88) || (f[1]&0xc7) || (f[22]&15) ||
+       !unicast(f+10) || memcmp(f+16,bssid,6)) return 0;
+    size_t hdr=(f[0]&0x80) ? 26 : 24;
+    // Fragment reassembly, HT-control/mesh headers and A-MSDU subframes are
+    // not implemented. A retry is permitted and handled by replay state.
+    if(hdr==26 && ((f[24]&0x80) || (f[25]&1))) return 0;
+    if(n<hdr+16 || memcmp(f+hdr,snap,8) || le16(f+hdr+8)!=0x0403 ||
+       le16(f+hdr+12)!=0 || f[hdr+14]!=0x86 || f[hdr+15]!=0xdd) return 0;
+    size_t len=n-hdr-16+14;
+    if(len>1514 || capacity<len || !validIPv6(f+hdr+16,n-hdr-16)) return 0;
+    memcpy(out,f+4,6); memcpy(out+6,f+10,6);
+    memcpy(out+12,f+hdr+14,n-hdr-14); seq=le16(f+hdr+10); return len;
+}
+// A matching, unexpired firmware grant is mandatory before any transmission.
+struct Reservation {
+    uint64_t deadline, grantObservedAt; uint8_t token, channel; bool pending, granted;
+    void request(uint8_t t,uint8_t c,uint64_t now) {
+        token=t; channel=c; pending=true; granted=false; grantObservedAt=0; deadline=now+100000;
+    }
+    bool grant(uint8_t t,uint8_t c,uint32_t durationMs,uint64_t now) {
+        if(!pending || t!=token || c!=channel || now>=deadline || !durationMs || durationMs>1000) return false;
+        pending=false; granted=true; grantObservedAt=now; deadline=now+uint64_t(durationMs)*1000; return true;
+    }
+    bool canTransmit(uint8_t c,uint64_t now) const { return granted && channel==c && now<deadline && deadline-now>2000; }
+    void cancel() { pending=granted=false; deadline=grantObservedAt=0; }
+};
+}
+#endif

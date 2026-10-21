@@ -30,6 +30,7 @@
 #include "MtkMwx.hpp"
 
 #include "AirportMtkEthernetInterface.hpp"
+#include "AirportMtkAwdlInterface.hpp"
 
 enum
 {
@@ -77,6 +78,26 @@ IOReturn get##REQ(OSObject *object, struct DATA_TYPE *data);
 IOReturn set##REQ(OSObject *object, struct DATA_TYPE *data);
     
 public:
+#ifdef MTK_NATIVE_AWDL
+    IO80211VirtualInterface *createVirtualInterface(ether_addr*, unsigned int) override;
+    SInt32 enableVirtualInterface(IO80211VirtualInterface*) override;
+    SInt32 disableVirtualInterface(IO80211VirtualInterface*) override;
+    bool createAwdlInterface(ether_addr *address = NULL);
+    IOReturn createAwdlInterfaceRequest(apple80211_virt_if_create_data *);
+    IOReturn requestAwdlCreation();
+    static IOReturn createAwdlGated(OSObject *, void *, void *, void *, void *);
+    void recordAwdlCreation(const char *stage, IOReturn status);
+    void stopAwdlInterface();
+    AirportMtkAwdlInterface *awdlInterface = NULL;
+    AirportMtkEthernetInterface *awdlBSD = NULL;
+    bool creatingAwdl = false;
+    bool awdlExperimental = true;
+    bool awdlCreating = false;
+    bool awdlStopping = false;
+    bool awdlAttached = false;
+    bool awdlStarted = false;
+    IOReturn awdlCreateStatus = kIOReturnNotReady;
+#endif
     virtual bool init(OSDictionary *properties) override;
     virtual void free() override;
     virtual IOService* probe(IOService* provider, SInt32* score) override;

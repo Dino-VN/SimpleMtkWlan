@@ -1,0 +1,99 @@
+"""Exercise production sync transitions with gate release and concurrent callers."""
+from pathlib import Path
+import subprocess, tempfile
+root=Path(__file__).resolve().parents[2]
+s=(root/'AirportMtkWlan/AirportMtkAwdlInterface.cpp').read_text()
+def fn(sig):
+ a=s.index(sig); return s[a:s.index('\n}\n',a)+3]
+code=r'''
+#include <cassert>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <functional>
+#include <mutex>
+#include <thread>
+#include <vector>
+#define XYLog(...) ((void)0)
+using IOReturn=unsigned;using AbsoluteTime=uint64_t;using IOThread=void*;
+constexpr unsigned kIOReturnSuccess=0,kIOReturnNotReady=1,kIOReturnBusy=2,kIOReturnTimeout=3,kMillisecondScale=1,THREAD_UNINT=0;
+std::atomic<uint64_t> offset{0};
+uint64_t awdlNow(){return offset+std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
+void clock_interval_to_deadline(unsigned n,unsigned,AbsoluteTime*p){*p=n;}
+IOThread IOThreadSelf(){thread_local int identity;return &identity;}
+struct OSObject{};
+struct Gate{
+ std::recursive_mutex mutex;std::condition_variable_any cv;
+ IOReturn runAction(IOReturn(*fn)(OSObject*,void*,void*,void*,void*),void*a,void*b=nullptr){std::lock_guard<std::recursive_mutex> lock(mutex);return fn(nullptr,a,b,nullptr,nullptr);}
+ void commandSleep(void*,AbsoluteTime ms,unsigned){cv.wait_for(mutex,std::chrono::milliseconds(ms));}
+ void commandWakeup(void*,bool){cv.notify_all();}
+} gate;
+Gate*_fCommandGate=&gate;
+using mbuf_t=int*;void mbuf_freem(mbuf_t m){delete m;}
+struct Timer{bool active=false;void setTimeoutMS(unsigned){active=true;}void cancelTimeout(){active=false;}};
+struct Hal{
+ bool on=false;unsigned calls=0,status=0,inFlight=0;std::vector<bool> history;
+ std::function<void()> wait;
+ IOReturn awdlEnable(const uint8_t*,bool value){assert(!inFlight++);++calls;history.push_back(value);if(wait)wait();--inFlight;if(!status)on=value;return status;}
+};
+struct AirportMtkAwdlInterface:OSObject{
+ Hal radio;Hal*hal=&radio;Timer clock;Timer*timer=&clock;
+ bool stopping=false,enabled=false;IOThread syncOwner=nullptr;
+ uint64_t syncRequests=0,syncWaits=0,syncFailures=0;
+ struct{uint8_t mac[6]={2,1,2,3,4,5};}state;
+ uint64_t nextAction=0,requestDeadline=0;unsigned requestedChannel=0,grantedChannel=0,queueCount=0,queueHead=0;
+ mbuf_t queue[64]{};std::atomic<unsigned> refs{1};
+ void retain(){++refs;}void release(){--refs;}void drainCompletions(){}
+ bool awTimelineOpen=false;void notifyAvailabilityWindowEnd(uint64_t){awTimelineOpen=false;}
+ struct{bool open=false;void reset(){open=false;}} awTimeline;
+ void setProperty(const char*,const char*){}void setProperty(const char*,bool){}void setProperty(const char*,uint64_t,unsigned){}
+ IOReturn setSync(bool);IOReturn setSyncInGate(bool);
+ static IOReturn syncGated(OSObject*,void*,void*,void*,void*);
+};
+'''+fn('IOReturn AirportMtkAwdlInterface::setSync(bool')+fn('IOReturn AirportMtkAwdlInterface::syncGated(')+fn('IOReturn AirportMtkAwdlInterface::setSyncInGate(')+r'''
+int main(){
+ AirportMtkAwdlInterface d;
+ // The firmware waiter releases the gate. A second native request enters
+ // while the first is waiting, then must wait for the owner's actual result.
+ for(bool second:{true,false}){
+  uint64_t beforeWaits=d.syncWaits;
+  std::mutex m;std::condition_variable cv;bool inside=false,finish=false;
+  d.radio.wait=[&]{gate.mutex.unlock();{std::unique_lock<std::mutex> l(m);inside=true;cv.notify_all();cv.wait(l,[&]{return finish;});}gate.mutex.lock();};
+  unsigned firstResult=99,secondResult=99;
+  std::thread first([&]{firstResult=d.setSync(true);});
+  {std::unique_lock<std::mutex> l(m);cv.wait(l,[&]{return inside;});}
+  std::thread next([&]{secondResult=d.setSync(second);});
+  // Observe actual waiter entry under the production gate.
+  bool waited=false;
+  for(unsigned i=0;i<200&&!waited;++i){ {std::lock_guard<std::recursive_mutex> l(gate.mutex);waited=d.syncWaits>beforeWaits;}if(!waited)std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+  {std::lock_guard<std::mutex> l(m);finish=true;}cv.notify_all();
+  first.join();next.join();
+  assert(waited);
+  assert(firstResult==0&&secondResult==0&&d.enabled==second&&d.radio.on==second);
+  assert(!d.syncOwner&&d.refs==1);d.radio.wait=nullptr;
+ }
+ assert(d.syncWaits>0);
+ // Actual firmware failure must propagate; no synthetic successful sync.
+ d.setSync(false);d.radio.status=17;assert(d.setSync(true)==17&&!d.enabled&&!d.clock.active&&d.syncFailures==1);d.radio.status=0;
+ // Synchronous recursion cannot wait for itself.
+ d.radio.wait=[&]{assert(d.setSync(false)==kIOReturnBusy);};assert(!d.setSync(true)&&d.enabled);d.radio.wait=nullptr;
+ // Teardown during the firmware wait must not revive timer/queued packets.
+ d.queue[0]=new int(3);d.queueCount=1;
+ d.radio.wait=[&]{d.stopping=true;d.enabled=false;};assert(d.setSync(true)==kIOReturnNotReady);
+ assert(!d.enabled&&!d.clock.active&&!d.queueCount&&!d.syncOwner&&d.refs==1);
+ d.radio.wait=nullptr;d.stopping=false;
+ // A stuck owner has a bounded wait, releases the caller's retain, and
+ // cannot be overwritten by the timed-out request.
+ int foreign;d.syncOwner=&foreign;
+ offset+=3000001; // deadline is relative, advance it while waiting
+ std::thread advance([&]{std::this_thread::sleep_for(std::chrono::milliseconds(20));offset+=3000001;gate.cv.notify_all();});
+ assert(d.setSync(true)==kIOReturnTimeout);advance.join();assert(d.syncOwner==&foreign&&d.refs==1);d.syncOwner=nullptr;
+ puts("PASS production sync: concurrent enable/enable and enable/disable across firmware gate sleep, real failure propagation, recursion rejection, teardown cancellation, bounded owner wait and retain balance.");
+}
+'''
+with tempfile.TemporaryDirectory(prefix='mtk-sync-transition-') as tmp:
+ p=Path(tmp)/'test.cpp';p.write_text(code);b=Path(tmp)/'test'
+ subprocess.run(['clang++','-std=c++14','-Wall','-Wextra','-fsanitize=address,undefined',str(p),'-o',str(b)],check=True)
+ subprocess.run([str(b)],check=True,timeout=15)

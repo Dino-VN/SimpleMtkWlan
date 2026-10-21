@@ -58,6 +58,8 @@ Works:
 - coexistence with MT7922 Bluetooth.
 
 Known problems:
+- AirDrop/Handoff/Continuity are not verified. Tahoe has an opt-in experimental
+  AWDL implementation; see [AWDL development and validation](docs/AWDL.md).
 - download is capped at about 90-100 Mbit/s even when the link supports more,
   while upload is not (under investigation);
 - no sleep/wake;
@@ -144,13 +146,16 @@ It does not depend on Lilu. Keep a backup EFI.
 | `-noht40` | disable 40 MHz channels |
 | `amtk_cc=XX` | AirportMtkWlan: override the country code |
 | `amtk_he=1` | AirportMtkWlan: offer 802.11ax (experimental, untested) |
+| `amtk_awdl=1` | Tahoe: enable experimental on-demand native AWDL (enabled by default) |
+| `amtk_awdl=0` | Tahoe: disable AWDL, including role-6 interface creation |
 
 ### Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | `kmutil load` says "not approved" | Approve the kext in Privacy & Security, then reboot. Also check that SIP allows unsigned kexts. |
-| The kext loads but there is no Wi-Fi | Another driver owns the card, or an SSDT hides it. |
+| No Wi-Fi interface after replacing a kext | Check `kmutil showloaded` for `com.eiyuumiru.AirportMtkWlan`, use the Tahoe build on macOS 26, and check load/approval errors. |
+| The kext loads but there is no Wi-Fi | Check PCI matching and controller-start errors; another driver or an SSDT may prevent attachment. |
 | Wi-Fi died and does not come back after a restart | The firmware crashed. Shut down fully, wait 10-15 s, then power on. |
 | Bluetooth disappeared together with Wi-Fi | A chip reset (`mtkctl reset`) also takes down Bluetooth. Reboot. |
 

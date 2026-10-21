@@ -21,6 +21,56 @@ extern IOCommandGate *_fCommandGate;
 #define super IO80211InfraProtocol
 OSDefineMetaClassAndStructors(AirportMtkSkywalkInterface, IO80211InfraProtocol);
 
+IOReturn AirportMtkSkywalkInterface::setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *request)
+{
+#ifdef MTK_NATIVE_AWDL
+    auto controller=OSDynamicCast(AirportMtkWlan,getController());
+    return controller ? controller->createAwdlInterfaceRequest(request) : kIOReturnNotReady;
+#else
+    return kIOReturnUnsupported;
+#endif
+}
+
+IOReturn AirportMtkSkywalkInterface::getHT_CAPABILITY(apple80211_ht_capability *d)
+{
+    if(!d) return kIOReturnBadArgument;
+    auto *ic=static_cast<AirportMtkWlan *>(getController())->fHalService->get80211Controller();
+    bzero(d,sizeof(*d));
+    d->version=APPLE80211_VERSION; d->hc_id=45; d->hc_len=26;
+    d->hc_cap=ic->ic_htcaps; d->hc_param=ic->ic_ampdu_params;
+    memcpy(d->hc_mcsset,ic->ic_sup_mcs,sizeof(ic->ic_sup_mcs));
+    d->hc_extcap=ic->ic_htxcaps; d->hc_txbf=ic->ic_txbfcaps;
+    return kIOReturnSuccess;
+}
+
+IOReturn AirportMtkSkywalkInterface::getVHT_CAPABILITY(apple80211_vht_capability *d)
+{
+    if(!d) return kIOReturnBadArgument;
+    auto *ic=static_cast<AirportMtkWlan *>(getController())->fHalService->get80211Controller();
+    bzero(d,sizeof(*d)); d->version=APPLE80211_VERSION;
+    d->cap=ic->ic_vhtcaps & 0xffff; d->unk1=ic->ic_vhtcaps;
+    return kIOReturnSuccess;
+}
+
+IOReturn AirportMtkSkywalkInterface::getHE_CAPABILITY(apple80211_he_capability *d)
+{
+    if(!d) return kIOReturnBadArgument;
+    // The Tahoe SDK intentionally leaves this private payload opaque. The
+    // AWDL manager only requires a successful capability query here; the
+    // infrastructure capability bitmap already advertises HE support.
+    uint8_t *raw=reinterpret_cast<uint8_t *>(d);
+    // IO80211AWDLPeerManager supplies a 0x28-byte HE IE buffer.
+    bzero(raw,0x28); *reinterpret_cast<uint32_t *>(raw)=APPLE80211_VERSION;
+    return kIOReturnSuccess;
+}
+
+IOReturn AirportMtkSkywalkInterface::getSIB_COEX_STATUS(apple80211_sib_coex_status *d)
+{
+    if(!d) return kIOReturnBadArgument;
+    bzero(reinterpret_cast<uint8_t *>(d),16);
+    return kIOReturnSuccess;
+}
+
 static int ieeeChanFlag2appleScanFlagVentura(int flags)
 {
     int ret = 0;

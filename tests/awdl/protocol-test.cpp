@@ -1,0 +1,332 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include <AWDL/AwdlProtocol.hpp>
+#include <assert.h>
+#include <stdio.h>
+#include <vector>
+using namespace mtkawdl;
+static const uint8_t local[6]={2,1,2,3,4,5}, remote[6]={2,1,2,3,4,6};
+static void scheduleTests()
+{
+    for(unsigned presence=1;presence<=64;presence*=2) {
+        State tx,rx; const uint64_t epoch=10000000;
+        tx.init(remote,epoch); rx.init(local,epoch); tx.metric=10;
+        assert(tx.setPresence(presence,epoch));
+        tx.baseCounter=65536-presence;
+        for(unsigned i=0;i<slots;++i) tx.sequence.channels[i]=(i&1) ? 44 : 6;
+        tx.ownSequence=tx.sequence; tx.elect(epoch);
+        const uint64_t period=presence*awUs;
+        const uint64_t offsets[]={0,1,1023,1024,awUs-1,awUs,period-1,period,period+1,period*17+1023};
+        for(uint64_t offset:offsets) {
+            uint64_t now=epoch+offset; uint8_t f[256]; Advertisement a={};
+            size_t n=buildAction(tx,f,sizeof(f),now);
+            assert(n && parseAction(f,n,a));
+            assert(a.presence==presence && a.sequence.step+1==presence);
+            assert(rx.receiveAction(f,n,now)>=0 && rx.synchronized);
+            assert(rx.counter(now)==tx.counter(now));
+            assert(rx.channel(now)==tx.channel(now));
+            assert(rx.peers[rx.find(remote)].channel(now)==tx.channel(now));
+            assert(rx.untilNext(now)>=tx.untilNext(now));
+            assert(rx.untilNext(now)-tx.untilNext(now)<1024);
+        }
+    }
+    State s; s.init(local,10000000);
+    s.baseCounter=5;
+    assert(s.setPresence(8,10000123));
+    assert(s.counter(10000123)==5 && s.untilNext(10000123)==3*awUs-123);
+    State before=s;
+    for(unsigned bad: {0U,3U,5U,65U,255U}) {
+        assert(!s.setPresence(bad,10000123)); assert(!memcmp(&before,&s,sizeof(s)));
+    }
+}
+static void roleTests()
+{
+    State tx,rx; uint8_t f[256]; tx.init(remote,1000000); rx.init(local,1000000);
+    tx.metric=10; tx.elect(1000000);
+    size_t n=buildAction(tx,f,sizeof(f),1000000);
+    assert(rx.setSyncRole(3,local));
+    assert(rx.receiveAction(f,n,1000000)>=0 && !rx.synchronized);
+    assert(!memcmp(rx.master,local,6));
+    assert(rx.setSyncRole(2,remote)); assert(!rx.channel(1000000));
+    assert(!buildAction(rx,f,0,1000000));
+    rx.elect(1000000); assert(rx.synchronized && !memcmp(rx.sync,remote,6));
+    rx.elect(5000000); assert(!rx.synchronized && !rx.channel(5000000));
+    assert(rx.setSyncRole(1,local)); assert(rx.channel(5000000));
+    State before=rx;
+    assert(!rx.setSyncRole(2,local) && !rx.setSyncRole(3,remote) && !rx.setSyncRole(0,local));
+    assert(!memcmp(&before,&rx,sizeof(rx)));
+    // Never follow a node which names us as its own synchronization source.
+    tx.epoch=5000000; memcpy(tx.sync,local,6);
+    n=buildAction(tx,f,sizeof(f),5000000);
+    assert(rx.receiveAction(f,n,5000000)>=0 && !rx.synchronized);
+}
+static void templateTests()
+{
+    State tx; tx.init(remote,1000000); uint8_t f[512]; Advertisement a={};
+    for(unsigned encoding: {0U,1U,3U}) {
+        size_t n=buildAction(tx,f,sizeof(f),1024000);
+        std::vector<uint8_t> frame(f,f+n);
+        size_t syncLength=le16(frame.data()+41);
+        if(encoding) {
+            frame.insert(frame.begin()+43+syncLength,16,0);
+            put16(frame.data()+41,syncLength+16);
+            uint8_t *p=frame.data()+43+33; p[1]=encoding;
+            for(unsigned i=0;i<16;++i) {
+                p[6+2*i]=encoding==1 ? 0 : 6;
+                p[7+2*i]=encoding==1 ? 6 : 81;
+            }
+            p[38]=p[39]=0;
+        }
+        assert(parseAction(frame.data(),frame.size(),a));
+        std::vector<uint8_t> malformed=frame;
+        malformed.push_back(250); // invalid trailing TLV, no mutation allowed
+        const std::vector<uint8_t> before=malformed; State stateBefore=tx;
+        assert(!refreshAction(tx,malformed.data(),malformed.size(),1065536));
+        assert(malformed==before && !memcmp(&stateBefore,&tx,sizeof(tx)));
+        // A band/class mismatch must not alias a 6 GHz channel onto 2 GHz.
+        if(encoding==3) {
+            auto bad=frame; bad[43+33+7]=131;
+            assert(!parseAction(bad.data(),bad.size(),a));
+        }
+        tx.sequence.channels[1]=44; tx.ownSequence=tx.sequence;
+        size_t refreshed=refreshAction(tx,frame.data(),frame.size(),1065536);
+        assert(refreshed && refreshed<=frame.size());
+        assert(parseAction(frame.data(),refreshed,a));
+        assert(a.sequence.channels[1]==44 && a.counter==tx.counter(1065536));
+        assert(frame[43+34]==0);
+        // A changed channel count is encoded exactly, without expanding a
+        // three-slot schedule into an inconsistent sixteen-slot repetition.
+        tx.sequence.count=3;
+        refreshed=refreshAction(tx,frame.data(),refreshed,1080000);
+        assert(refreshed && parseAction(frame.data(),refreshed,a));
+        assert(a.sequence.count==3);
+        tx.sequence.count=16; tx.sequence.channels[1]=6;
+    }
+}
+static void nativeTemplateTests()
+{
+    State tx,rx; tx.init(remote,1000000); rx.init(local,1000000);
+    uint8_t original[256];size_t originalSize=buildAction(tx,original,sizeof(original),1000000);
+    // Native builds service/election/data-path TLVs separately; it omits sync.
+    size_t electionOffset=43+le16(original+41);
+    std::vector<uint8_t> native(original+electionOffset,original+originalSize);
+    native.insert(native.end(),{250,2,0,0x12,0x34});
+    assert(validTemplateTLVs(native.data(),native.size()));
+    uint8_t output[2304];memset(output,0xaa,sizeof(output));State before=tx;
+    assert(!buildActionWithTemplate(tx,output,1,1065536,native.data(),native.size()));
+    assert(!memcmp(&before,&tx,sizeof(tx))&&output[0]==0xaa);
+    size_t n=buildActionWithTemplate(tx,output,sizeof(output),1065536,native.data(),native.size());
+    Advertisement a={};assert(n&&parseAction(output,n,a));
+    assert(rx.receiveAction(output,n,1065536)>=0&&rx.synchronized);
+    assert(!memcmp(output+n-native.size(),native.data(),native.size()));
+    // Native template election can become stale while the host AW clock
+    // changes masters. Preserve service/vendor TLVs, align the election, and
+    // remove the old sync-tree path rather than advertise two masters.
+    auto stale=native;
+    stale[3+5]=0x99; // first TLV is Election Parameters v2
+    stale.insert(stale.end(),{20,6,0,2,9,8,7,6,5});
+    State elected=tx; elected.masterMetric=123; elected.selfCounter=17;
+    n=buildActionWithTemplate(elected,output,sizeof(output),1080000,stale.data(),stale.size());
+    assert(n&&parseAction(output,n,a)&&a.metric==123&&a.selfCounter==17);
+    bool unknown=false;
+    for(size_t at=40;at<n;) {
+        assert(output[at]!=20);
+        if(output[at]==250) {unknown=true;assert(output[at+3]==0x12&&output[at+4]==0x34);}
+        at+=3+le16(output+at+1);
+    }
+    assert(unknown);
+    for(size_t cut=0;cut<native.size();++cut) {
+        std::vector<uint8_t> truncated(native.begin(),native.begin()+cut);
+        // Complete TLV prefixes are permitted, partial TLVs must reject.
+        if(validTemplateTLVs(truncated.data(),truncated.size())) {
+            assert(buildActionWithTemplate(tx,output,sizeof(output),1080000,truncated.data(),truncated.size()));
+        }
+    }
+    auto bad=native;bad.push_back(1);assert(!validTemplateTLVs(bad.data(),bad.size()));
+    bad=native;bad[1]=bad[2]=0xff;assert(!validTemplateTLVs(bad.data(),bad.size()));
+    std::vector<uint8_t> sync(original+40,original+electionOffset);
+    assert(!validTemplateTLVs(sync.data(),sync.size()));
+    bad=native;bad.insert(bad.end(),native.begin(),native.begin()+43);
+    assert(!validTemplateTLVs(bad.data(),bad.size()));
+    uint32_t random=0x7921;
+    for(unsigned i=0;i<10000;++i) {
+        random=random*1664525+1013904223;bad=native;bad[random%bad.size()]^=uint8_t(random>>24);
+        validTemplateTLVs(bad.data(),bad.size());
+    }
+}
+static void nativePeriodTests()
+{
+    State s; s.init(local,1000000); uint8_t f[256];
+    for(unsigned period : {110U,440U}) {
+        s.psfPeriod=period;
+        size_t n=buildAction(s,f,sizeof(f),1065536);
+        Advertisement a{}; assert(n && parseAction(f,n,a));
+        assert(le16(f+43+7)==period);
+        assert(a.period==16 && a.counter==s.counter(1065536));
+    }
+}
+static void capturedIphoneTests()
+{
+    FILE *file=fopen("tests/awdl/fixtures/iphone-v9-psf.bin","rb"); assert(file);
+    uint8_t raw[2048]; size_t n=fread(raw,1,sizeof(raw),file); fclose(file); assert(n==612);
+    Advertisement a{}; assert(validActionEnvelope(raw,n) && parseAction(raw,n,a));
+    assert(a.metric==531 && a.counter==10626 && a.down==29 && a.presence==4);
+    const uint8_t channels[16]={11,0,149,0,0,0,0,0,6,0,149,0,0,0,0,0};
+    assert(!memcmp(a.sequence.channels,channels,16));
+    State rx; rx.init(local,10000000);
+    assert(rx.receiveAction(raw,n,10000000)>=0 && rx.synchronized && rx.find(raw+10)>=0);
+    assert(rx.channel(10000000)==11);
+    // Bound and validate the observed three-byte padding, opclass, shape,
+    // duplicate schedule and truncated TLVs. Reject atomically.
+    for(size_t offset:{size_t(181),size_t(150),size_t(145)}) {
+        auto bad=std::vector<uint8_t>(raw,raw+n);bad[offset]=255;
+        State before=rx;assert(rx.receiveAction(bad.data(),bad.size(),10000001)<0);
+        assert(!memcmp(&rx,&before,sizeof(rx)));
+    }
+    auto duplicate=std::vector<uint8_t>(raw,raw+n);duplicate.insert(duplicate.end(),raw+140,raw+184);
+    assert(!parseAction(duplicate.data(),duplicate.size(),a));
+    auto conflict=std::vector<uint8_t>(raw,raw+n);
+    conflict[77]=3; // Same opclass encoding in both TLVs must agree.
+    for(unsigned i=0;i<16;++i) {
+        conflict[82+2*i]=channels[i]; conflict[83+2*i]=channels[i] ? (channels[i]<=14 ? 81 : 128) : 0;
+    }
+    conflict[86]=44;assert(!parseAction(conflict.data(),conflict.size(),a));
+    for(size_t length=0;length<n;++length) parseAction(raw,length,a);
+    uint32_t random=0x9010;
+    for(unsigned i=0;i<100000;++i) {
+        random=random*1664525+1013904223;auto bad=std::vector<uint8_t>(raw,raw+n);
+        bad[random%n]^=uint8_t(random>>24);parseAction(bad.data(),bad.size(),a);
+    }
+    puts("PASS captured iPhone PSF: standalone opclass schedule, zero padding, peer election, malformed input and 100000 mutations.");
+}
+static void applePaddingElectionTests()
+{
+    State tx,rx; tx.init(remote,1000000); rx.init(local,1000000);
+    tx.metric=522;tx.masterMetric=522;tx.selfCounter=393;tx.masterCounter=393;
+    rx.metric=510;rx.selfCounter=3214;
+    uint8_t frame[256];size_t n=buildAction(tx,frame,sizeof(frame),1000000);
+    for(unsigned padding:{1U,2U,8U}) {
+        std::vector<uint8_t> f(frame,frame+n);f.resize(n+padding,0);
+        Advertisement a{};assert(validActionEnvelope(f.data(),f.size()));
+        assert(parseAction(f.data(),f.size(),a));
+        assert(rx.receiveAction(f.data(),f.size(),1000000)>=0&&rx.synchronized);
+        assert(rx.masterMetric==522); // higher metric wins despite older counter
+        f.back()=1;assert(!parseAction(f.data(),f.size(),a));
+        assert(!validActionEnvelope(f.data(),f.size()));
+    }
+    rx.metric=600;rx.elect(1000000);assert(!rx.synchronized);
+}
+int main()
+{
+    capturedIphoneTests(); scheduleTests(); roleTests(); templateTests(); nativeTemplateTests(); nativePeriodTests(); applePaddingElectionTests();
+    State tx,rx; tx.init(remote,1000000); rx.init(local,1000000); tx.metric=10;
+    for(unsigned i=0;i<16;++i) tx.sequence.channels[i]=i%2 ? 44 : 6;
+    tx.ownSequence=tx.sequence; tx.elect(1024000);
+    uint8_t frame[2048]; size_t n=buildAction(tx,frame,sizeof(frame),1024000);
+    Advertisement a={}; assert(n && parseAction(frame,n,a));
+    assert(a.period==16 && a.presence==4 && a.metric==10 && a.sequence.channels[1]==44);
+    // Truncation at every byte, including complete TLV prefixes, never reads
+    // outside the supplied buffer. Invalid frames cannot mutate state.
+    for(size_t len=0;len<n;++len) {
+        std::vector<uint8_t> shortFrame(frame,frame+len);
+        Advertisement parsed={}; parseAction(shortFrame.data(),len,parsed);
+    }
+    for(unsigned type=0;type<256;++type) {
+        std::vector<uint8_t> bad(frame,frame+n); bad[41]=255; bad[42]=255; bad[40]=type;
+        State before=rx; assert(rx.receiveAction(bad.data(),bad.size(),1024000)==-1);
+        assert(!memcmp(&before,&rx,sizeof(rx)));
+    }
+    for(unsigned bit: {1U,2U,4U,0x40U,0x80U}) {
+        auto bad=std::vector<uint8_t>(frame,frame+n); bad[1]=bit;
+        assert(!parseAction(bad.data(),bad.size(),a));
+    }
+    {
+        auto bad=std::vector<uint8_t>(frame,frame+n); bad[22]|=1;
+        assert(!parseAction(bad.data(),bad.size(),a));
+        bad.assign(frame,frame+n); bad[43+27]=0;
+        assert(!parseAction(bad.data(),bad.size(),a));
+        bad.assign(frame,frame+n); bad[43+33+2]=1;
+        assert(!parseAction(bad.data(),bad.size(),a));
+        bad.assign(frame,frame+n); bad[43+33+4]=0;
+        assert(!parseAction(bad.data(),bad.size(),a));
+    }
+    assert(rx.receiveAction(frame,n,1024000)==0 && rx.synchronized);
+    assert(rx.counter(1024000)==tx.counter(1024000));
+    assert(rx.untilNext(1024000)>=tx.untilNext(1024000) && rx.untilNext(1024000)-tx.untilNext(1024000)<1024);
+    assert(rx.channel(1080000)==tx.channel(1080000));
+    assert(!rx.peers[0].channel(1024000+peerLifetimeUs+1));
+    assert(rx.acceptData(rx.peers[0],123));
+    // Expiry resets replay history even if a fresh advertisement arrives
+    // before a separate timer tick has purged the old peer entry.
+    assert(rx.receiveAction(frame,n,1024000+peerLifetimeUs+1)==0);
+    assert(rx.acceptData(rx.peers[0],123));
+    rx.elect(1024000+2*peerLifetimeUs+2);
+    assert(!rx.synchronized && rx.find(remote)==-1);
+    assert(rx.sequence.channels[1]==6 && rx.masterMetric==rx.metric && rx.distance==0);
+    assert(tx.setPresence(1,1024000)); size_t shortPresence=buildAction(tx,frame,sizeof(frame),1024000);
+    assert(parseAction(frame,shortPresence,a) && a.presence==1);
+    assert(tx.setPresence(4,1024000)); n=buildAction(tx,frame,sizeof(frame),1024000);
+    // Unknown TLVs are skipped, but a malformed trailing TLV rejects the
+    // entire advertisement rather than applying only the synchronization TLV.
+    std::vector<uint8_t> extended(frame,frame+n);
+    extended.insert(extended.end(),{250,2,0,1,2}); assert(parseAction(extended.data(),extended.size(),a));
+    extended.pop_back(); assert(!parseAction(extended.data(),extended.size(),a));
+    tx.baseCounter=65532; tx.epoch=1000000;
+    assert(tx.counter(1065536)==0 && tx.channel(1065536)==6);
+    Reservation grant={}; grant.request(3,44,1000000);
+    assert(!grant.canTransmit(44,1001000));
+    assert(!grant.grant(2,44,50,1002000)); assert(!grant.grant(3,6,50,1002000));
+    assert(grant.grant(3,44,50,1002000)); assert(grant.canTransmit(44,1003000));
+    assert(!grant.canTransmit(6,1003000) && !grant.canTransmit(44,1051000));
+    grant.cancel(); assert(!grant.canTransmit(44,1003000));
+    grant.request(4,6,2000000); assert(!grant.grant(4,6,50,2100000));
+    grant.request(5,6,2000000); assert(!grant.grant(5,6,0,2001000));
+    Peer p={}; assert(rx.acceptData(p,65535)); assert(rx.acceptData(p,0));
+    assert(!rx.acceptData(p,65535)); assert(rx.acceptData(p,65534)); assert(!rx.acceptData(p,65534));
+    assert(rx.acceptData(p,100)); assert(!rx.acceptData(p,0));
+    // Round trip actual Ethernet/IPv6 payloads and both 802.11 header sizes.
+    for(size_t size=54;size<=1514;++size) {
+        uint8_t eth[1514]={},wire[1546]={},decoded[1514]={};
+        memcpy(eth,local,6); memcpy(eth+6,remote,6); eth[12]=0x86; eth[13]=0xdd;
+        for(size_t i=14;i<size;++i) eth[i]=uint8_t(i*7); eth[14]=0x60;
+        eth[18]=uint8_t((size-54)>>8); eth[19]=uint8_t(size-54);
+        size_t encoded=encodeData(wire,sizeof(wire),eth,size,42); uint16_t seq=0;
+        assert(encoded==size+26);
+        assert(decodeData(decoded,sizeof(decoded),wire,encoded,seq)==size && seq==42);
+        assert(!memcmp(eth,decoded,size));
+        // Unsupported headers must never reach the IPv6 stack as a partial
+        // or incorrectly decapsulated datagram, and must leave outputs alone.
+        for(unsigned bit: {1U,2U,4U,0x40U,0x80U}) {
+            wire[1]=bit; assert(!decodeData(decoded,sizeof(decoded),wire,encoded,seq));
+        }
+        wire[1]=0; wire[22]|=1;
+        assert(!decodeData(decoded,sizeof(decoded),wire,encoded,seq)); wire[22]&=0xf0;
+        wire[0]=9; assert(!decodeData(decoded,sizeof(decoded),wire,encoded,seq)); wire[0]=8;
+        memmove(wire+26,wire+24,encoded-24); wire[24]=wire[25]=0; wire[0]=0x88;
+        assert(decodeData(decoded,sizeof(decoded),wire,encoded+2,seq)==size);
+        assert(!memcmp(eth,decoded,size));
+        wire[24]=0x80; assert(!decodeData(decoded,sizeof(decoded),wire,encoded+2,seq)); wire[24]=0;
+        wire[25]=1; assert(!decodeData(decoded,sizeof(decoded),wire,encoded+2,seq)); wire[25]=0;
+        wire[42]=0x40; assert(!decodeData(decoded,sizeof(decoded),wire,encoded+2,seq)); wire[42]=0x60;
+        wire[46]^=1; assert(!decodeData(decoded,sizeof(decoded),wire,encoded+2,seq)); wire[46]^=1;
+        if(size==1514) for(size_t len=40;len<encoded+2;++len) {
+            std::vector<uint8_t> truncated(wire,wire+len);
+            assert(!decodeData(decoded,sizeof(decoded),truncated.data(),len,seq));
+        }
+        for(size_t len=0;len<40;++len) {
+            std::vector<uint8_t> shortWire(wire,wire+len);
+            assert(!decodeData(decoded,sizeof(decoded),shortWire.data(),len,seq));
+        }
+        wire[1]=0x40; assert(!decodeData(decoded,sizeof(decoded),wire,encoded+2,seq));
+    }
+    // Deterministic fuzzing of TLV sizes and header bits under ASan/UBSan.
+    uint32_t random=0x7921;
+    for(unsigned i=0;i<100000;++i) {
+        random=random*1664525+1013904223;
+        std::vector<uint8_t> packet(frame,frame+n);
+        packet[random%n]^=uint8_t(random>>24);
+        parseAction(packet.data(),packet.size(),a);
+        uint8_t out[1514]; uint16_t seq;
+        decodeData(out,sizeof(out),packet.data(),packet.size(),seq);
+    }
+    puts("AWDL protocol: bounded templates, variable presence/wrap, forced roles, malformed/fragmented frames, election/expiry, replay, grants, IPv6 round trips and 100000 mutations passed");
+}

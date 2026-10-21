@@ -10,11 +10,13 @@ pre=r'''
 #define NBPFILTER 0
 const int IFF_RUNNING=1,IFF_UP=2,IEEE80211_S_RUN=4,IEEE80211_F_TX_MGMT_ONLY=8;
 struct ieee80211_node{int refs=0;};
-struct mbuf{ieee80211_node*node;};struct queue{mbuf*m=nullptr;};
+struct mbuf{ieee80211_node*node;};struct queue{mbuf*m=nullptr;bool active=false;};
 struct ifnet {void*if_softc;int if_flags=3;queue if_snd;int if_oerrors=0,if_timer=0;};
 struct ieee80211com {int ic_state=4,ic_xflags=0;queue ic_mgtq;};
-struct mwx_softc{ieee80211com sc_ic;};struct ether_header{char bytes[14];};
-bool ifq_is_oactive(queue*){return false;}
+struct mwx_softc{ieee80211com sc_ic;int sc_tx_stalls=0;};struct ether_header{char bytes[14];};
+bool full=false;bool mwx_tx_full(mwx_softc*){return full;}
+bool ifq_is_oactive(queue*q){return q->active;}
+void ifq_set_oactive(queue*q){q->active=true;}
 mbuf*mq_dequeue(queue*q){auto m=q->m;q->m=nullptr;return m;}
 mbuf*ifq_dequeue(queue*q){return mq_dequeue(q);}
 void*mbuf_pkthdr_rcvif(mbuf*m){return m->node;}
@@ -32,6 +34,8 @@ int main(){
   if(mgmt){ni.refs++;sc.sc_ic.ic_mgtq.m=&m;}else ifp.if_snd.m=&m;
   mwx_start(&ifp);assert(ni.refs==0);assert(ifp.if_oerrors==error);
  }
+ mwx_softc sc; ifnet ifp;ifp.if_softc=&sc;ieee80211_node ni;mbuf m{&ni};ifp.if_snd.m=&m;full=true;
+ mwx_start(&ifp);assert(ifp.if_snd.m==&m&&ni.refs==0&&ifp.if_snd.active&&sc.sc_tx_stalls==1);
  puts("PASS: extracted mwx_start balances enqueue node references for data/management, success/failure.");
 }
 '''

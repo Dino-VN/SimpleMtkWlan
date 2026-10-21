@@ -25,6 +25,9 @@ IOCommandGate *_fCommandGate;
 
 void AirportMtkWlan::releaseAll()
 {
+#ifdef MTK_NATIVE_AWDL
+    stopAwdlInterface();
+#endif
 #ifdef AIRPORT_WCL
     if (fNetIf)
         static_cast<AirportMtkSkywalkInterface *>(fNetIf)->stopWCL();
@@ -140,7 +143,21 @@ bool AirportMtkWlan::init(OSDictionary *properties)
 {
     XYLog("%s\n", __PRETTY_FUNCTION__);
     bool ret = super::init(properties);
-    awdlSyncEnable = true;
+    awdlSyncEnable = false;
+#ifdef MTK_NATIVE_AWDL
+    // Allow native AWDL requests by default on Tahoe. The personality and
+    // boot argument can disable it; creation still requires a role-6 request.
+    auto option=OSDynamicCast(OSBoolean,getProperty("MTKAWDLExperimental"));
+    awdlExperimental=option ? option->isTrue() : true;
+    uint32_t awdlOption=0;
+    if(PE_parse_boot_argn("amtk_awdl",&awdlOption,sizeof(awdlOption)))
+        awdlExperimental=awdlOption==1;
+    setProperty("MTKAWDLEnabled",awdlExperimental);
+    setProperty("MTKAWDLDiagnosticVersion",static_cast<uint64_t>(11),32);
+    setProperty("MTKAWDLNativeDataPathAvailable",AirportMtkAwdlInterface::nativeDataPathAvailable());
+    setProperty("MTKAWDLCreateStage","awaiting-request");
+    setProperty("MTKAWDLCreateStatus",static_cast<uint64_t>(static_cast<uint32_t>(kIOReturnNotReady)),32);
+#endif
     power_state = 0;
     memset(geo_location_cc, 0, sizeof(geo_location_cc));
     return ret;
@@ -469,11 +486,19 @@ bool AirportMtkWlan::start(IOService *provider)
     bsdInterface->registerService();
 #endif
     registerService();
+    // Do not create the native AWDL interface during controller start.
+    // Tahoe may probe/start the controller while Bluetooth and the native
+    // peer manager are still coming up; creating a role-6 interface here
+    // races that lifecycle and can leave a retained virtual interface during
+    // boot.  AWDL is created only from the explicit role-6 request below.
     return true;
 }
 
 void AirportMtkWlan::stop(IOService *provider)
 {
+#ifdef MTK_NATIVE_AWDL
+    stopAwdlInterface();
+#endif
     XYLog("%s\n", __PRETTY_FUNCTION__);
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
 #ifdef AIRPORT_WCL
@@ -538,6 +563,9 @@ void *AirportMtkWlan::getFaultReporterFromDriver()
 
 IOReturn AirportMtkWlan::enable(IO80211SkywalkInterface *netif)
 {
+#ifdef MTK_NATIVE_AWDL
+    if(netif==awdlInterface) return enableVirtualInterface(awdlInterface);
+#endif
     XYLog("%s\n", __PRETTY_FUNCTION__);
     super::enable(netif);
     _fCommandGate->enable();
@@ -548,6 +576,9 @@ IOReturn AirportMtkWlan::enable(IO80211SkywalkInterface *netif)
 
 IOReturn AirportMtkWlan::disable(IO80211SkywalkInterface *netif)
 {
+#ifdef MTK_NATIVE_AWDL
+    if(netif==awdlInterface) return disableVirtualInterface(awdlInterface);
+#endif
     XYLog("%s\n", __PRETTY_FUNCTION__);
     super::disable(netif);
     setLinkStatus(kIONetworkLinkValid);
@@ -556,6 +587,13 @@ IOReturn AirportMtkWlan::disable(IO80211SkywalkInterface *netif)
 
 bool AirportMtkWlan::configureInterface(IONetworkInterface *netif)
 {
+#ifdef MTK_NATIVE_AWDL
+    if(creatingAwdl) {
+        return IOEthernetController::configureInterface(netif) &&
+            netif->configureOutputPullModel(64,kIONetworkWorkLoopSynchronous,0,
+                IOEthernetInterface::kOutputPacketSchedulingModelNormal,0)==kIOReturnSuccess;
+    }
+#endif
     IONetworkData *nd;
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
 
@@ -591,7 +629,13 @@ IONetworkInterface *AirportMtkWlan::createInterface()
     AirportMtkEthernetInterface *netif = new AirportMtkEthernetInterface;
     if (!netif)
         return NULL;
-    if (!netif->initWithSkywalkInterfaceAndProvider(this, fNetIf)) {
+    if (!netif->initWithSkywalkInterfaceAndProvider(this,
+#ifdef MTK_NATIVE_AWDL
+        creatingAwdl ? static_cast<IO80211SkywalkInterface *>(awdlInterface) : fNetIf
+#else
+        fNetIf
+#endif
+        )) {
         netif->release();
         return NULL;
     }
@@ -689,6 +733,14 @@ setLinkStateGated(OSObject *target, void *arg0, void *arg1, void *arg2, void *ar
 #ifdef __PRIVATE_SPI__
 IOReturn AirportMtkWlan::outputStart(IONetworkInterface *interface, IOOptionBits options)
 {
+#ifdef MTK_NATIVE_AWDL
+    if(interface==awdlBSD && awdlInterface) {
+        mbuf_t m=NULL;
+        while(kIOReturnSuccess==interface->dequeueOutputPackets(1,&m))
+            awdlInterface->output(m);
+        return kIOReturnSuccess;
+    }
+#endif
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
     mbuf_t m = NULL;
     if (ifq_is_oactive(&ifp->if_snd))
@@ -949,6 +1001,17 @@ getCARD_CAPABILITIES(OSObject *object,
     cd->capabilities[2] = (1 << (APPLE80211_CAP_WME - 16)) |
         (1 << (APPLE80211_CAP_SHORT_GI_40MHZ - 16)) |
         (1 << (APPLE80211_CAP_SHORT_GI_20MHZ - 16));
+#if __IO80211_TARGET == __MAC_26_0
+    // BSD CARD_CAPABILITIES strips version and returns 21 capability bytes.
+    // wifip2pd tests returned byte 4 bit 0 before requesting native AWDL.
+#ifdef MTK_NATIVE_AWDL
+    if (awdlExperimental && AirportMtkAwdlInterface::nativeDataPathAvailable())
+        cd->capabilities[4] |= 0x01;
+#endif
+    // Tahoe configureValidAWDLChannels reads capability bit 29 for dual band.
+    // A single radio can support both bands; this does not advertise RSDB.
+    if (fHalService->getDriverInfo()->is5GBandSupport()) cd->capabilities[3] |= 0x20;
+#endif
     // Tahoe WCLDeviceConfiguration::isHeSupported reads byte 17, bit 7.
     // WCL uses this capability together with the BSS HE IE for PHY reporting.
     if (caps & IEEE80211_C_HE)
@@ -1169,6 +1232,12 @@ IOReturn AirportMtkWlan::enableAdapter(IONetworkInterface *netif)
 
 void AirportMtkWlan::disableAdapter(IONetworkInterface *netif)
 {
+#ifdef MTK_NATIVE_AWDL
+    if(awdlInterface) {
+        apple80211_awdl_sync_enabled disabled={APPLE80211_VERSION,0,0};
+        awdlInterface->setAWDL_SYNC_ENABLED(&disabled);
+    }
+#endif
     watchdogTimer->cancelTimeout();
     watchdogTimer->disable();
     fHalService->disable(netif);
@@ -1345,3 +1414,177 @@ void AirportMtkWlan::setPowerStateOn()
     pmPowerState = kPowerStateOn;
     pmPolicyMaker->acknowledgeSetPowerState();
 }
+
+#ifdef MTK_NATIVE_AWDL
+void AirportMtkWlan::recordAwdlCreation(const char *stage, IOReturn status)
+{
+    awdlCreateStatus=status;
+    setProperty("MTKAWDLCreateStage",stage);
+    setProperty("MTKAWDLCreateStatus",static_cast<uint64_t>(static_cast<uint32_t>(status)),32);
+    // The user-client log ring survives missing unified-log messages.
+    mtk_printf("AirportMtkWlan: MTK AWDL create stage=%s status=0x%x\n",stage,status);
+    IOLog("AirportMtkWlan: MTK AWDL create stage=%s status=0x%x\n",stage,status);
+}
+IOReturn AirportMtkWlan::requestAwdlCreation()
+{
+    if(isInactive() || !_fCommandGate) return kIOReturnNotReady;
+    // Run on the caller's thread inside the gate. Native registration must
+    // not run on the IO80211WorkQueue event thread (the removed timer did).
+    retain();
+    IOReturn status=_fCommandGate->runAction(createAwdlGated);
+    release();
+    return status;
+}
+IOReturn AirportMtkWlan::createAwdlGated(OSObject *target,void*,void*,void*,void*)
+{
+    auto self=OSDynamicCast(AirportMtkWlan,target);
+    if(!self || self->isInactive()) return kIOReturnNotReady;
+    self->setProperty("MTKAWDLCreateSource","manual");
+    if(!self->awdlExperimental) return kIOReturnUnsupported;
+    if(self->awdlCreating || self->awdlStopping) return kIOReturnBusy;
+    // Registration is idempotent even while infrastructure is scanning.
+    // Do not replace a successfully registered interface's diagnostic stage
+    // with a creation failure solely because en0 disconnected afterwards.
+    if(self->awdlInterface) return kIOReturnSuccess;
+    auto ic=self->fHalService ? self->fHalService->get80211Controller() : NULL;
+    if(!ic || ic->ic_state!=IEEE80211_S_RUN) {
+        self->recordAwdlCreation("infrastructure-not-connected",kIOReturnNotReady);
+        return kIOReturnNotReady;
+    }
+    return self->createAwdlInterface() ? kIOReturnSuccess : self->awdlCreateStatus;
+}
+IO80211VirtualInterface *AirportMtkWlan::createVirtualInterface(ether_addr *address,unsigned int role)
+{
+    IOLog("AirportMtkWlan: MTK AWDL createVirtualInterface role=%u\n",role);
+    setProperty("MTKAWDLCreateSource","controller-request");
+    if(role!=6 || !awdlExperimental || !createAwdlInterface(address)) return NULL;
+    return awdlInterface;
+}
+SInt32 AirportMtkWlan::enableVirtualInterface(IO80211VirtualInterface *interface)
+{
+    if(!interface || interface!=awdlInterface || awdlStopping) return kIOReturnUnsupported;
+    return awdlInterface->setInterfaceEnable(true);
+}
+SInt32 AirportMtkWlan::disableVirtualInterface(IO80211VirtualInterface *interface)
+{
+    if(!interface || interface!=awdlInterface || awdlStopping) return kIOReturnUnsupported;
+    apple80211_awdl_sync_enabled disabled={APPLE80211_VERSION,0,0};
+    awdlInterface->setAWDL_SYNC_ENABLED(&disabled);
+    return awdlInterface->setInterfaceEnable(false);
+}
+IOReturn AirportMtkWlan::createAwdlInterfaceRequest(apple80211_virt_if_create_data *data)
+{
+    IOLog("AirportMtkWlan: MTK AWDL VIRTUAL_IF_CREATE version=%u role=%u\n",
+          data ? data->version : 0,data ? data->role : 0);
+    setProperty("MTKAWDLCreateSource","virtual-if-request");
+    if(!data || data->version>APPLE80211_VERSION) return kIOReturnBadArgument;
+    if(data->role!=6 || !awdlExperimental) return kIOReturnUnsupported;
+    if(awdlCreating || awdlStopping) return kIOReturnBusy;
+    bool existed=awdlInterface && !awdlStopping;
+    ether_addr address;
+    memcpy(&address,data->mac,6);
+    if(!existed && !mtkawdl::unicast((uint8_t *)&address)) return kIOReturnBadArgument;
+    if(!createAwdlInterface(&address)) return awdlCreateStatus;
+    bzero(data->bsd_name,sizeof(data->bsd_name));
+    const char *name=awdlInterface->getBSDName();
+    if(name && name[0]) strlcpy((char *)data->bsd_name,name,sizeof(data->bsd_name));
+    else strlcpy((char *)data->bsd_name,"awdl0",sizeof(data->bsd_name));
+    // Native BCM writes the existing BSD name and returns EEXIST on a
+    // duplicate request, which lets the caller recover the interface.
+    return existed ? EEXIST : kIOReturnSuccess;
+}
+bool AirportMtkWlan::createAwdlInterface(ether_addr *address)
+{
+    if(!awdlExperimental) { recordAwdlCreation("disabled",kIOReturnUnsupported); return false; }
+    if(awdlCreating || awdlStopping) return false;
+    if(awdlInterface) return true;
+    // The interface start method defers BSD matching until native queue,
+    // pool and logical-link registration succeeds.
+    if(!AirportMtkAwdlInterface::nativeDataPathAvailable()) {
+        recordAwdlCreation("native-data-path-unavailable",kIOReturnUnsupported);
+        return false;
+    }
+    MtkMwx *hal=OSDynamicCast(MtkMwx,fHalService);
+    if(!hal || !fNetIf || !bsdInterface) {
+        recordAwdlCreation("infrastructure-not-ready",kIOReturnNotReady); return false;
+    }
+    // wifip2pd can request AWDL during early boot, before HAL channel setup.
+    // Return a retryable status before allocating any native interface.
+    auto ic=hal->get80211Controller();
+    if(!ic || ic->ic_state!=IEEE80211_S_RUN) {
+        recordAwdlCreation("infrastructure-not-connected",kIOReturnNotReady); return false;
+    }
+    if(!hal->awdlChannelAllowed(6) && !hal->awdlChannelAllowed(44) && !hal->awdlChannelAllowed(149)) {
+        recordAwdlCreation("no-social-channel",kIOReturnNotReady); return false;
+    }
+    ether_addr mac;
+    if(address) {
+        if(!mtkawdl::unicast((uint8_t *)address)) {
+            recordAwdlCreation("invalid-address",kIOReturnBadArgument); return false;
+        }
+        memcpy(&mac,address,6);
+    } else {
+        memcpy(&mac,hal->get80211Controller()->ic_myaddr,6);
+        ((uint8_t *)&mac)[0]=(((uint8_t *)&mac)[0]|2)&0xfe;
+        ((uint8_t *)&mac)[5]^=0x80;
+    }
+    awdlCreating=true;
+    recordAwdlCreation("allocate",kIOReturnNotReady);
+    awdlInterface=new AirportMtkAwdlInterface;
+    if(!awdlInterface) {
+        recordAwdlCreation("allocate-failed",kIOReturnNoMemory);
+        stopAwdlInterface(); return false;
+    }
+    recordAwdlCreation("native-init",kIOReturnNotReady);
+    if(!awdlInterface->initWithController(this,&mac,hal)) {
+        stopAwdlInterface(); return false;
+    }
+    recordAwdlCreation("attach",kIOReturnNotReady);
+    if(!awdlInterface->attach(this)) {
+        recordAwdlCreation("attach-failed",kIOReturnError);
+        stopAwdlInterface(); return false;
+    }
+    awdlAttached=true;
+    awdlInterface->setInterfaceRole(6);
+    awdlInterface->setInterfaceId(2);
+    recordAwdlCreation("native-start",kIOReturnNotReady);
+    if(!awdlInterface->start(this)) {
+        if(awdlCreateStatus==kIOReturnNotReady) recordAwdlCreation("native-start-failed",kIOReturnError);
+        stopAwdlInterface(); return false;
+    }
+    awdlStarted=true;
+    awdlCreating=false;
+    setProperty("MTKAWDLInterfaceReady",true);
+    recordAwdlCreation("registered",kIOReturnSuccess);
+    // Removing IODeferBSDAttach republishes only the fully registered
+    // provider. State is ready before its BSD client can call us back.
+    awdlInterface->deferBSDAttach(false);
+    return true;
+}
+void AirportMtkWlan::stopAwdlInterface()
+{
+    if(awdlStopping) return;
+    awdlStopping=true;
+    if(!awdlInterface) {
+        awdlBSD=NULL;
+        creatingAwdl=awdlCreating=false;
+        removeProperty("MTKAWDLInterfaceReady");
+        awdlStopping=false;
+        return;
+    }
+    awdlInterface->shutdown();
+    if(awdlStarted) {
+        awdlInterface->stop(this);
+        awdlStarted=false;
+    }
+    if(awdlAttached) {
+        awdlInterface->detach(this);
+        awdlAttached=false;
+    }
+    OSSafeReleaseNULL(awdlInterface);
+    awdlBSD=NULL;
+    creatingAwdl=awdlCreating=false;
+    removeProperty("MTKAWDLInterfaceReady");
+    awdlStopping=false;
+}
+#endif

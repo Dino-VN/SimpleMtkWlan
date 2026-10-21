@@ -15,11 +15,15 @@ stubs=r'''
 #include <condition_variable>
 #include <atomic>
 #include <chrono>
-using IORecursiveLock=std::recursive_mutex;
+struct IORecursiveLock:std::recursive_mutex{std::condition_variable_any cv;};
 IORecursiveLock* IORecursiveLockAlloc(){return new IORecursiveLock;}
 void IORecursiveLockFree(IORecursiveLock*p){delete p;}
 void IORecursiveLockLock(IORecursiveLock*p){p->lock();}
 void IORecursiveLockUnlock(IORecursiveLock*p){p->unlock();}
+const int THREAD_UNINT=0;
+void IORecursiveLockWakeup(IORecursiveLock*p,void*,bool){p->cv.notify_all();}
+void IORecursiveLockSleep(IORecursiveLock*p,void*,int){std::unique_lock<IORecursiveLock> l(*p,std::adopt_lock);p->cv.wait(l);l.release();}
+void IOSleep(int ms){std::this_thread::sleep_for(std::chrono::milliseconds(ms));}
 void* IOMalloc(size_t n){return malloc(n);}void IOFree(void*p,size_t){free(p);}
 using thread_call_param_t=void*;
 struct Call{void(*fn)(void*,void*);void*arg;std::mutex m;std::condition_variable cv;bool pending=false,running=false,stop=false;std::thread worker;};
@@ -31,8 +35,8 @@ Call*thread_call_allocate_with_options(void(*fn)(void*,void*),void*arg,int,int){
  c->worker=std::thread([c]{std::unique_lock<std::mutex> l(c->m);for(;;){c->cv.wait(l,[c]{return c->pending||c->stop;});if(c->stop)return;c->pending=false;c->running=true;l.unlock();c->fn(c->arg,nullptr);l.lock();c->running=false;c->cv.notify_all();}});return c;
 }
 void thread_call_enter(Call*c){std::lock_guard<std::mutex> l(c->m);c->pending=true;c->cv.notify_all();}
-void thread_call_cancel_wait(Call*c){std::unique_lock<std::mutex> l(c->m);c->pending=false;c->cv.wait(l,[c]{return !c->running;});}
-bool thread_call_free(Call*c){{std::lock_guard<std::mutex> l(c->m);c->stop=true;c->cv.notify_all();}c->worker.join();delete c;return true;}
+bool thread_call_cancel(Call*c){std::lock_guard<std::mutex> l(c->m);bool canceled=c->pending;c->pending=false;return canceled;}
+bool thread_call_free(Call*c){{std::lock_guard<std::mutex> l(c->m);if(c->running||c->pending)return false;c->stop=true;c->cv.notify_all();}c->worker.join();delete c;return true;}
 struct task{TAILQ_ENTRY(task)t_entry;void(*t_func)(void*);void*t_arg;unsigned t_flags;char name[256];};
 TAILQ_HEAD(task_list,task);
 #define TASK_ONQUEUE 1

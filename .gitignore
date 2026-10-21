@@ -17,5 +17,7 @@ build/
 *.tar.gz
 MacKernelSDK/
 
-# Local MacKernelSDK checkout (acidanthera/MacKernelSDK), not part of this repo
-/MacKernelSDK
+# Local analysis and runtime artifacts
+artifacts/
+._*
+._build

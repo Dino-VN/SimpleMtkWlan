@@ -22,6 +22,9 @@
 
 #include "MtkWlanUserClient.hpp"
 #include <sys/_netstat.h>
+#ifdef AIRPORT
+#include "AirportMtkWlan.hpp"
+#endif
 
 #define super IOUserClient
 OSDefineMetaClassAndStructors( MtkWlanUserClient, IOUserClient );
@@ -445,6 +448,17 @@ sDEBUG(OSObject* target, void* data, bool isSet)
     MtkWlanUserClient *that = OSDynamicCast(MtkWlanUserClient, target);
     if (isSet) {
         struct ioctl_debug_set *req = (struct ioctl_debug_set *)data;
+        if (req->op == IOCTL_DEBUG_OP_AWDL_CREATE) {
+            if (req->version != IOCTL_VERSION || req->val != 0)
+                return kIOReturnBadArgument;
+#ifdef MTK_NATIVE_AWDL
+            auto hal = OSDynamicCast(MtkMwx, that->fDriver->fHalService);
+            auto controller = hal ? OSDynamicCast(AirportMtkWlan, hal->mwxController()) : NULL;
+            return controller ? controller->requestAwdlCreation() : kIOReturnNotReady;
+#else
+            return kIOReturnUnsupported;
+#endif
+        }
         return that->fDriverController->debugSet(req->op, req->val);
     }
     memset(data, 0, sizeof(struct ioctl_debug));

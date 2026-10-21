@@ -6,6 +6,9 @@
 //  Copyright © 2023 钟先耀. All rights reserved.
 //
 
+#if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_26_0
+#include "macOS26/IOSkywalkPacketBufferPool.h"
+#else
 #ifndef IOSkywalkPacketBufferPool_h
 #define IOSkywalkPacketBufferPool_h
 
@@ -59,4 +62,5 @@ public:
 };
 
 #endif /* IOSkywalkPacketBufferPool_h */
+#endif /* Tahoe native pool routing */
 

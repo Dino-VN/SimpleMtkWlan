@@ -14,6 +14,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		AD0100000000000000000001 /* AirportMtkAwdlInterface.cpp in Sources */ = {isa = PBXBuildFile; fileRef = AD0100000000000000000002; };
 		024A07B023FCBC3C009FBA6C /* SimpleMtkWlan.hpp in Headers */ = {isa = PBXBuildFile; fileRef = 024A07AF23FCBC3C009FBA6C /* SimpleMtkWlan.hpp */; };
 		024A07B223FCBC3C009FBA6C /* SimpleMtkWlan.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 024A07B123FCBC3C009FBA6C /* SimpleMtkWlan.cpp */; };
 		024A082E23FCBC6C009FBA6C /* aes.c in Sources */ = {isa = PBXBuildFile; fileRef = 024A07C923FCBC6C009FBA6C /* aes.c */; };
@@ -192,6 +193,8 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		AD0100000000000000000002 /* AirportMtkAwdlInterface.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = AirportMtkAwdlInterface.cpp; sourceTree = "<group>"; };
+		AD0100000000000000000003 /* AirportMtkAwdlInterface.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = AirportMtkAwdlInterface.hpp; sourceTree = "<group>"; };
 		024A07AC23FCBC3C009FBA6C /* SimpleMtkWlan.kext */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SimpleMtkWlan.kext; sourceTree = BUILT_PRODUCTS_DIR; };
 		024A07AF23FCBC3C009FBA6C /* SimpleMtkWlan.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = SimpleMtkWlan.hpp; sourceTree = "<group>"; };
 		024A07B123FCBC3C009FBA6C /* SimpleMtkWlan.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = SimpleMtkWlan.cpp; sourceTree = "<group>"; };
@@ -611,6 +614,8 @@
 			isa = PBXGroup;
 			children = (
 				A1B2C3D4000000000000000F /* WCL */,
+				AD0100000000000000000002 /* AirportMtkAwdlInterface.cpp */,
+				AD0100000000000000000003 /* AirportMtkAwdlInterface.hpp */,
 				A1B2C3D40000000000000001 /* AirportMtkWlan.cpp */,
 				A1B2C3D40000000000000002 /* AirportMtkWlan.hpp */,
 				A1B2C3D40000000000000003 /* AirportMtkSkywalkInterface.cpp */,
@@ -901,6 +906,7 @@
 				A1B2C3D40000000000000047 /* AirportMtkWlan.cpp in Sources */,
 				A1B2C3D40000000000000048 /* AirportMtkSkywalkInterface.cpp in Sources */,
 				A1B2C3D40000000000000049 /* AirportMtkEthernetInterface.cpp in Sources */,
+				AD0100000000000000000001 /* AirportMtkAwdlInterface.cpp in Sources */,
 				A1B2C3D4000000000000004A /* MtkPCIEDeviceWrapper.cpp in Sources */,
 				A1B2C3D4000000000000004B /* WCL.cpp in Sources */,
 			);
@@ -1112,7 +1118,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = YES;
-				AMTK_IO80211_TARGET = __MAC_15_2;
+				AMTK_IO80211_TARGET = __MAC_26_0;
 				FRAMEWORK_SEARCH_PATHS = "";
 				GCC_PRECOMPILE_PREFIX_HEADER = YES;
 				GCC_PREFIX_HEADER = SimpleMtkWlan/PrivateSPI.pch;
@@ -1153,7 +1159,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = YES;
-				AMTK_IO80211_TARGET = __MAC_15_2;
+				AMTK_IO80211_TARGET = __MAC_26_0;
 				FRAMEWORK_SEARCH_PATHS = "";
 				GCC_PRECOMPILE_PREFIX_HEADER = YES;
 				GCC_PREFIX_HEADER = SimpleMtkWlan/PrivateSPI.pch;

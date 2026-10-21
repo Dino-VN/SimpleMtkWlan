@@ -239,6 +239,7 @@ enum {
     IOCTL_DEBUG_OP_DUMP = 3,    /* write DMA state to the log */
     IOCTL_DEBUG_OP_BA_GAP = 4,  /* val = RX BA gap timeout in ms, 0 = default */
     IOCTL_DEBUG_OP_BGSCAN_DWELL = 5, /* val = background scan dwell in ms, 0 = firmware, ~0 = auto */
+    IOCTL_DEBUG_OP_AWDL_CREATE = 6, /* Tahoe Airport: create native interface, val must be 0 */
 };
 
 struct ioctl_debug_set {

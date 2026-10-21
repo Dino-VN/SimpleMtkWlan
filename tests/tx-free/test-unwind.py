@@ -9,15 +9,20 @@ pre=r'''
 #include <cstdio>
 #include <cerrno>
 #define MWX_DEV_LOG(...) ((void)0)
-struct mbuf {bool freed=false;};struct ieee80211_node {};struct mwx_node:ieee80211_node{unsigned wcid;};
+#define MWX_KNOB_LINEARIZE 1
+struct mbuf {bool freed=false;mbuf*next=nullptr;};struct ieee80211_node {};struct mwx_node:ieee80211_node{unsigned wcid;};
 struct mt76_txwi {char desc[64];};
-struct mwx_txwi{mt76_txwi*mt_desc;mbuf*mt_mbuf;bool busy;};
-struct mwx_softc{int sc_txq;};
+struct mwx_txwi{mt76_txwi*mt_desc;mbuf*mt_mbuf;bool busy;int mt_eapol;};
+struct mwx_softc{int sc_txq,sc_knobs=0,sc_tx_nobufs=0,sc_tx_ring_full=0;};
 mt76_txwi desc; mwx_txwi mt{&desc,nullptr,false};int fail_at,freed,returned,mapped;
 void m_freem(mbuf*m){assert(!m->freed);m->freed=true;freed++;}
+mbuf*mbuf_next(mbuf*m){return m->next;}
+int linearized;bool linearize_fail;
+mbuf*mwx_mbuf_linearize(mbuf*m){linearized++;if(linearize_fail)return nullptr;m->next=nullptr;return m;}
+int mwx_eapol_keyinfo(mbuf*,uint16_t*ki){*ki=0;return 0;}
 mwx_txwi* mwx_txwi_get(mwx_softc*){if(fail_at==1)return nullptr;assert(!mt.busy);mt.busy=true;return &mt;}
 void mt7921_mac_write_txwi(mwx_softc*,mbuf*,ieee80211_node*,mt76_txwi*){}
-int mwx_txwi_enqueue(mwx_softc*,mwx_txwi*t,mbuf*m){if(fail_at==2)return EFBIG;t->mt_mbuf=m;mapped++;return 0;}
+int mwx_txwi_enqueue(mwx_softc*,mwx_txwi*t,mbuf*m){if(fail_at==2||m->next)return EFBIG;t->mt_mbuf=m;mapped++;return 0;}
 int mwx_dma_txwi_enqueue(mwx_softc*,int*,mwx_txwi*){return fail_at==3?EBUSY:0;}
 void mwx_txwi_put(mwx_softc*,mwx_txwi*t){assert(t->busy);if(t->mt_mbuf){m_freem(t->mt_mbuf);t->mt_mbuf=nullptr;mapped--;}t->busy=false;returned++;}
 '''
@@ -28,6 +33,13 @@ int main(){mwx_softc sc{};mwx_node ni{};
   if(fail_at==0){assert(rv==0&&mt.busy&&mapped==1&&!m.freed);mwx_txwi_put(&sc,&mt);}
   else assert(rv!=0);
   assert(m.freed&&freed==1&&!mt.busy&&mapped==0);assert(returned==(fail_at==1?0:1));
+ }
+ for(int proactive=0;proactive<2;proactive++)for(int allocationFailure=0;allocationFailure<2;allocationFailure++){
+  mbuf tail,m; m.next=&tail;fail_at=0;freed=returned=mapped=linearized=0;linearize_fail=allocationFailure;sc.sc_knobs=proactive?MWX_KNOB_LINEARIZE:0;
+  int rv=mwx_tx(&sc,&m,&ni);
+  if(!allocationFailure){assert(!rv&&linearized==1&&mapped==1);mwx_txwi_put(&sc,&mt);}
+  else assert(rv==EFBIG&&linearized==(proactive?2:1));
+  assert(m.freed&&freed==1&&!mt.busy&&mapped==0&&returned==1);
  }
  puts("PASS:400 extracted mwx_tx paths; no-token,map failure,ring-full and completion return packet/token/map exactly once.");
 }

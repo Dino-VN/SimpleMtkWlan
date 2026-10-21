@@ -9,10 +9,12 @@ pre=r'''
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#define MWX_DEV_LOG(...) ((void)0)
 struct mbuf {unsigned char* raw;size_t len,off;};
-struct mwx_txwi {int mt_busy;};
+struct mwx_txwi {int mt_busy,mt_eapol;};
 struct mwx_softc {int sc_txq;struct {int mt_count;mwx_txwi mt_data[16];}sc_txwi;};
 void mwx_dma_tx_cleanup(mwx_softc*,int*){}
+unsigned resumes;void mwx_tx_resume(mwx_softc*){resumes++;}
 mbuf* m_pullup(mbuf*m,size_t){return m;}
 size_t mbuf_len(mbuf*m){return m->len-m->off;}
 size_t mbuf_pkthdr_len(mbuf*m){return m->len;}
@@ -38,8 +40,8 @@ int main(int argc,char**argv){
   auto m=packet(8+4*(pairs+2));auto p=mtod(m,uint32_t*);p[0]=2u<<16;
   for(unsigned i=0;i<pairs;i++)p[2+i]=MT_TX_FREE_PAIR;
   p[2+pairs]=3u<<16;p[3+pairs]=4u<<16;
-  sc.sc_txwi.mt_data[3].mt_busy=sc.sc_txwi.mt_data[4].mt_busy=1;unsigned prev=releases;
-  mwx_mac_tx_free(&sc,m);assert(releases==prev+2);
+  sc.sc_txwi.mt_data[3].mt_busy=sc.sc_txwi.mt_data[4].mt_busy=1;sc.sc_txwi.mt_data[3].mt_eapol=1;unsigned prev=releases,before=resumes;
+  mwx_mac_tx_free(&sc,m);assert(releases==prev+2&&resumes==before+1);assert(!sc.sc_txwi.mt_data[3].mt_eapol);
  }
  for(unsigned n=1;n<64;n++){
   auto m=packet(8+4*n);auto p=mtod(m,uint32_t*);p[0]=1u<<16;

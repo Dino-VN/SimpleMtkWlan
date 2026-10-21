@@ -1,6 +1,8 @@
 // mtkctl: talk to SimpleMtkWlan (or AirportMtkWlan) through its IOUserClient.
 // Build: clang -O2 -Wall -I../include/ClientKit -o mtkctl mtkctl.c -framework IOKit -framework CoreFoundation
 #include <IOKit/IOKitLib.h>
+#include <CoreFoundation/CFNumber.h>
+#include <mach/mach_error.h>
 #include <net/ethernet.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -148,17 +150,71 @@ static void cmd_debug_set(io_connect_t c, uint32_t op, uint32_t val)
     printf("debug op %u val 0x%x: %s (0x%x)\n", op, val, kr ? "error" : "ok", kr);
 }
 
-static void cmd_log(io_connect_t c)
+static int cmd_awdl_create(io_connect_t c)
 {
-    struct ioctl_log l;
-    for (;;) {
-        kern_return_t kr = ioctl_get(c, IOCTL_80211_LOG, &l, sizeof(l));
-        if (kr) { printf("log: error 0x%x\n", kr); return; }
-        if (l.len == 0)
-            break;
-        fwrite(l.data, 1, l.len, stdout);
+    // v1/v2 can enter native startup without registering a logical link.
+    // Refuse those builds before sending the external method, even when
+    // this new executable is used from an old diagnostic directory.
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
+        IOServiceMatching("AirportMtkWlan"));
+    CFTypeRef version = svc ? IORegistryEntryCreateCFProperty(svc,
+        CFSTR("MTKAWDLDiagnosticVersion"), kCFAllocatorDefault, 0) : NULL;
+    int64_t diagnostic_version = 0;
+    if (version && CFGetTypeID(version) == CFNumberGetTypeID())
+        CFNumberGetValue((CFNumberRef)version, kCFNumberSInt64Type, &diagnostic_version);
+    if (version) CFRelease(version);
+    if (svc) IOObjectRelease(svc);
+    if (diagnostic_version < 3) {
+        fprintf(stderr, "AWDL creation refused: load diagnostic v3 or newer first.\n");
+        return 1;
     }
-    fprintf(stderr, "[log head=%llu]\n", (unsigned long long)l.head);
+    struct ioctl_debug_set req = {
+        .version = IOCTL_VERSION, .op = IOCTL_DEBUG_OP_AWDL_CREATE, .val = 0
+    };
+    kern_return_t kr = ioctl_set(c, IOCTL_80211_DEBUG, &req, sizeof(req));
+    if (kr) {
+        fprintf(stderr, "AWDL creation failed: 0x%x (%s)\n", kr, mach_error_string(kr));
+        if (kr == kIOReturnUnsupported)
+            fprintf(stderr, "Native Skywalk AWDL data path is unavailable; creation was blocked before native startup.\n");
+        fprintf(stderr, "Check MTKAWDLCreateStage/Status on AirportMtkWlan and mtkctl log.\n");
+        return 1;
+    }
+    printf("Native AWDL interface registered. Verify awdl0 with ifconfig; AirDrop still requires native sync.\n");
+    return 0;
+}
+
+static int cmd_log(io_connect_t c)
+{
+    // Capture the head from the first read. Following a moving head until
+    // the ring is empty can run forever while the kernel keeps logging.
+    struct ioctl_log l = {0};
+    uint64_t snapshot_head = 0, previous_cursor = 0;
+    const unsigned max_reads = (256 * 1024) / MTK_LOG_CHUNK + 2;
+    for (unsigned read = 0; read < max_reads; ++read) {
+        kern_return_t kr = ioctl_get(c, IOCTL_80211_LOG, &l, sizeof(l));
+        if (kr) { fprintf(stderr, "log: error 0x%x\n", kr); return 1; }
+        if (l.version != IOCTL_VERSION || l.len > sizeof(l.data) ||
+            l.cursor > l.head || l.cursor < l.len ||
+            (read && l.cursor < previous_cursor) ||
+            (l.len && read && l.cursor == previous_cursor)) {
+            fprintf(stderr, "log: invalid or non-advancing response\n");
+            return 1;
+        }
+        if (!read) snapshot_head = l.head;
+        uint64_t chunk_start = l.cursor - l.len;
+        size_t count = chunk_start < snapshot_head ?
+            (size_t)(snapshot_head - chunk_start) : 0;
+        if (count > l.len) count = l.len;
+        if (count && fwrite(l.data, 1, count, stdout) != count) return 1;
+        previous_cursor = l.cursor;
+        if (!l.len || l.cursor >= snapshot_head) {
+            fprintf(stderr, "[log head=%llu]\n", (unsigned long long)snapshot_head);
+            return 0;
+        }
+    }
+    fprintf(stderr, "log: snapshot read limit reached (head=%llu)\n",
+        (unsigned long long)snapshot_head);
+    return 1;
 }
 
 static void cmd_scan(io_connect_t c, int wait_s)
@@ -192,16 +248,18 @@ static void cmd_join(io_connect_t c, const char *ssid, const char *pass)
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: mtkctl info|state|debug|log|knob <hex>|gap <ms>|dwell <ms|auto>|reset|dump|scan [seconds]|results|join <ssid> [password]\n");
+        fprintf(stderr, "usage: mtkctl info|state|debug|log|awdl-create|knob <hex>|gap <ms>|dwell <ms|auto>|reset|dump|scan [seconds]|results|join <ssid> [password]\n");
         return 2;
     }
     io_connect_t c = open_driver();
+    int result = 0;
     if (!strcmp(argv[1], "info")) { cmd_info(c); cmd_state(c); }
     else if (!strcmp(argv[1], "state")) cmd_state(c);
     else if (!strcmp(argv[1], "scan")) cmd_scan(c, argc > 2 ? atoi(argv[2]) : 8);
     else if (!strcmp(argv[1], "results")) cmd_results(c);
     else if (!strcmp(argv[1], "debug")) cmd_debug(c);
-    else if (!strcmp(argv[1], "log")) cmd_log(c);
+    else if (!strcmp(argv[1], "log")) result = cmd_log(c);
+    else if (!strcmp(argv[1], "awdl-create")) result = cmd_awdl_create(c);
     else if (!strcmp(argv[1], "knob") && argc >= 3)
         cmd_debug_set(c, IOCTL_DEBUG_OP_KNOBS, (uint32_t)strtoul(argv[2], NULL, 0));
     else if (!strcmp(argv[1], "reset")) cmd_debug_set(c, IOCTL_DEBUG_OP_RESET, 0);
@@ -214,5 +272,5 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "join") && argc >= 3) cmd_join(c, argv[2], argc > 3 ? argv[3] : NULL);
     else { fprintf(stderr, "unknown command\n"); return 2; }
     IOServiceClose(c);
-    return 0;
+    return result;
 }

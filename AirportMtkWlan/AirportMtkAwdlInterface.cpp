@@ -1,0 +1,1105 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "AirportMtkWlan.hpp"
+#include "AirportMtkAwdlInterface.hpp"
+#ifdef MTK_NATIVE_AWDL
+#include <IOKit/IOCommandGate.h>
+#include <sys/kpi_mbuf.h>
+#include <Airport/macOS26/IO80211Buffer.h>
+
+#define super IO80211AWDLProtocol
+OSDefineMetaClassAndStructors(AirportMtkAwdlInterface, IO80211AWDLProtocol)
+
+extern IOCommandGate *_fCommandGate;
+// The controller copies the message before returning (same API used by the
+// native BCM driver's cache completion). No message data outlives this call.
+extern void awdlControllerMessage(IO80211Controller*,IO80211SkywalkInterface*,unsigned int,void*,unsigned long,bool)
+    __asm__("__ZN17IO80211Controller11postMessageEP23IO80211SkywalkInterfacejPvmb");
+
+static uint64_t awdlNow()
+{
+    uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(),&ns); return ns/1000;
+}
+
+bool AirportMtkAwdlInterface::start(IOService *provider)
+{
+    if(!owner || provider!=owner || !hal || stopping || nativeStarted) return false;
+    // The superclass publishes during start. BSD must not match until native
+    // registration creates its logical-link set and packet queues.
+    deferBSDAttach(true);
+    if(!getProperty("IODeferBSDAttach")) {
+        owner->recordAwdlCreation("bsd-deferral-failed",kIOReturnNoMemory);
+        return false;
+    }
+    if(!createDataPath()) { releaseDataPath(); return false; }
+    owner->recordAwdlCreation("native-super-start",kIOReturnNotReady);
+    if(!super::start(provider)) { releaseDataPath(); return false; }
+    nativeStarted=true;
+    // The native MAC agent now exists. Its setter calls our setMacAddress
+    // callback, then commits the address to the agent and IOMACAddress.
+    ether_addr mac;
+    memcpy(&mac,state.mac,6);
+    owner->recordAwdlCreation("native-mac-address",kIOReturnNotReady);
+    IOReturn macStatus=IO80211SkywalkInterface::setHardwareAddress(&mac);
+    ether_addr nativeMac=IO80211SkywalkInterface::getSelfMacAddr();
+    if(macStatus!=kIOReturnSuccess || memcmp(&nativeMac,state.mac,6)) {
+        owner->recordAwdlCreation("native-mac-address-failed",
+                                macStatus!=kIOReturnSuccess ? macStatus : kIOReturnError);
+        stop(provider); return false;
+    }
+    setProperty("MTKAWDLNativeMAC",&nativeMac,6);
+    setProperty("MTKAWDLNativeMACReady",true);
+    IOSkywalkEthernetInterface::RegistrationInfo info={};
+    owner->setProperty("MTKAWDLRegistrationVersion",static_cast<uint64_t>(1),32);
+    owner->setProperty("MTKAWDLRegistrationSize",static_cast<uint64_t>(sizeof(info)),32);
+    if(!initRegistrationInfo(&info,1,sizeof(info))) {
+        owner->recordAwdlCreation("registration-info-failed",kIOReturnError);
+        stop(provider); return false;
+    }
+    // Tahoe's helper calls Ethernet base getters directly and defaults to
+    // Ethernet media / "en" / UINT_MAX; it bypasses Wi-Fi overrides. Set
+    // the public registration fields verified against the Tahoe initializer:
+    // subfamily 0x0c, initial media 0x28, BSD prefix/unit 0x30/0x38.
+    const uint32_t subfamily=3; // IFNET_SUBFAMILY_WIFI (XNU kpi_interface.h)
+    const uint32_t media=0x80; // IFM_IEEE80211 (net/if_media.h)
+    const char *prefix=getBSDNamePrefix();
+    const uint32_t unit=0;
+    memcpy(info.bytes+0x0c,&subfamily,sizeof(subfamily));
+    memcpy(info.bytes+0x28,&media,sizeof(media));
+    memcpy(info.bytes+0x30,&prefix,sizeof(prefix));
+    memcpy(info.bytes+0x38,&unit,sizeof(unit));
+    owner->setProperty("MTKAWDLRegistrationReady",true);
+    IOSkywalkPacketQueue *queues[]={txSubmit,txComplete,rxComplete};
+    owner->recordAwdlCreation("native-register",kIOReturnNotReady);
+    IOReturn status=registerEthernetInterface(&info,queues,3,txPool,rxPool,0);
+    if(status!=kIOReturnSuccess) {
+        owner->recordAwdlCreation("native-register-failed",status);
+        stop(provider); return false;
+    }
+    nativeRegistered=true;
+    setProperty("MTKAWDLConfigured",true);
+    setProperty("MTKAWDLConfigStatus",static_cast<uint64_t>(kIOReturnSuccess),32);
+    // Controller start marks the object ready before releasing BSD deferral.
+    // Publish the verified agent address after registration and before BSD.
+    setProperty("IOMACAddress",&nativeMac,6);
+    setProperty("MTKAWDLRegistrationSubfamily",static_cast<uint64_t>(subfamily),32);
+    setProperty("MTKAWDLRegistrationMedia",static_cast<uint64_t>(media),32);
+    setProperty("MTKAWDLNativeQueuesRegistered",true);
+    // Controller start marks the object ready before releasing BSD deferral.
+    return true;
+}
+
+bool AirportMtkAwdlInterface::createDataPath()
+{
+    // The native factory has an unbounded IOBSD dependency wait. A nonblocking
+    // lookup prevents entering that wait when boot resources are unavailable.
+    OSDictionary *matching=IOService::resourceMatching("IOBSD");
+    IOService *resource=matching ? IOService::copyMatchingService(matching) : NULL;
+    OSSafeReleaseNULL(matching);
+    if(!resource) { owner->recordAwdlCreation("bsd-resource-unavailable",kIOReturnNotReady); return false; }
+    resource->release();
+    IOSkywalkPacketBufferPool::PoolOptions options={256,256,2048,1,4096,0,0};
+    owner->recordAwdlCreation("tx-pool",kIOReturnNotReady);
+    txPool=IOSkywalkPacketBufferPool::withName("MTK AWDL TX",this,0,&options);
+    if(!txPool) { owner->recordAwdlCreation("tx-pool-failed",kIOReturnNoMemory); return false; }
+    owner->recordAwdlCreation("rx-pool",kIOReturnNotReady);
+    rxPool=IOSkywalkPacketBufferPool::withName("MTK AWDL RX",this,0,&options);
+    if(!rxPool) { owner->recordAwdlCreation("rx-pool-failed",kIOReturnNoMemory); return false; }
+    owner->recordAwdlCreation("native-queues",kIOReturnNotReady);
+    txSubmit=IOSkywalkTxSubmissionQueue::withPool(txPool,64,0,this,submitNative,NULL,0);
+    txComplete=IOSkywalkTxCompletionQueue::withPool(txPool,128,0,this,NULL,NULL,0);
+    rxComplete=IOSkywalkRxCompletionQueue::withPool(rxPool,128,0,this,NULL,NULL,0);
+    if(!txSubmit || !txComplete || !rxComplete) {
+        owner->recordAwdlCreation("native-queues-failed",kIOReturnNoMemory); return false;
+    }
+    if(!owner->getWorkLoop()) {
+        owner->recordAwdlCreation("native-workloop-unavailable",kIOReturnNotReady); return false;
+    }
+    IOSkywalkPacketQueue *queues[]={txSubmit,txComplete,rxComplete};
+    for(auto q:queues) {
+        IOReturn status=owner->getWorkLoop()->addEventSource(q);
+        if(status!=kIOReturnSuccess) {
+            owner->recordAwdlCreation("native-queue-add-failed",status); return false;
+        }
+        ++queuesAdded;
+        q->disable();
+    }
+    return true;
+}
+
+void AirportMtkAwdlInterface::releaseDataPath()
+{
+    IOSkywalkPacketQueue *queues[]={txSubmit,txComplete,rxComplete};
+    for(unsigned i=0;i<queuesAdded;++i) queues[i]->disable();
+    // A rejected completion still owns its packet. Pool deallocation completes
+    // the preparation and notifies the submission queue exactly once.
+    for(unsigned i=0;i<completionCount;++i) txPool->deallocatePacket(completions[i]);
+    completionCount=0;
+    while(queuesAdded) owner->getWorkLoop()->removeEventSource(queues[--queuesAdded]);
+    OSSafeReleaseNULL(txSubmit); OSSafeReleaseNULL(txComplete); OSSafeReleaseNULL(rxComplete);
+    OSSafeReleaseNULL(txPool); OSSafeReleaseNULL(rxPool);
+    dataPathEnabled=false;
+}
+void *AirportMtkAwdlInterface::getTxSubQueue(apple80211_wme_ac) { return txSubmit; }
+void *AirportMtkAwdlInterface::getTxCompQueue() { return txComplete; }
+void *AirportMtkAwdlInterface::getRxCompQueue() { return rxComplete; }
+void *AirportMtkAwdlInterface::getTxPacketPool() { return txPool; }
+void *AirportMtkAwdlInterface::getRxPacketPool() { return rxPool; }
+IOReturn AirportMtkAwdlInterface::dataPathGated(OSObject*,void *arg,void *enable,void*,void*)
+{
+    auto self=static_cast<AirportMtkAwdlInterface *>(arg);
+    self->setDataPathEnabled(enable!=NULL); return kIOReturnSuccess;
+}
+void AirportMtkAwdlInterface::enableDatapath()
+{
+    if(_fCommandGate) _fCommandGate->runAction(dataPathGated,this,this);
+}
+void AirportMtkAwdlInterface::disableDatapath()
+{
+    if(_fCommandGate) _fCommandGate->runAction(dataPathGated,this,NULL);
+}
+void AirportMtkAwdlInterface::setDataPathEnabled(bool value)
+{
+    if(!nativeRegistered || !queuesAdded || (value && stopping)) return;
+    if(value) {
+        dataPathEnabled=true;
+        txComplete->enable(); rxComplete->enable(); txSubmit->enable();
+    } else {
+        dataPathEnabled=false;
+        txSubmit->disable(); rxComplete->disable();
+        drainCompletions(); txComplete->disable();
+    }
+    setProperty("MTKAWDLDataPathEnabled",dataPathEnabled);
+}
+unsigned AirportMtkAwdlInterface::submitNative(OSObject *target,IOSkywalkTxSubmissionQueue*,
+                                            IOSkywalkPacket *const *packets,unsigned count,void*)
+{
+    auto self=static_cast<AirportMtkAwdlInterface *>(target);
+    // Native queues and the HAL share the controller workloop gate. Never
+    // call firmware waits here; copy into the bounded protocol queue instead.
+    unsigned consumed=0;
+    for(;consumed<count && self->completionCount<128;++consumed) {
+        IOSkywalkPacket *packet=packets[consumed];
+        if(!packet) break;
+        bool accepted=false;
+        unsigned length=packet->getDataLength(), offset=packet->getDataOffset();
+        if(self->enabled && self->dataPathEnabled && !self->stopping &&
+           self->queueCount<64 && length>=14 && length<=1514 && offset+length<=2048 &&
+           packet->getPacketBufferCount()==1) {
+            auto bytes=static_cast<const uint8_t *>(packet->getDataVirtualAddress());
+            mbuf_t frame=bytes ? self->makeFrame(bytes+offset,length) : NULL;
+            if(frame) accepted=self->output(frame)==kIOReturnOutputSuccess;
+        }
+        if(accepted) ++self->nativeTx; else ++self->nativeDrops;
+        // Completion must run after submission returns: native submission
+        // updates its outstanding count only after invoking this callback.
+        self->completions[self->completionCount++]=packet;
+    }
+    if(consumed && self->timer) self->timer->setTimeoutMS(1);
+    return consumed;
+}
+void AirportMtkAwdlInterface::drainCompletions()
+{
+    // Native completion rejects count >= queue capacity (128). Clear our
+    // pending count before notifications, which can reenter queue callbacks.
+    unsigned pending=completionCount;
+    if(!pending) return;
+    IOSkywalkPacket *batch[128];
+    memcpy(batch,completions,pending*sizeof(batch[0]));
+    completionCount=0;
+    for(unsigned offset=0;offset<pending;) {
+        unsigned count=pending-offset;
+        if(count>64) count=64;
+        IOReturn status=txComplete->enqueuePackets(batch+offset,count,0);
+        if(status!=kIOReturnSuccess) {
+            for(unsigned i=0;i<count;++i) txPool->deallocatePacket(batch[offset+i]);
+        }
+        offset+=count;
+    }
+    setProperty("MTKAWDLNativeTxPackets",nativeTx,64);
+    setProperty("MTKAWDLNativeDroppedPackets",nativeDrops,64);
+}
+void AirportMtkAwdlInterface::inputNative(const uint8_t *bytes,size_t length)
+{
+    if(!dataPathEnabled || stopping || !rxPool || !rxComplete) return;
+    if(!bytes || length<14 || length>1514) { ++nativeDrops; return; }
+    IOSkywalkPacket *packet=NULL;
+    // Flags bit 0 uses kern_pbufpool_alloc_nosleep. Preparation materializes
+    // the native buflets before accessing virtual address or packet length.
+    if(rxPool->allocatePacket(&packet,1)!=kIOReturnSuccess || !packet) { ++nativeDrops; return; }
+    if(packet->prepareWithQueue(rxComplete,2,0)!=kIOReturnSuccess ||
+       packet->getPacketBufferCount()!=1 || packet->setDataOffset(0)!=kIOReturnSuccess ||
+       packet->setDataLength(static_cast<unsigned>(length))!=kIOReturnSuccess) {
+        rxPool->deallocatePacket(packet); ++nativeDrops; return;
+    }
+    void *destination=packet->getDataVirtualAddress();
+    if(!destination || length>1514) { rxPool->deallocatePacket(packet); ++nativeDrops; return; }
+    memcpy(destination,bytes,length);
+    IOReturn status=rxComplete->enqueuePackets(&packet,1,0);
+    if(status!=kIOReturnSuccess) { rxPool->deallocatePacket(packet); ++nativeDrops; }
+    else { ++nativeRx; setProperty("MTKAWDLNativeRxPackets",nativeRx,64); }
+    // Successful RX enqueue disposes the wrapper and transfers the packet
+    // handle to networking. No release/deallocation after that transfer.
+}
+
+bool AirportMtkAwdlInterface::initWithController(AirportMtkWlan *controller,ether_addr *mac,MtkMwx *transport)
+{
+    owner=controller; hal=transport; timer=NULL; bsd=NULL; timerAdded=false;
+    stopping=enabled=false; queueHead=queueCount=0; templateLength=0;
+    // Configuration is tracked by the native peer manager; this backend keeps
+    // the firmware context ready once registration succeeds.
+    requestedChannel=grantedChannel=0; nextAction=requestDeadline=0;
+    bzero(queue,sizeof(queue));
+    bzero(trafficPeer,sizeof(trafficPeer)); trafficActive=false;
+    bzero(installedTrafficPeer,sizeof(installedTrafficPeer)); trafficPeerInstalled=false;
+    state.init((const uint8_t *)mac,awdlNow());
+    state.nativeElectionManaged=true;
+    XYLog("AWDL native interface init\n");
+    syncParams={APPLE80211_VERSION,16,16,16,110,0};
+    extension={APPLE80211_VERSION,3,3,3,3};
+    electionId={APPLE80211_VERSION,0}; presence={APPLE80211_VERSION,4};
+    bzero(&syncState,sizeof(syncState)); syncState.version=APPLE80211_VERSION;
+    syncState.state=1; memcpy(syncState.master,mac,6);
+    rssiThresholds={APPLE80211_VERSION,0,0,0,-70}; afMode={APPLE80211_VERSION,0};
+    minRate={APPLE80211_VERSION,12};
+    bzero(&channelSequence,sizeof(channelSequence));
+    channelSequence.version=APPLE80211_VERSION; channelSequence.length=16; channelSequence.step_count=3;
+    for(unsigned i=0;i<16;++i) {
+        channelSequence.seqs[i].version=APPLE80211_VERSION;
+        channelSequence.seqs[i].channel=6;
+        channelSequence.seqs[i].flags=APPLE80211_C_FLAG_20MHZ | APPLE80211_C_FLAG_2GHZ;
+    }
+    // Keep a stable sequence tied to the advertised AW clock.
+    const uint8_t social[]={6,44,149}; unsigned count=0;
+    for(unsigned i=0;i<3;++i) if(hal->awdlChannelAllowed(social[i]))
+        state.ownSequence.channels[count++]=social[i];
+    if(!count) {
+        owner->recordAwdlCreation("no-social-channel",kIOReturnNotReady);
+        return false;
+    }
+    for(unsigned i=count;i<16;++i) state.ownSequence.channels[i]=state.ownSequence.channels[i%count];
+    state.sequence=state.ownSequence;
+    for(unsigned i=0;i<16;++i) {
+        auto &c=channelSequence.seqs[i]; c.channel=state.sequence.channels[i];
+        c.flags=APPLE80211_C_FLAG_20MHZ | (c.channel<=14 ? APPLE80211_C_FLAG_2GHZ : APPLE80211_C_FLAG_5GHZ);
+    }
+    // Native initialization may call configuration getters through our vtable.
+    // Skywalk::free dereferences its ivars before testing for NULL. Establish
+    // the base allocation separately, so partial VirtualInterface init and
+    // all later failures have a defined native cleanup path.
+    owner->recordAwdlCreation("native-base-init",kIOReturnNotReady);
+    if(!IO80211SkywalkInterface::init()) {
+        owner->recordAwdlCreation("native-base-init-failed",kIOReturnNoMemory);
+        return false;
+    }
+    nativeBaseInitialized=true;
+    owner->recordAwdlCreation("native-super-init",kIOReturnNotReady);
+    if(!super::init(controller,mac,6,"awdl")) {
+        owner->recordAwdlCreation("native-super-init-failed",kIOReturnError);
+        return false;
+    }
+    setInterfaceId(2);
+    owner->recordAwdlCreation("protocol-timer",kIOReturnNotReady);
+    timer=IOTimerEventSource::timerEventSource(this,tick);
+    if(!timer) {
+        owner->recordAwdlCreation("protocol-timer-failed",kIOReturnNoMemory);
+        return false;
+    }
+    IOReturn timerStatus=owner->getWorkLoop()->addEventSource(timer);
+    if(timerStatus!=kIOReturnSuccess) {
+        owner->recordAwdlCreation("protocol-timer-add-failed",timerStatus);
+        return false;
+    }
+    timerAdded=true;
+    hal->awdlSetReceiver(this,receive);
+    receiverRegistered=true;
+    return true;
+}
+
+void AirportMtkAwdlInterface::setBSDInterface(ifnet_t interface) {
+    bsd=interface;
+    if(bsd) ifnet_set_lladdr(bsd,state.mac,6);
+}
+IOReturn AirportMtkAwdlInterface::getHardwareAddress(ether_addr *mac) {
+    if(!mac) return kIOReturnBadArgument;
+    memcpy(mac,state.mac,6); return kIOReturnSuccess;
+}
+ether_addr AirportMtkAwdlInterface::getSelfMacAddr()
+{
+    // Native startup constructs the peer manager before its MAC agent. The
+    // native getter returns zero in that interval; use initialized identity.
+    ether_addr mac;
+    memcpy(&mac,state.mac,6);
+    return mac;
+}
+bool AirportMtkAwdlInterface::isChipInterfaceReady() { return !stopping && hal; }
+
+void AirportMtkAwdlInterface::shutdown()
+{
+    if(_fCommandGate && timerAdded) {
+        _fCommandGate->runAction(shutdownGated,this); return;
+    }
+    shutdownGated(this,this,NULL,NULL,NULL);
+}
+IOReturn AirportMtkAwdlInterface::shutdownGated(OSObject*,void *arg,void*,void*,void*)
+{
+    auto self=static_cast<AirportMtkAwdlInterface *>(arg);
+    self->shutdownInGate(); return kIOReturnSuccess;
+}
+void AirportMtkAwdlInterface::shutdownInGate()
+{
+    if(stopping) return;
+    if(awTimeline.open) notifyAvailabilityWindowEnd(awdlNow());
+    awTimeline.reset();
+    stopping=true;
+    setDataPathEnabled(false);
+    if(timer) { timer->cancelTimeout(); timer->disable(); }
+    if(hal && receiverRegistered) {
+        hal->awdlSetReceiver(NULL,NULL); receiverRegistered=false;
+        hal->awdlEnable(NULL,false);
+    }
+    enabled=false;
+    trafficPeerInstalled=false; bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
+    while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%64; --queueCount; }
+    if(timerAdded) { owner->getWorkLoop()->removeEventSource(timer); timerAdded=false; }
+    bsd=NULL;
+}
+void AirportMtkAwdlInterface::stop(IOService *provider)
+{
+    shutdown();
+    if(nativeStarted) { super::stop(provider); nativeStarted=false; }
+    nativeRegistered=false;
+    releaseDataPath();
+}
+void AirportMtkAwdlInterface::free()
+{
+    shutdown(); releaseDataPath(); OSSafeReleaseNULL(timer);
+    if(nativeBaseInitialized) super::free();
+    else {
+        // Never enter IO80211SkywalkInterface::free on an object whose base
+        // ivars were not allocated. The lower Skywalk free is NULL-safe.
+        IOSkywalkEthernetInterface::free();
+    }
+}
+IOReturn AirportMtkAwdlInterface::setMacAddress(ether_addr &mac)
+{
+    if(stopping) return kIOReturnNotReady;
+    if(enabled || syncOwner) return kIOReturnBusy;
+    if(!mtkawdl::unicast((uint8_t *)&mac)) return kIOReturnBadArgument;
+    auto sequence=state.ownSequence;
+    state.init((uint8_t *)&mac,awdlNow());
+    state.nativeElectionManaged=true;
+    awTimeline.reset();
+    bzero(nativePeerSamples,sizeof(nativePeerSamples));
+    state.sequence=state.ownSequence=sequence;
+    memcpy(syncState.master,&mac,6);
+    if(bsd) ifnet_set_lladdr(bsd,state.mac,6);
+    // This is the native MAC agent's hardware callback. Calling
+    // setHardwareAddress here reenters the agent and recurses indefinitely.
+    setProperty("MTKAWDLProtocolMAC",state.mac,6);
+    return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::setInterfaceEnable(bool value)
+{
+    if(stopping) return kIOReturnNotReady;
+    // Native link transitions enable the Apple peer manager; sync is enabled
+    // by the peer manager after the AWDL configuration transaction succeeds.
+    retain();
+    IOReturn status=super::setInterfaceEnable(value);
+    if(status==kIOReturnSuccess && !stopping)
+        status=reportLinkStatus(value ? 3 : 1,value ? 0x80 : 0x82);
+    if(!value && !stopping) setSync(false);
+    setProperty("MTKAWDLInterfaceEnableRequested",value);
+    setProperty("MTKAWDLInterfaceEnableStatus",static_cast<uint64_t>(status),32);
+    release(); return status;
+}
+bool AirportMtkAwdlInterface::setLinkState(IO80211LinkState value,unsigned int reason)
+{
+    if(stopping) return false;
+    if(value==kIO80211NetworkLinkDown) setSync(false);
+    setProperty("MTKAWDLNativeLinkState",static_cast<uint64_t>(value),32);
+    return super::setLinkState(value,reason);
+}
+IOReturn AirportMtkAwdlInterface::setSync(bool value)
+{
+    retain();
+    IOReturn status=_fCommandGate ? _fCommandGate->runAction(syncGated,this,
+                            reinterpret_cast<void *>(uintptr_t(value))) : kIOReturnNotReady;
+    release(); return status;
+}
+IOReturn AirportMtkAwdlInterface::syncGated(OSObject*,void *arg,void *value,void*,void*)
+{
+    auto self=static_cast<AirportMtkAwdlInterface *>(arg);
+    return self->setSyncInGate(value!=NULL);
+}
+IOReturn AirportMtkAwdlInterface::setSyncInGate(bool value)
+{
+    if(stopping || !hal || !timer || !_fCommandGate) return kIOReturnNotReady;
+    ++syncRequests;
+    IOThread caller=IOThreadSelf();
+    uint64_t deadline=awdlNow()+3000000;
+    while(syncOwner) {
+        // A synchronous callback cannot wait for its own stack to unwind.
+        if(syncOwner==caller) return kIOReturnBusy;
+        if(awdlNow()>=deadline) return kIOReturnTimeout;
+        ++syncWaits;
+        AbsoluteTime wake;
+        clock_interval_to_deadline(10,kMillisecondScale,&wake);
+        _fCommandGate->commandSleep(&syncOwner,wake,THREAD_UNINT);
+        if(stopping) return kIOReturnNotReady;
+    }
+    syncOwner=caller;
+    setProperty("MTKAWDLSyncTransition",value ? "enabling" : "disabling");
+    if(!value) {
+        enabled=false;
+        if(awTimeline.open) notifyAvailabilityWindowEnd(awdlNow());
+        awTimeline.reset(); drainCompletions();
+    }
+    IOReturn status=hal->awdlEnable(state.mac,value);
+    if(stopping) status=kIOReturnNotReady;
+    if(status==kIOReturnSuccess) enabled=value;
+    if(!enabled) {
+        // Firmware commandSleep releases the gate. Submission can queue drop
+        // completions during that wait, so drain again before canceling tick.
+        drainCompletions();
+        timer->cancelTimeout(); requestedChannel=grantedChannel=0; requestDeadline=0;
+        while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%64; --queueCount; }
+    } else if(!stopping) {
+        nextAction=0; timer->setTimeoutMS(1);
+    }
+    if(status!=kIOReturnSuccess) ++syncFailures;
+    setProperty("MTKAWDLSyncEnableStatus",static_cast<uint64_t>(status),32);
+    setProperty("MTKAWDLSyncEnabled",enabled);
+    setProperty("MTKAWDLSyncTransition",status==kIOReturnSuccess ? (enabled ? "enabled" : "disabled") : "failed");
+    setProperty("MTKAWDLSyncRequests",syncRequests,64);
+    setProperty("MTKAWDLSyncWaits",syncWaits,64);
+    setProperty("MTKAWDLSyncFailures",syncFailures,64);
+    XYLog("AWDL sync request=%d enabled=%d status=0x%x waits=%llu\n",value,enabled,status,syncWaits);
+    syncOwner=NULL;
+    _fCommandGate->commandWakeup(&syncOwner,false);
+    return status;
+}
+mbuf_t AirportMtkAwdlInterface::makeFrame(const uint8_t *data,size_t length)
+{
+    mbuf_t m=NULL; unsigned chunks=1;
+    if(mbuf_allocpacket(MBUF_DONTWAIT,length,&chunks,&m)) return NULL;
+    memcpy(mbuf_data(m),data,length); mbuf_setlen(m,length); mbuf_pkthdr_setlen(m,length);
+    return m;
+}
+UInt32 AirportMtkAwdlInterface::output(mbuf_t m)
+{
+    if(!m) return kIOReturnOutputDropped;
+    if(!enabled || stopping || queueCount==64 || !(mbuf_flags(m)&MBUF_PKTHDR)) {
+        mbuf_freem(m); return kIOReturnOutputDropped;
+    }
+    size_t n=mbuf_pkthdr_len(m); uint8_t eth[1514],frame[1542];
+    if(n<14 || n>sizeof(eth) || mbuf_copydata(m,0,n,eth)) { mbuf_freem(m); return kIOReturnOutputDropped; }
+    // The AWDL interface has its own locally administered address.
+    memcpy(eth+6,state.mac,6);
+    size_t size=mtkawdl::encodeData(frame,sizeof(frame),eth,n,state.dataCounter++);
+    mbuf_freem(m);
+    if(!size) return kIOReturnOutputDropped;
+    m=makeFrame(frame,size);
+    if(!m) return kIOReturnOutputDropped;
+    unsigned pos=(queueHead+queueCount)%64;
+    queue[pos]=m; queueTime[pos]=awdlNow(); ++queueCount;
+    timer->setTimeoutMS(1);
+    return kIOReturnOutputSuccess;
+}
+void AirportMtkAwdlInterface::tick(OSObject *o,IOTimerEventSource*)
+{
+    static_cast<AirportMtkAwdlInterface *>(o)->service();
+}
+void AirportMtkAwdlInterface::service()
+{
+    retain(); drainCompletions(); serviceInGate(); release();
+}
+void AirportMtkAwdlInterface::notifyAvailabilityWindowStart(uint8_t channel,uint64_t now)
+{
+    struct __attribute__((packed)) NativeAwStart {
+        uint32_t awCounter;
+        uint32_t nativeRole;
+        uint8_t syncMaster[6];
+        uint8_t topMaster[6];
+        uint32_t fwStartUsBE;
+        apple80211_channel channel;
+    } payload={};
+    static_assert(sizeof(NativeAwStart)==36,"AW-start ABI");
+    static_assert(offsetof(NativeAwStart,channel)==24,"AW channel offset");
+    payload.awCounter=awTimeline.active.counter;
+    // Native sync roles 1/2/3 map through BCM firmware 2/0/1 and back to
+    // event roles 1/2/3 respectively. Report the effective elected role.
+    payload.nativeRole=state.nativeParentSelected ? 2 : (state.syncRole==3 ? 3 : 1);
+    memcpy(payload.syncMaster,awTimeline.sync,6);
+    memcpy(payload.topMaster,awTimeline.root,6);
+    payload.fwStartUsBE=__builtin_bswap32(static_cast<uint32_t>(now));
+    payload.channel={APPLE80211_VERSION,channel,
+        uint32_t(APPLE80211_C_FLAG_20MHZ | (channel<=14 ? APPLE80211_C_FLAG_2GHZ : APPLE80211_C_FLAG_5GHZ))};
+    setProperty("MTKAWDLLastAWStartChannel",static_cast<uint64_t>(channel),32);
+    setProperty("MTKAWDLLastAWStartCounter",static_cast<uint64_t>(payload.awCounter),32);
+    setProperty("MTKAWDLLastAWStartUS",now,64);
+    ++awStartNotifications;
+    setProperty("MTKAWDLAWStartNotifications",awStartNotifications,64);
+    postMessage(APPLE80211_M_AWDL_AVAILABILITY_WINDOW_START,&payload,sizeof(payload),true);
+}
+void AirportMtkAwdlInterface::notifyAvailabilityWindowEnd(uint64_t now)
+{
+    struct __attribute__((packed)) NativeAwEnd {
+        uint32_t role;
+        uint32_t endUsBE;
+        uint8_t flags;
+        uint8_t padding[3];
+        uint32_t beaconCount;
+        uint8_t stats[24];
+    } payload={};
+    static_assert(sizeof(NativeAwEnd)==40,"AW-end ABI");
+    payload.endUsBE=__builtin_bswap32(static_cast<uint32_t>(now));
+    setProperty("MTKAWDLLastAWEndUS",now,64);
+    awTimeline.close(); awWindowOpen=false;
+    postMessage(APPLE80211_M_AWDL_AVAILABILITY_WINDOW_EXTENSIONS_END,&payload,sizeof(payload),true);
+}
+void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
+{
+    if(lastDiagnostic && now-lastDiagnostic<1000000) return;
+    lastDiagnostic=now;
+    hal->awdlPublishDiagnostics();
+    setProperty("MTKAWDLServiceTicks",serviceTicks,64);
+    setProperty("MTKAWDLReserveAttempts",reserveAttempts,64);
+    setProperty("MTKAWDLReserveStatus",static_cast<uint64_t>(reserveStatus),32);
+    setProperty("MTKAWDLReserveDurationMS",static_cast<uint64_t>(reserveDuration),32);
+    setProperty("MTKAWDLGrantObservations",grantObservations,64);
+    setProperty("MTKAWDLActionSubmitted",actionSubmitted,64);
+    setProperty("MTKAWDLActionFailed",actionFailed,64);
+    setProperty("MTKAWDLActionStatus",static_cast<uint64_t>(actionStatus),32);
+    setProperty("MTKAWDLActionReceived",actionReceived,64);
+    setProperty("MTKAWDLActionHostAccepted",actionHostAccepted,64);
+    setProperty("MTKAWDLActionHostRejected",actionHostRejected,64);
+    setProperty("MTKAWDLActionRSSIRejected",actionRSSIRejected,64);
+    setProperty("MTKAWDLActionNativeDelivered",actionNativeDelivered,64);
+    setProperty("MTKAWDLActionInvalid",actionInvalid,64);
+    setProperty("MTKAWDLActionNoBuffer",actionNoBuffer,64);
+    setProperty("MTKAWDLLastActionRSSI",static_cast<uint64_t>(lastActionRSSI),32);
+    if(rejectedActionLength) setProperty("MTKAWDLRejectedAction",rejectedAction,static_cast<unsigned>(rejectedActionLength));
+    setProperty("MTKAWDLMISubmitted",miSubmitted,64);
+    setProperty("MTKAWDLAWStartNotifications",awStartNotifications,64);
+    setProperty("MTKAWDLAWEndNotifications",awTimeline.ends,64);
+    setProperty("MTKAWDLLateWindowObservations",awTimeline.late,64);
+    setProperty("MTKAWDLMIFailed",miFailed,64);
+    setProperty("MTKAWDLMIStatus",static_cast<uint64_t>(miStatus),32);
+    setProperty("MTKAWDLHostChannel",static_cast<uint64_t>(state.channel(now)),32);
+    setProperty("MTKAWDLHostCounter",static_cast<uint64_t>(state.counter(now)),32);
+    unsigned peers=0;
+    for(unsigned i=0;i<mtkawdl::maxPeers;++i) if(state.peers[i].used) ++peers;
+    setProperty("MTKAWDLHostPeerCount",static_cast<uint64_t>(peers),32);
+}
+void AirportMtkAwdlInterface::serviceInGate()
+{
+    if(!enabled || stopping) return;
+    ++serviceTicks;
+    if(!hal->awdlIsEnabled()) {
+        // Transport reset invalidates the secondary BSS and all grants.
+        enabled=false; trafficPeerInstalled=false; bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
+        setProperty("MTKAWDLSyncEnabled",false);
+        setProperty("MTKAWDLSyncEnableStatus",static_cast<uint64_t>(kIOReturnNotReady),32);
+        timer->cancelTimeout(); requestedChannel=grantedChannel=0; awStartCounterValid=false;
+        awTimeline.reset(); awWindowOpen=false;
+        while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%64; --queueCount; }
+        return;
+    }
+    uint64_t now=awdlNow();
+    if(awTimeline.due(now)) {
+        notifyAvailabilityWindowEnd(now);
+        if(stopping || !enabled) return;
+        hal->awdlAbort(); requestedChannel=grantedChannel=0;
+        now=awdlNow();
+    }
+    state.elect(now); publishScheduler(now);
+    if(trafficPeerInstalled) {
+        int peer=state.find(installedTrafficPeer);
+        if(!trafficActive || peer<0 || memcmp(installedTrafficPeer,trafficPeer,6)) {
+            if(hal->awdlPeer(installedTrafficPeer,false)==kIOReturnSuccess) {
+                trafficPeerInstalled=false;
+                bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
+            }
+        }
+    }
+    if(trafficActive && !trafficPeerInstalled) {
+        int peer=state.find(trafficPeer);
+        if(peer>=0 && hal->awdlPeer(trafficPeer,true)==kIOReturnSuccess) {
+            memcpy(installedTrafficPeer,trafficPeer,6); trafficPeerInstalled=true;
+        }
+    }
+    mtkawdl::Window window={};
+    if(!mtkawdl::currentWindow(state,now,window)) { timer->setTimeoutMS(2); return; }
+    uint8_t channel=window.channel;
+    if(!channel || !hal->awdlChannelAllowed(channel)) {
+        if(awTimeline.open) notifyAvailabilityWindowEnd(now);
+        hal->awdlAbort(); requestedChannel=grantedChannel=0;
+        timer->setTimeoutMS(2); return;
+    }
+    if(awTimeline.open && (awTimeline.active.channel!=channel ||
+       memcmp(awTimeline.sync,state.sync,6) || memcmp(awTimeline.root,state.master,6))) {
+        notifyAvailabilityWindowEnd(now);
+        hal->awdlAbort(); requestedChannel=grantedChannel=0;
+    }
+    mtkawdl::Reservation grant={};
+    bool grantReady=hal->awdlGrantSnapshot(grant) && grant.canTransmit(channel,now);
+    if(!grantReady) {
+        // Do not replace the last 2ms TX guard of a live grant with another
+        // short ROC. Prepare the next EAW after closing this one.
+        if(awTimeline.open) { timer->setTimeoutMS(1); return; }
+        if(!requestedChannel || now>=requestDeadline || requestedWindow.end<=now) {
+            // A small dwell margin covers timer dispatch and the 2ms TX guard.
+            // It does not authorize RF use before a real grant event.
+            uint32_t duration=(window.end-now+999)/1000+4;
+            if(duration>70) duration=70;
+            reserveDuration=duration; ++reserveAttempts;
+            requestedWindow=window;
+            IOReturn status=hal->awdlReserve(channel,duration);
+            reserveStatus=status;
+            if(stopping || !enabled) return;
+            now=awdlNow();
+            mtkawdl::Window after={};
+            if(!mtkawdl::currentWindow(state,now,after) ||
+               after.start!=window.start || after.channel!=channel ||
+               after.counter!=window.counter) {
+                hal->awdlAbort(); requestedChannel=grantedChannel=0;
+                timer->setTimeoutMS(1); return;
+            }
+            if(status==kIOReturnSuccess) {
+                requestedChannel=channel; requestDeadline=window.end;
+            } else requestedChannel=0;
+        }
+        timer->setTimeoutMS(1); return;
+    }
+    if(grantedChannel!=channel) ++grantObservations;
+    if(!awTimeline.open && awTimeline.begin(window,grant,now,state.sync,state.master)) {
+        // Set lifecycle state before dispatch: native may synchronously call
+        // back into sync/advertisers setters while receiving this event.
+        awWindowOpen=true; awWindowEnd=window.end;
+        notifyAvailabilityWindowStart(channel,now);
+        if(stopping || !enabled || !awTimeline.open) return;
+    }
+    if(afMode.mode==0 && (grantedChannel!=channel || now>=nextAction)) {
+        uint8_t frame[2304]; size_t size;
+        if(templateLength) {
+            size=mtkawdl::buildActionWithTemplate(state,frame,sizeof(frame),now,
+                                                 syncTemplate,templateLength);
+        } else size=mtkawdl::buildAction(state,frame,sizeof(frame),now);
+        if(size) frame[30]=0; // PSF; MIF (3) is scheduled separately below
+        mbuf_t m=size ? makeFrame(frame,size) : NULL;
+        actionStatus=m ? hal->awdlTransmit(m,channel) : kIOReturnNoMemory;
+        if(actionStatus==kIOReturnSuccess) ++actionSubmitted; else ++actionFailed;
+        // Native asks for PSF periods 110/440ms; honor the actual request.
+        nextAction=now+uint64_t(syncParams.synchronization_frame_period)*1000;
+    }
+    grantedChannel=channel;
+    // Native's default bitmap 0xffffffff selects all transmission slots.
+    // Emit at most once per EAW and only after an actual firmware ROC grant.
+    // Other bitmaps are rejected until their slot mapping is established.
+    uint16_t eaw=state.counter(now)/state.presence;
+    if(miTemplateLength && now>=miStart && (!miCounterValid || miCounter!=eaw)) {
+        uint8_t frame[2304];
+        size_t size=mtkawdl::buildActionWithTemplate(state,frame,sizeof(frame),now,miTemplate,miTemplateLength);
+        mbuf_t m=size ? makeFrame(frame,size) : NULL;
+        miStatus=m ? hal->awdlTransmit(m,channel) : kIOReturnNoMemory;
+        if(miStatus==kIOReturnSuccess) ++miSubmitted; else ++miFailed;
+        miCounter=eaw; miCounterValid=true;
+    }
+    unsigned pending=queueCount;
+    while(pending-- && queueCount && hal->awdlCanTransmit(channel)) {
+        mbuf_t m=queue[queueHead]; uint64_t time=queueTime[queueHead];
+        const uint8_t *f=(const uint8_t *)mbuf_data(m);
+        int peer=state.find(f+4);
+        bool ready=f[4]&1;
+        if(peer>=0) {
+            const mtkawdl::Peer &p=state.peers[peer];
+            ready=p.channel(now)==channel;
+        }
+        queueHead=(queueHead+1)%64; --queueCount;
+        if(now-time<1000000 && !ready) {
+            unsigned tail=(queueHead+queueCount)%64; queue[tail]=m; queueTime[tail]=time; ++queueCount;
+            continue;
+        }
+        if(now-time>=1000000) mbuf_freem(m);
+        else hal->awdlTransmit(m,channel);
+    }
+    if(!hal->awdlCanTransmit(channel)) { requestedChannel=0; grantedChannel=0; }
+    timer->setTimeoutMS(2);
+}
+
+bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,uint8_t channel,int8_t rssi)
+{
+    auto self=static_cast<AirportMtkAwdlInterface *>(context);
+    if(!self || !self->enabled || self->stopping || n<24) return false;
+    uint64_t now=awdlNow();
+    if(f[0]==0xd0) {
+        ++self->actionReceived;
+        self->lastActionRSSI=rssi;
+        if(!mtkawdl::validActionEnvelope(f,n) || !memcmp(f+10,self->state.mac,6)) {
+            ++self->actionInvalid;
+            if(n<=sizeof(self->rejectedAction)) {
+                memcpy(self->rejectedAction,f,n); self->rejectedActionLength=n;
+            }
+            return true;
+        }
+        if(rssi<self->rssiThresholds.peer_rssi_threshold) { ++self->actionRSSIRejected; return true; }
+        if(self->state.receiveAction(f,n,now)>=0) {
+            ++self->actionHostAccepted;
+            self->setProperty("MTKAWDLLastPeer",const_cast<uint8_t *>(f+10),6);
+        } else {
+            ++self->actionHostRejected;
+            memcpy(self->rejectedAction,f,n); self->rejectedActionLength=n;
+        }
+        mtkawdl::Advertisement nativeAdvertisement={};
+        if(mtkawdl::parseAction(f,n,nativeAdvertisement)) {
+            auto &sample=self->nativePeerSamples[self->nativePeerSampleNext++%16];
+            sample.advertisement=nativeAdvertisement;
+            memcpy(sample.peer,f+10,6); sample.received=now; sample.valid=true;
+        }
+        // Native discovery must not depend on the host parser accepting a
+        // sync TLV or election policy. Native validates the bounded body itself.
+        // Native AWDL action input receives the vendor action body and a
+        // 72-byte host metadata header. bpfTapInput owns/returns the buffer.
+        IO80211BufferPool *pool=self->getMgmtFramePool();
+        IO80211Buffer *buffer=pool ? pool->getBuffer() : NULL;
+        if(!buffer) { ++self->actionNoBuffer; return true; }
+        void *bytes=buffer->getBytesNoCopy();
+        if(bytes && buffer->getCapacity()>=n-24) {
+            memcpy(bytes,f+24,n-24); buffer->setLength(n-24);
+            uint8_t metadata[72]={}; memcpy(metadata,f+10,6);
+            apple80211_channel c={APPLE80211_VERSION,channel,
+                uint32_t(APPLE80211_C_FLAG_20MHZ | (channel<=14 ? APPLE80211_C_FLAG_2GHZ : APPLE80211_C_FLAG_5GHZ))};
+            memcpy(metadata+12,&c,sizeof(c)); int32_t signal=rssi;
+            // Native RX metadata RSSI is +44, noise +40 and rate +48.
+            memcpy(metadata+44,&signal,4);
+            // actionFrameReport reads metadata +48 as BE FW AF RX usec.
+            // The host implementation uses this same monotonic clock for
+            // AW events and advertisers correlation; this is not RF TSF.
+            mtkawdl::putBE32(metadata+48,static_cast<uint32_t>(now));
+            ++self->actionNativeDelivered;
+            self->bpfTapInput(buffer,12,metadata,sizeof(metadata));
+        } else { ++self->actionNoBuffer; buffer->returnBuffer(); }
+        return true;
+    }
+    uint8_t eth[1514]; uint16_t seq;
+    size_t size=mtkawdl::decodeData(eth,sizeof(eth),f,n,seq);
+    int peer=self->state.find(f+10);
+    if(!size || peer<0 || (memcmp(eth,self->state.mac,6) && !(eth[0]&1)) ||
+       !self->state.acceptData(self->state.peers[peer],seq)) return true;
+    self->inputNative(eth,size);
+    return true;
+}
+
+#define AWDL_GET(name,type,field) IOReturn AirportMtkAwdlInterface::get##name(type *d) { if(!d) return kIOReturnBadArgument; *d=field; return kIOReturnSuccess; }
+#define AWDL_SET(name,type,field) IOReturn AirportMtkAwdlInterface::set##name(type *d) { if(!d || d->version>APPLE80211_VERSION) return kIOReturnBadArgument; field=*d; return kIOReturnSuccess; }
+AWDL_GET(AWDL_SYNC_PARAMS,apple80211_awdl_sync_params,syncParams)
+AWDL_GET(AWDL_ELECTION_ID,apple80211_awdl_election_id,electionId)
+AWDL_SET(AWDL_ELECTION_ID,apple80211_awdl_election_id,electionId)
+AWDL_GET(AWDL_PRESENCE_MODE,apple80211_awdl_presence_mode,presence)
+AWDL_GET(AWDL_AF_TX_MODE,apple80211_awdl_af_tx_mode,afMode)
+AWDL_GET(AWDL_ELECTION_RSSI_THRESHOLDS,apple80211_awdl_election_rssi_thresholds,rssiThresholds)
+AWDL_GET(AWDL_MIN_RATE,apple80211_awdl_min_rate,minRate)
+AWDL_GET(AWDL_EXTENSION_STATE_MACHINE_PARAMETERS,apple80211_awdl_extension_state_machine_parameter,extension)
+IOReturn AirportMtkAwdlInterface::setAWDL_EXTENSION_STATE_MACHINE_PARAMETERS(apple80211_awdl_extension_state_machine_parameter *d) {
+    if(!d || d->version>APPLE80211_VERSION || d->unk1>255 || d->unk2>255 || d->unk3>255 || d->unk4>255) return kIOReturnBadArgument;
+    state.minExtension[0]=d->unk1; state.minExtension[1]=d->unk2;
+    state.minExtension[2]=d->unk3; state.minExtension[3]=d->unk4;
+    extension=*d; return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::setAWDL_MIN_RATE(apple80211_awdl_min_rate *d) {
+    if(!d || d->version>APPLE80211_VERSION) return kIOReturnBadArgument;
+    if(d->min_rate!=12) return kIOReturnUnsupported;
+    minRate=*d; return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::setAWDL_AF_TX_MODE(apple80211_awdl_af_tx_mode *d) {
+    if(!d || d->version>APPLE80211_VERSION) return kIOReturnBadArgument;
+    setProperty("MTKAWDLRequestedAFMode",static_cast<uint64_t>(d->mode),32);
+    // Native setAFTXMode maps firmware 0 to allow and 3 to suppress PSFs.
+    // OOB Master Indications remain independently scheduled in either mode.
+    if(d->mode!=0 && d->mode!=3) return kIOReturnUnsupported;
+    afMode=*d;
+    setProperty("MTKAWDLAFMode",static_cast<uint64_t>(d->mode),32);
+    nextAction=0;
+    if(enabled && !stopping && timer) timer->setTimeoutMS(1);
+    return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::setAWDL_OOB_AUTO_REQUEST(apple80211_awdl_oob_request *d)
+{
+    if(!d || d->version>APPLE80211_VERSION) return kIOReturnBadArgument;
+    // Tahoe passes supplemental MI TLVs through a borrowed kernel pointer at
+    // +48. Copy them synchronously, before this ioctl returns to its owner.
+    setProperty("MTKAWDLRequestedMILength",static_cast<uint64_t>(d->data_len),32);
+    setProperty("MTKAWDLRequestedMIPeriod",static_cast<uint64_t>(d->unk4),32);
+    setProperty("MTKAWDLRequestedMIDelay",static_cast<uint64_t>(d->unk3),32);
+    if(stopping) return kIOReturnNotReady;
+    // +16 is a bitmap (native setMiBitmap), +12 is the randomized start
+    // delay in microseconds. Limit support to the observed broadcast/all-slot
+    // request, so a different bitmap is never interpreted as an interval.
+    const uint8_t *raw=reinterpret_cast<const uint8_t *>(d);
+    static const uint8_t broadcast[6]={255,255,255,255,255,255};
+    if(memcmp(raw+4,broadcast,6)) return kIOReturnUnsupported;
+    if(d->unk4!=0 && d->unk4!=0xffffffffU) return kIOReturnUnsupported;
+    if(!d->unk4 || !d->data_len) {
+        miTemplateLength=0; miCounterValid=false;
+        setProperty("MTKAWDLMITemplateLength",static_cast<uint64_t>(0),32);
+        return kIOReturnSuccess;
+    }
+    if(!d->data || d->data_len>sizeof(miTemplate) || d->unk3>1000000 ||
+       !mtkawdl::validTemplateTLVs(d->data,d->data_len)) return kIOReturnBadArgument;
+    bool same=miTemplateLength==d->data_len && !memcmp(miTemplate,d->data,d->data_len);
+    memcpy(miTemplate,d->data,d->data_len); miTemplateLength=d->data_len;
+    if(!same) { miStart=awdlNow()+d->unk3; miCounterValid=false; }
+    setProperty("MTKAWDLMITemplateLength",static_cast<uint64_t>(miTemplateLength),32);
+    setProperty("MTKAWDLMIBitmap",static_cast<uint64_t>(d->unk4),32);
+    if(enabled && timer) timer->setTimeoutMS(1);
+    return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::setAWDL_ELECTION_RSSI_THRESHOLDS(apple80211_awdl_election_rssi_thresholds *d) {
+    if(!d || d->version>APPLE80211_VERSION || d->peer_rssi_threshold<-128 || d->peer_rssi_threshold>0)
+        return kIOReturnBadArgument;
+    // Only the discovery threshold at +0x10 is used by this host engine.
+    if(d->unk1 || d->unk2 || d->unk3) return kIOReturnUnsupported;
+    rssiThresholds=*d; return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::setAWDL_AWDL_ADVERTISERS(awdl_peer_advert_add *input)
+{
+    if(!input || stopping) return input ? kIOReturnNotReady : kIOReturnBadArgument;
+    uint8_t raw[44]; memcpy(raw,input,sizeof(raw));
+    ++advertisersRequests;
+    setProperty("MTKAWDLAdvertisersRequests",advertisersRequests,64);
+    setProperty("MTKAWDLAdvertisersPayload",raw,sizeof(raw));
+    uint16_t counter=mtkawdl::le16(raw), down=mtkawdl::le16(raw+2);
+    uint32_t timestamp=mtkawdl::be32(raw+20);
+    IOReturn status=kIOReturnNotReady;
+    const NativePeerSample *matched=NULL;
+    uint64_t now=awdlNow();
+    if(!mtkawdl::unicast(raw+32) || !mtkawdl::unicast(raw+38)) status=kIOReturnBadArgument;
+    else if(mtkawdl::le16(raw+12)!=16 || !mtkawdl::validPresence(raw[16]) ||
+            raw[15] || raw[17] || raw[19] || mtkawdl::le16(raw+10)!=16) status=kIOReturnUnsupported;
+    else {
+        for(unsigned i=0;i<16;++i) {
+            const auto &sample=nativePeerSamples[i];
+            if(sample.valid && now>=sample.received && now-sample.received<=mtkawdl::peerLifetimeUs &&
+               static_cast<uint32_t>(sample.received)==timestamp && !memcmp(sample.peer,raw+38,6) &&
+               !memcmp(sample.advertisement.master,raw+32,6) && sample.advertisement.counter==counter &&
+               sample.advertisement.down==down && sample.advertisement.presence==raw[16]) { matched=&sample; break; }
+        }
+        if(matched) {
+            // The native record lacks a channel sequence and election counter.
+            // Recover both from the exact RX frame that native selected.
+            NativePeerSample sample=*matched;
+            const auto &a=sample.advertisement;
+            uint64_t elapsed=uint64_t(unsigned(a.presence)*a.period-a.down)*1024;
+            if(sample.received>=elapsed) {
+                int peer=state.find(sample.peer);
+                if(peer>=0) {
+                    uint64_t epoch=sample.received-elapsed;
+                    uint16_t base=counter-counter%a.presence;
+                    uint16_t expected=base+uint16_t((now-epoch)/mtkawdl::awUs);
+                    bool changed=!state.nativeParentSelected || memcmp(state.nativeParent,sample.peer,6) ||
+                        memcmp(state.master,a.master,6) || state.presence!=a.presence ||
+                        memcmp(&state.sequence,&a.sequence,sizeof(a.sequence)) || state.counter(now)!=expected;
+                    if(changed && awTimeline.open) notifyAvailabilityWindowEnd(now);
+                    if(stopping) return kIOReturnNotReady;
+                    auto &p=state.peers[peer]; p.advertisement=a; p.epoch=epoch; p.baseCounter=base;
+                    memcpy(state.nativeParent,sample.peer,6); state.nativeParentSelected=true;
+                    state.nativeElectionManaged=true; state.elect(now);
+                    if(changed && enabled) {
+                        hal->awdlAbort(); requestedChannel=grantedChannel=0;
+                        nextAction=0; miCounterValid=false; timer->setTimeoutMS(1);
+                    }
+                    status=kIOReturnSuccess;
+                    setProperty("MTKAWDLAdvertisersPeer",const_cast<uint8_t *>(sample.peer),6);
+                    setProperty("MTKAWDLAdvertisersRoot",const_cast<uint8_t *>(a.master),6);
+                    setProperty("MTKAWDLAdvertisersMatchedRXAgeUS",now-sample.received,64);
+                    setProperty("MTKAWDLAdvertisersStage",changed ? "applied" : "duplicate");
+                }
+            }
+        }
+    }
+    if(status!=kIOReturnSuccess) setProperty("MTKAWDLAdvertisersStage",matched ? "peer-unavailable" : "unmatched-rx");
+    setProperty("MTKAWDLAdvertisersStatus",static_cast<uint64_t>(status),32);
+    return status;
+}
+
+IOReturn AirportMtkAwdlInterface::getAWDL_SYNC_STATE(apple80211_awdl_sync_state *d) {
+    if(!d) return kIOReturnBadArgument;
+    *d=syncState; memcpy(d->master,state.master,6); return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::setAWDL_SYNC_STATE(apple80211_awdl_sync_state *d) {
+    if(!d || d->version>APPLE80211_VERSION) return kIOReturnBadArgument;
+    if(!d->state) {
+        IOReturn status=setSync(false);
+        if(status==kIOReturnSuccess) syncState=*d;
+        return status;
+    }
+    // Tahoe supplies private control bits in flags/mode_flags during the
+    // native enable/disable transition. They are consumed by IO80211Family;
+    // rejecting them prevents even the initial AWDL disable from completing.
+    if(!state.setSyncRole(d->state,d->master)) return kIOReturnBadArgument;
+    syncState=*d; state.elect(awdlNow());
+    setProperty("MTKAWDLSyncRole",d->state,32);
+    if(enabled) { hal->awdlAbort(); requestedChannel=grantedChannel=0; nextAction=0; timer->setTimeoutMS(1); }
+    return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::setAWDL_PRESENCE_MODE(apple80211_awdl_presence_mode *d) {
+    if(!d || d->version>APPLE80211_VERSION) return kIOReturnBadArgument;
+    if(!mtkawdl::validPresence(d->mode)) return kIOReturnUnsupported;
+    state.setPresence(d->mode,awdlNow()); channelSequence.step_count=d->mode-1;
+    presence=*d; return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::setAWDL_SYNC_PARAMS(apple80211_awdl_sync_params *d)
+{
+    if(!d || d->version>APPLE80211_VERSION) return kIOReturnBadArgument;
+    if(d->availability_window_length!=16 || d->availability_window_period!=16 ||
+       d->extension_length!=16 || d->non_election_master>1 ||
+       (d->synchronization_frame_period!=110 && d->synchronization_frame_period!=440))
+        return kIOReturnUnsupported;
+    // A period update must not reset an already selected synchronization peer.
+    if(state.syncRole!=2) state.setSyncRole(d->non_election_master ? 3 : 1,state.mac);
+    state.psfPeriod=d->synchronization_frame_period;
+    state.elect(awdlNow()); syncParams=*d; nextAction=0;
+    setProperty("MTKAWDLPSFPeriodMS",static_cast<uint64_t>(state.psfPeriod),32);
+    return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::getAWDL_SYNC_ENABLED(apple80211_awdl_sync_enabled *d) { if(!d) return kIOReturnBadArgument; *d={APPLE80211_VERSION,0,uint32_t(enabled)}; return kIOReturnSuccess; }
+IOReturn AirportMtkAwdlInterface::setAWDL_CONFIG(apple80211_awdl_config_request *d)
+{
+    // Tahoe uses this request to commit the peer-manager configuration. The
+    // request is opaque in the public headers; accept the common versioned
+    // prefix and let the individual AWDL setters validate their payloads.
+    if(!d || stopping) return stopping ? kIOReturnNotReady : kIOReturnBadArgument;
+    uint32_t version=0;
+    memcpy(&version,d,sizeof(version));
+    if(version>APPLE80211_VERSION) return kIOReturnBadArgument;
+    setProperty("MTKAWDLConfigured",true);
+    setProperty("MTKAWDLConfigStatus",static_cast<uint64_t>(kIOReturnSuccess),32);
+    return kIOReturnSuccess;
+}
+
+IOReturn AirportMtkAwdlInterface::setAWDL_SYNC_ENABLED(apple80211_awdl_sync_enabled *d) { if(!d || d->version>APPLE80211_VERSION || d->enabled>1) return kIOReturnBadArgument; return setSync(d->enabled); }
+IOReturn AirportMtkAwdlInterface::getSSID(apple80211_ssid_data *d) { if(!d) return kIOReturnBadArgument; bzero(d,sizeof(*d)); d->version=APPLE80211_VERSION; return kIOReturnSuccess; }
+IOReturn AirportMtkAwdlInterface::getBSSID(apple80211_bssid_data *d) { if(!d) return kIOReturnBadArgument; bzero(d,sizeof(*d)); d->version=APPLE80211_VERSION; memcpy(&d->bssid,mtkawdl::bssid,6); return kIOReturnSuccess; }
+IOReturn AirportMtkAwdlInterface::getSTATE(apple80211_state_data *d) { if(!d) return kIOReturnBadArgument; *d={APPLE80211_VERSION,enabled ? APPLE80211_S_RUN : APPLE80211_S_INIT}; return kIOReturnSuccess; }
+IOReturn AirportMtkAwdlInterface::getCHANNEL(apple80211_channel_data *d) { if(!d) return kIOReturnBadArgument; bzero(d,sizeof(*d)); d->version=APPLE80211_VERSION; d->channel={APPLE80211_VERSION,state.channel(awdlNow()),APPLE80211_C_FLAG_20MHZ}; return kIOReturnSuccess; }
+IOReturn AirportMtkAwdlInterface::setAWDL_BSSID(apple80211_awdl_bssid *d) { return d && !memcmp(d->bssid,mtkawdl::bssid,6) ? kIOReturnSuccess : kIOReturnUnsupported; }
+IOReturn AirportMtkAwdlInterface::getAWDL_ELECTION_METRIC(apple80211_awdl_election_metric *d) { if(!d) return kIOReturnBadArgument; *d={APPLE80211_VERSION,state.metric}; return kIOReturnSuccess; }
+IOReturn AirportMtkAwdlInterface::setAWDL_ELECTION_METRIC(apple80211_awdl_election_metric *d) { if(!d) return kIOReturnBadArgument; state.metric=d->metric; return kIOReturnSuccess; }
+IOReturn AirportMtkAwdlInterface::getPEER_CACHE_MAXIMUM_SIZE(apple80211_peer_cache_maximum_size *d) { if(!d) return kIOReturnBadArgument; *d={APPLE80211_VERSION,hal->awdlPeerCapacity()}; return kIOReturnSuccess; }
+IOReturn AirportMtkAwdlInterface::getAWDL_MASTER_CHANNEL(apple80211_awdl_master_channel *d) { if(!d) return kIOReturnBadArgument; *d={APPLE80211_VERSION,state.ownSequence.channels[0]}; return kIOReturnSuccess; }
+IOReturn AirportMtkAwdlInterface::setAWDL_MASTER_CHANNEL(apple80211_awdl_master_channel *d) {
+    if(!d || d->version>APPLE80211_VERSION || d->master_channel>165 || !hal->awdlChannelAllowed(d->master_channel)) return kIOReturnBadArgument;
+    // Apply a primary social channel to the local discovery schedule. A
+    // received master's schedule takes precedence while synchronized.
+    state.ownSequence.channels[0]=d->master_channel;
+    if(!state.synchronized) state.sequence=state.ownSequence;
+    channelSequence.seqs[0].channel=d->master_channel;
+    return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::getAWDL_SECONDARY_MASTER_CHANNEL(apple80211_awdl_secondary_master_channel *d) { if(!d) return kIOReturnBadArgument; *d={APPLE80211_VERSION,secondaryMasterChannel}; return kIOReturnSuccess; }
+IOReturn AirportMtkAwdlInterface::setAWDL_SECONDARY_MASTER_CHANNEL(apple80211_awdl_secondary_master_channel *d) {
+    if(!d || d->version>APPLE80211_VERSION) return kIOReturnBadArgument;
+    if(d->secondary_master_channel && (d->secondary_master_channel>165 ||
+       !hal->awdlChannelAllowed(d->secondary_master_channel))) return kIOReturnBadArgument;
+    secondaryMasterChannel=d->secondary_master_channel;
+    // Keep a second discovery channel until the complete native sequence arrives.
+    if(state.ownSequence.count>1) state.ownSequence.channels[1]=secondaryMasterChannel;
+    if(!state.synchronized) state.sequence=state.ownSequence;
+    channelSequence.seqs[1].channel=secondaryMasterChannel;
+    setProperty("MTKAWDLSecondaryMasterChannel",static_cast<uint64_t>(secondaryMasterChannel),32);
+    return kIOReturnSuccess;
+}
+AWDL_GET(AWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE,apple80211_awdl_sync_channel_sequence,channelSequence)
+IOReturn AirportMtkAwdlInterface::setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE(apple80211_awdl_sync_channel_sequence *d)
+{
+    if(!d || d->version>APPLE80211_VERSION || !d->length || d->length>16 ||
+       d->encoding>1 || !mtkawdl::validPresence(unsigned(d->step_count)+1) || d->duplicate_count)
+        return kIOReturnUnsupported;
+    mtkawdl::Sequence s={}; s.count=d->length; s.step=d->step_count;
+    for(unsigned i=0;i<s.count;++i) { unsigned c=d->seqs[i].channel; if(c && (c>165 || !hal->awdlChannelAllowed(c))) return kIOReturnBadArgument; s.channels[i]=c; }
+    state.ownSequence=s; state.setPresence(s.step+1,awdlNow()); if(!state.synchronized) state.sequence=s;
+    channelSequence=*d;
+    setProperty("MTKAWDLNativeChannelSequence",state.ownSequence.channels,state.ownSequence.count);
+    return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::setAWDL_SYNC_FRAME_TEMPLATE(apple80211_awdl_sync_frame_template *d)
+{
+    if(!d || d->version>APPLE80211_VERSION || !d->payload || !d->payload_len || d->payload_len>sizeof(syncTemplate)) return kIOReturnBadArgument;
+    const uint8_t *p=(const uint8_t *)d->payload;
+    if(!mtkawdl::validTemplateTLVs(p,d->payload_len)) return kIOReturnBadArgument;
+    memcpy(syncTemplate,p,d->payload_len); templateLength=d->payload_len;
+    setProperty("MTKAWDLNativeTemplateLength",static_cast<uint64_t>(templateLength),32);
+    return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::getAWDL_AF_SECONDARY_PAYLOAD_CAPABILITIES(apple80211_awdl_cap *d)
+{
+    if(!d) return kIOReturnBadArgument;
+    *d={APPLE80211_VERSION,0}; // secondary payload is not implemented
+    return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::getAWDL_DEVICE_CAPABILITIES(apple80211_awdl_device_capabilities *d)
+{
+    if(!d) return kIOReturnBadArgument;
+    *d={APPLE80211_VERSION,0,10,hal->awdlPeerCapacity(),mtkawdl::slots};
+    return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::getAWDL_ELECTION_PARAMS(apple80211_awdl_election_params *d)
+{
+    if(!d) return kIOReturnBadArgument;
+    bzero(d,sizeof(*d)); d->version=APPLE80211_VERSION;
+    d->election_id=electionId.election_id; d->distance=state.distance;
+    memcpy(d->master,state.master,6); d->master_metric=state.masterMetric;
+    d->self_metric=state.metric; return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::setAWDL_ELECTION_PARAMS(apple80211_awdl_election_params *d)
+{
+    if(!d || d->version>APPLE80211_VERSION || d->distance>10 || !mtkawdl::unicast(d->master)) return kIOReturnBadArgument;
+    // The host election engine supplies these values. RF synchronization is
+    // still learned from a received master frame, never guessed from an ioctl.
+    electionId.election_id=d->election_id; state.metric=d->self_metric;
+    if(!memcmp(d->master,state.mac,6)) {
+        if(d->distance) return kIOReturnBadArgument;
+        state.setSyncRole(syncParams.non_election_master ? 3 : 1,state.mac);
+    } else {
+        // Select a received candidate carrying this elected master. Never
+        // fabricate its AW clock when the host request arrives first.
+        const uint8_t *candidate=d->master;
+        for(unsigned i=0;i<mtkawdl::maxPeers;++i)
+            if(state.peers[i].used && !memcmp(state.peers[i].advertisement.master,d->master,6)) {
+                candidate=state.peers[i].mac; break;
+            }
+        state.setSyncRole(2,candidate);
+    }
+    state.elect(awdlNow()); return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::setPEER_CACHE_CONTROL(apple80211_peer_cache_control *d)
+{
+    if(!d || stopping || !enabled) return kIOReturnNotReady;
+    // Tahoe supplies a 0x1d0-byte request. Only the independently verified
+    // version/op/address prefix is needed for our raw, unencrypted peer path.
+    auto p=reinterpret_cast<uint8_t *>(d);
+    uint32_t version=mtkawdl::le32(p), operation=mtkawdl::le32(p+4);
+    if(version>APPLE80211_VERSION || !mtkawdl::unicast(p+8)) return kIOReturnBadArgument;
+    if(operation!=0 && operation!=2 && operation!=6) return kIOReturnUnsupported;
+    uint8_t address[6]; memcpy(address,p+8,6);
+    retain();
+    IOReturn status=hal->awdlPeer(address,operation!=2);
+    if(status!=kIOReturnSuccess || stopping || !enabled) {
+        if(status==kIOReturnSuccess) status=kIOReturnNotReady;
+        release(); return status;
+    }
+    uint8_t completion[0x1d0]={}; mtkawdl::put32(completion,APPLE80211_VERSION);
+    mtkawdl::put32(completion+4,operation==2 ? 3 : 1); memcpy(completion+8,address,6);
+    awdlControllerMessage(owner,this,0x33,completion,sizeof(completion),true);
+    release(); return kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::setAWDL_PEER_TRAFFIC_REGISTRATION(apple80211_awdl_peer_traffic_registration *d)
+{
+    if(!d || d->version>APPLE80211_VERSION || d->active>1 || d->name_len>sizeof(d->name) ||
+       (d->active && !mtkawdl::unicast(d->addr))) return kIOReturnBadArgument;
+    memcpy(trafficPeer,d->addr,6); trafficActive=d->active;
+    // Expedite queued traffic during an active Continuity session.
+    if(enabled && trafficActive) timer->setTimeoutMS(1);
+    return kIOReturnSuccess;
+}
+#endif

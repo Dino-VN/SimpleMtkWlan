@@ -29,6 +29,7 @@
  */
 
 #include "MtkMwx.hpp"
+#include <AWDL/AwdlProtocol.hpp>
 
 #include <linux/kernel.h>
 #include <linux/types.h>
@@ -404,8 +405,29 @@ struct mwx_ba_task_arg {
 };
 
 struct mwx_softc {
-	struct device		sc_dev;
-	struct ieee80211com	sc_ic;
+    struct device sc_dev;
+    struct ieee80211com sc_ic;
+    struct mwx_vif sc_awdl_vif;
+    struct mwx_node sc_awdl_peers[3];
+    bool sc_awdl_peer_used[3];
+    // A station can exist in firmware after its BSS/device is removed, or
+    // after a failed reply. Keep ownership until a disconnect is acknowledged.
+    bool sc_awdl_station_pending[4];
+    mtkawdl::Reservation sc_awdl_roc;
+    uint64_t sc_awdl_roc_events, sc_awdl_roc_grants, sc_awdl_roc_rejected;
+    uint64_t sc_awdl_roc_submitted, sc_awdl_roc_send_failed;
+    uint64_t sc_awdl_roc_scan_blocked, sc_awdl_roc_busy_blocked;
+    void *sc_awdl_context;
+    MtkMwx::AwdlReceive sc_awdl_receive;
+    uint8_t sc_awdl_address[6];
+    bool sc_awdl_enabled, sc_awdl_configured, sc_awdl_filter_active;
+    uint32_t sc_awdl_filter;
+    IOLock *sc_awdl_lock;
+    uint32_t sc_awdl_epoch;
+    bool sc_awdl_busy, sc_awdl_stopping;
+    unsigned sc_awdl_calls;
+    uint8_t sc_awdl_channel;
+    uint64_t sc_awdl_token_used[256];
 
 	enum mwx_hw_type	sc_hwtype;
 
@@ -661,6 +683,9 @@ pkt_hex_dump(struct mbuf *m)
 
 int	mwx_init(struct ifnet *);
 void	mwx_stop(struct ifnet *);
+static void mwx_awdl_quiesce(struct mwx_softc *, bool drainCalls=true);
+static bool mwx_awdl_current(struct mwx_softc *, uint32_t);
+static int mwx_awdl_remove_context(struct mwx_softc *, uint32_t);
 void	mwx_watchdog(struct ifnet *);
 void	mwx_start(struct ifnet *);
 int	mwx_ioctl(struct ifnet *, u_long, caddr_t);
@@ -731,6 +756,7 @@ void	mwx_mcu_set_len(struct mbuf *, void *);
 int	mwx_mcu_send_mbuf(struct mwx_softc *, uint32_t, struct mbuf *, int *);
 int	mwx_mcu_send_msg(struct mwx_softc *, uint32_t, void *, size_t, int *);
 int	mwx_mcu_send_wait(struct mwx_softc *, uint32_t, void *, size_t);
+static int mwx_send_assoc_status(struct mwx_softc *, uint32_t, void *, size_t);
 int	mwx_mcu_send_mbuf_wait(struct mwx_softc *, uint32_t, struct mbuf *);
 void	mwx_mcu_rx_event(struct mwx_softc *, struct mbuf *);
 int	mwx_mcu_wait_resp_int(struct mwx_softc *, uint32_t, int, uint32_t *);
@@ -802,6 +828,7 @@ void		mwx_mac_tx_free(struct mwx_softc *, struct mbuf *);
 int		mt7921_set_channel(struct mwx_softc *);
 int mt7921_mcu_set_associated_bss(struct mwx_softc *, int);
 int mt7921_mcu_set_associated_peer(struct mwx_softc *);
+static int mwx_send_assoc_status(struct mwx_softc *, uint32_t, void *, size_t);
 void		mwx_apply_phy_knobs(struct mwx_softc *);
 void		mwx_set_bss_bw(struct mwx_softc *, struct ieee80211_node *);
 int		mwx_ampdu_rx_start(struct ieee80211com *,
@@ -1068,6 +1095,11 @@ mwx_init_running(struct ifnet *ifp)
 	MWX_DEV_LOG(sc, "init rxfilter set 0x%08x\n", sc->sc_rxfilter);
 
 	ifp->if_flags |= IFF_RUNNING;
+    if (sc->sc_awdl_lock) {
+        IOLockLock(sc->sc_awdl_lock);
+        sc->sc_awdl_stopping = false;
+        IOLockUnlock(sc->sc_awdl_lock);
+    }
 	ifq_clr_oactive(&ifp->if_snd);
 	MWX_DEV_LOG(sc, "init interface running flags=0x%x\n", ifp->if_flags);
 	sc->sc_dma_stall_logged = 0;
@@ -1101,6 +1133,10 @@ mwx_stop(struct ifnet *ifp)
 	int s = splnet();
 	int was_running = (ifp->if_flags & IFF_RUNNING) != 0;
 
+    // MCU waits release the workloop gate. Invalidate and drain AWDL work
+    // before removing the firmware context or reclaiming its TX entries.
+    mwx_awdl_quiesce(sc);
+
 	DPRINTF("%s: stop\n", DEVNAME(sc));
 
 	/* Cancel scheduled tasks and let any stale tasks finish up. */
@@ -1123,6 +1159,10 @@ mwx_stop(struct ifnet *ifp)
 
 	if (was_running) {
 		struct mwx_node *mn;
+        if (sc->sc_awdl_configured) {
+            mwx_awdl_remove_context(sc,sc->sc_awdl_epoch);
+        }
+        sc->sc_awdl_filter_active=false;
 
 		free(sc->sc_bgscan_arg, M_DEVBUF, sc->sc_bgscan_arg_size);
 		sc->sc_bgscan_arg = NULL;
@@ -1868,6 +1908,13 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
 		return;
 	}
 
+    if (sc->sc_awdl_enabled && sc->sc_awdl_receive &&
+        mbuf_len(m) >= 24 && !memcmp(mtod(m, uint8_t *)+16, mtkawdl::bssid, 6)) {
+        sc->sc_awdl_receive(sc->sc_awdl_context, mtod(m, const uint8_t *),
+            mbuf_len(m), rxi.rxi_chan, rxi.rxi_rssi);
+        m_freem(m);
+        return;
+    }
 	wh = mtod(m, struct ieee80211_frame *);
 	if (sc->sc_rx_delivered < 32) {
 		uint8_t type = wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK;
@@ -2178,6 +2225,8 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 		printf("%s: can't allocate TX queue lock\n", DEVNAME(sc));
 		return false;
 	}
+    sc->sc_awdl_lock = IOLockAlloc();
+    if (!sc->sc_awdl_lock) return false;
 	sc->sc_pc = pa->pa_pc;
 	sc->sc_tag = pa->pa_tag;
 	sc->sc_dmat = pa->pa_dmat;
@@ -3267,8 +3316,9 @@ mwx_dma_tx_cleanup(struct mwx_softc *sc, struct mwx_queue *q)
 	IOLockLock(mwx_txq_lock);
 	wake = mwx_dma_tx_cleanup_locked(sc, q);
 	IOLockUnlock(mwx_txq_lock);
-	if (wake)
-		wakeup(q);
+	if (wake) {
+        if(gMwxHal) gMwxHal->mwxWakeup(q); else wakeup(q);
+    }
 }
 
 void
@@ -3563,7 +3613,7 @@ mwx_mcu_send_mbuf(struct mwx_softc *sc, uint32_t cmd, struct mbuf *m, int *seqp)
 	if (cmd & MCU_CMD_FIELD_UNI) {
 		uni_txd = (struct mwx_uni_txd *)txd;
 		uni_txd->len = htole16(tot_len - sizeof(uni_txd->txd));
-		uni_txd->option = MCU_CMD_UNI_EXT_ACK;
+		uni_txd->option = seqp ? MCU_CMD_UNI_EXT_ACK : (MCU_CMD_UNI | MCU_CMD_QUERY);
 		uni_txd->cid = htole16(mcu_cmd);
 		uni_txd->s2d_index = CMD_S2D_IDX_H2N;
 		uni_txd->pkt_type = MCU_PKT_ID;
@@ -3613,10 +3663,14 @@ enqueue:
 	}
 
 	s = splnet();
+	unsigned ringWaits=0;
 	while (1) {
 		rv = mwx_dma_tx_enqueue(sc, q, m);
 		if (rv != EBUSY)
 			break;
+        // Teardown must be able to drain an AWDL MCU operation even when
+        // firmware has stopped advancing the command ring.
+        if(++ringWaits>=30) { rv=EWOULDBLOCK; break; }
 		mwx_ebusy_sleeps++;
 		q->mq_wakeme = 1;
 		tsleep_nsec(q, 0, "mwxq", MSEC_TO_NSEC(100));
@@ -3674,7 +3728,7 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 {
 	struct mwx_mcu_rxd *rxd;
 	uint32_t cmd, mcu_int = 0;
-	uint8_t rxd_eid, rxd_ext_eid, rxd_seq;
+	uint8_t rxd_eid, rxd_ext_eid, rxd_seq, rxd_option;
 	int len, rxd_size;
 
 	rxd_size = MT7921_MCU_RXD_SIZE;
@@ -3700,9 +3754,27 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 	rxd_eid = rxd->eid;
 	rxd_ext_eid = rxd->ext_eid;
 	rxd_seq = rxd->seq;
+    rxd_option = rxd->option;
 	m_adj(m, sizeof(*rxd));
 	sc->sc_mcu_events++;
 	sc->sc_last_mcu_eid = rxd_eid;
+    if ((rxd_option & MCU_UNI_CMD_UNSOLICITED_EVENT) && rxd_eid == MCU_UNI_EVENT_ROC) {
+        // Unified event header (4 bytes), then a 20-byte grant TLV.
+        const uint8_t *p=mtod(m,const uint8_t *);
+        if(sc->sc_awdl_lock) {
+            uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+            IOLockLock(sc->sc_awdl_lock);
+            ++sc->sc_awdl_roc_events;
+            // Linux v6.17 mt7921_roc_grant_tlv: 20-byte TLV; ROC reqtype=1.
+            bool accepted=mbuf_len(m)>=24 && mtkawdl::le16(p+4)==0 &&
+                mtkawdl::le16(p+6)==20 && p[8]==sc->sc_awdl_vif.idx && p[10]==0 && p[17]==1 &&
+                sc->sc_awdl_enabled && !sc->sc_awdl_stopping && !sc->sc_resetting && !sc->sc_detaching &&
+                sc->sc_awdl_roc.grant(p[9],p[11],mtkawdl::le32(p+20),ns/1000);
+            if(accepted) ++sc->sc_awdl_roc_grants; else ++sc->sc_awdl_roc_rejected;
+            IOLockUnlock(sc->sc_awdl_lock);
+        }
+        m_freem(m); return;
+    }
 
 	switch (rxd_eid) {
 	case MCU_EVENT_SCHED_SCAN_DONE:
@@ -3780,7 +3852,8 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 		sc->sc_mcu_wait[rxd_seq].mcu_int = mcu_int;
 		sc->sc_mcu_wait[rxd_seq].mcu_m = m;
 		sc->sc_mcu_wait[rxd_seq].mcu_done = 1;
-		wakeup(&sc->sc_mcu_wait[rxd_seq]);
+        if(gMwxHal) gMwxHal->mwxWakeup(&sc->sc_mcu_wait[rxd_seq]);
+        else wakeup(&sc->sc_mcu_wait[rxd_seq]);
 		return;
 	}
 
@@ -5238,6 +5311,13 @@ mwx_fullreset_task(void *arg)
 	/* Channel/media setup from preinit stays valid; only redo hardware. */
 	rv = mwx_init_hardware(sc);
 	MWX_DEV_LOG(sc, "full reset hardware init rv=%d\n", rv);
+	if(rv==0) {
+        // Reloading firmware destroys every old station, including entries
+        // whose disconnect response failed before the hardware reset.
+        memset(sc->sc_awdl_station_pending,0,sizeof(sc->sc_awdl_station_pending));
+        memset(sc->sc_awdl_peer_used,0,sizeof(sc->sc_awdl_peer_used));
+        sc->sc_awdl_configured=false;
+    }
 	sc->sc_resetting = 0;
 	if (rv == 0 && (ifp->if_flags & IFF_UP))
 		rv = mwx_init(ifp);
@@ -5774,8 +5854,18 @@ mt7921_mcu_uni_add_dev(struct mwx_softc *sc, struct mwx_vif *mvif,
 	};
 	int rv, idx, cmd, len;
 	void *data;
+    const uint32_t awdlEpoch = sc->sc_awdl_epoch;
 
-	switch (sc->sc_ic.ic_opmode) {
+	if (mvif == &sc->sc_awdl_vif) {
+        // MT7921 firmware rejects the IBSS BSS (0xc00000bb on this card).
+        // A P2P GO context supplies the separate raw-frame transport; the
+        // host AWDL scheduler provides action frames rather than GO beacons.
+        basic_req.basic.conn_type = htole32(STA_TYPE_AP | NETWORK_P2P);
+        memcpy(basic_req.basic.bssid, mtkawdl::bssid, 6);
+        basic_req.basic.conn_state = 0;
+        basic_req.basic.phymode = (1U << 1) | (1U << 2);
+        basic_req.basic.nonht_basic_phy = htole16(PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP);
+    } else switch (sc->sc_ic.ic_opmode) {
 	case IEEE80211_M_MONITOR:
 #ifndef IEEE80211_STA_ONLY
 	case IEEE80211_M_HOSTAP:
@@ -5800,7 +5890,8 @@ mt7921_mcu_uni_add_dev(struct mwx_softc *sc, struct mwx_vif *mvif,
 	idx = mvif->omac_idx > EXT_BSSID_START ? HW_BSSID_0 : mvif->omac_idx;
 	basic_req.basic.hw_bss_idx = idx;
 
-	memcpy(dev_req.tlv.omac_addr, sc->sc_ic.ic_myaddr, ETHER_ADDR_LEN);
+	memcpy(dev_req.tlv.omac_addr, mvif == &sc->sc_awdl_vif ?
+        sc->sc_awdl_address : sc->sc_ic.ic_myaddr, ETHER_ADDR_LEN);
 
 	if (enable) {
 		cmd = MCU_UNI_CMD_DEV_INFO_UPDATE;
@@ -5813,9 +5904,12 @@ mt7921_mcu_uni_add_dev(struct mwx_softc *sc, struct mwx_vif *mvif,
 	}
 
 printf("%s: %s cmd %x mvif idx %d omac %d band %d wmm %d\n", DEVNAME(sc), __func__, cmd, mvif->idx, mvif->omac_idx, mvif->band_idx, mvif->wmm_idx);
-	rv = mwx_mcu_send_wait(sc, cmd, data, len);
-	if (rv < 0)
+	rv = mvif == &sc->sc_awdl_vif ? mwx_send_assoc_status(sc,cmd,data,len) :
+        mwx_mcu_send_wait(sc, cmd, data, len);
+	if (rv != 0)
 		return rv;
+    if (mvif == &sc->sc_awdl_vif && sc->sc_awdl_epoch != awdlEpoch)
+        return ECANCELED;
 
 	if (enable) {
 		cmd = MCU_UNI_CMD_BSS_INFO_UPDATE;
@@ -5828,7 +5922,8 @@ printf("%s: %s cmd %x mvif idx %d omac %d band %d wmm %d\n", DEVNAME(sc), __func
 	}
 
 printf("%s: %s cmd %x wcid %d\n", DEVNAME(sc), __func__, cmd, mn->wcid);
-	return mwx_mcu_send_wait(sc, cmd, data, len);
+return mvif == &sc->sc_awdl_vif ? mwx_send_assoc_status(sc,cmd,data,len) :
+        mwx_mcu_send_wait(sc, cmd, data, len);
 }
 
 int
@@ -6550,7 +6645,12 @@ mt7921_mac_write_txwi_80211(struct mwx_softc *sc, struct mbuf *m,
 		/* hardware won't add HTC for mgmt/ctrl frame */
 		val |= htole32(MT_TXD2_HTC_VLD);
 
-		rate = mt7921_mac_tx_rate_val(sc);
+		if (ni == &sc->sc_awdl_vif.vif_mn.ni ||
+            ni == &sc->sc_awdl_peers[0].ni || ni == &sc->sc_awdl_peers[1].ni ||
+            ni == &sc->sc_awdl_peers[2].ni) {
+            uint32_t hw=mt76_rates[4].hw_value;
+            rate=(hw & 0xff) | ((hw>>8)<<MT_TX_RATE_MODE_SHIFT);
+        } else rate = mt7921_mac_tx_rate_val(sc);
 
 		val6 = MT_TXD6_FIXED_BW;
 		val6 |= (rate << MT_TXD6_TX_RATE_SHIFT) & MT_TXD6_TX_RATE_MASK;
@@ -6653,9 +6753,13 @@ mt7921_mac_write_txwi(struct mwx_softc *sc, struct mbuf *m,
 	    !IEEE80211_IS_MULTICAST(wh->i_addr1) &&
 	    ratecheck(&sc->sc_txs_last, &txs_interval))
 		pid = MT_PACKET_ID_FIRST;
-	omac_idx = sc->sc_vif.omac_idx << MT_TXD1_OWN_MAC_SHIFT;
-	wmm_idx = sc->sc_vif.wmm_idx;
-	band_idx = sc->sc_vif.band_idx;
+    const bool awdl = ni == &sc->sc_awdl_vif.vif_mn.ni ||
+        ni == &sc->sc_awdl_peers[0].ni || ni == &sc->sc_awdl_peers[1].ni ||
+        ni == &sc->sc_awdl_peers[2].ni;
+    const mwx_vif *vif = awdl ? &sc->sc_awdl_vif : &sc->sc_vif;
+	omac_idx = vif->omac_idx << MT_TXD1_OWN_MAC_SHIFT;
+	wmm_idx = vif->wmm_idx;
+	band_idx = vif->band_idx;
 
 	if (qid >= MT_TXQ_PSD) {
 		p_fmt = MT_TX_TYPE_CT;
@@ -6716,6 +6820,18 @@ mt7921_mac_write_txwi(struct mwx_softc *sc, struct mbuf *m,
 	else
 #endif
 		mt7921_mac_write_txwi_80211(sc, m, ni, txp);
+    if (awdl) {
+        // AWDL starts with legacy OFDM at 6 Mbps on either band. Keep the
+        // supplied sequence number and never use the infrastructure key/RA.
+        const uint32_t hw=mt76_rates[4].hw_value;
+        const uint32_t rate=(hw & 0xff) | ((hw>>8)<<MT_TX_RATE_MODE_SHIFT);
+        txp->txwi[2] |= htole32(MT_TXD2_FIX_RATE);
+        txp->txwi[6] = htole32(MT_TXD6_FIXED_BW |
+            ((rate<<MT_TXD6_TX_RATE_SHIFT)&MT_TXD6_TX_RATE_MASK));
+        txp->txwi[3] |= htole32(MT_TXD3_BA_DISABLE | MT_TXD3_SN_VALID |
+            (((mtkawdl::le16((uint8_t *)wh+22)>>4)<<16)&MT_TXD3_SEQ));
+        if (IEEE80211_IS_MULTICAST(wh->i_addr1)) txp->txwi[3] |= htole32(MT_TXD3_NO_ACK);
+    }
 }
 
 void
@@ -7522,6 +7638,7 @@ MtkMwx::detach(IOPCIDevice *device)
     }
     struct ifnet *ifp = &com->sc_ic.ic_if;
     com->sc_detaching = true;
+    mwx_awdl_quiesce(com);
     timeout_del(&com->sc_reset_to);
     timeout_del(&com->sc_scan_to);
     timeout_del(&com->sc_dma_to);
@@ -7643,6 +7760,15 @@ int
 MtkMwx::mwxSleepNsec(void *ident, int priority, const char *wmesg,
     uint64_t timo)
 {
+    // Native AWDL requests arrive with the controller gate held. msleep
+    // would retain that gate and block the interrupt delivering the reply.
+    if (getMainWorkLoop() && getMainWorkLoop()->inGate() && getMainCommandGate()) {
+        AbsoluteTime deadline;
+        clock_interval_to_deadline((uint32_t)MIN(timo,UINT32_MAX), kNanosecondScale,
+            reinterpret_cast<uint64_t *>(&deadline));
+        IOReturn result = getMainCommandGate()->commandSleep(ident, deadline, THREAD_UNINT);
+        return result == THREAD_AWAKENED ? 0 : EWOULDBLOCK;
+    }
 	return MtkHalService::tsleep_nsec(ident, priority, wmesg, timo);
 }
 
@@ -7650,6 +7776,8 @@ void
 MtkMwx::mwxWakeup(void *ident)
 {
 	wakeupOn(ident);
+    // Wake native commandSleep and the ordinary HAL msleep callers.
+    if(getMainCommandGate()) getMainCommandGate()->commandWakeup(ident,false);
 }
 
 const char *
@@ -7882,6 +8010,8 @@ MtkMwx::releaseAll()
 {
 	MWX_LOG("HAL releaseAll com=%p pci=%p\n", (void *)com, (void *)pci);
 	if (com) {
+        mwx_awdl_quiesce(com);
+        if (com->sc_awdl_lock) IOLockFree(com->sc_awdl_lock);
 		mwx_free_mem(com);
 		com = NULL;
 	}
@@ -8371,4 +8501,571 @@ mwx_ba_task(void *arg)
 	}
 
 	splx(s);
+}
+
+// AWDL firmware boundary. All operations run on the same gate as DMA/MCU.
+static uint64_t mwx_awdl_now()
+{
+    uint64_t ns;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+    return ns / 1000;
+}
+
+// Only one operation may own the secondary firmware context. Never hold the
+// lock across MCU waits: replies arrive on the workloop that owns the gate.
+class MwxAwdlCall {
+    mwx_softc *sc;
+public:
+    MwxAwdlCall(mwx_softc *s) : sc(NULL) {
+        if(!s || !s->sc_awdl_lock) return;
+        IOLockLock(s->sc_awdl_lock);
+        if(!s->sc_detaching && !s->sc_awdl_stopping) { ++s->sc_awdl_calls; sc=s; }
+        IOLockUnlock(s->sc_awdl_lock);
+    }
+    ~MwxAwdlCall() {
+        if(!sc) return;
+        IOLockLock(sc->sc_awdl_lock);
+        --sc->sc_awdl_calls;
+        IOLockUnlock(sc->sc_awdl_lock);
+    }
+    bool valid() const { return sc!=NULL; }
+};
+
+class MwxAwdlOperation {
+    mwx_softc *sc;
+public:
+    uint32_t epoch;
+    MwxAwdlOperation(mwx_softc *s,bool teardown=false) : sc(NULL), epoch(0) {
+        if (!s || !s->sc_awdl_lock) return;
+        IOLockLock(s->sc_awdl_lock);
+        if (!s->sc_awdl_busy && (!s->sc_awdl_stopping || teardown) && !s->sc_detaching &&
+            !s->sc_resetting && (s->sc_ic.ic_if.if_flags & IFF_RUNNING)) {
+            s->sc_awdl_busy=true; epoch=s->sc_awdl_epoch; sc=s;
+        }
+        IOLockUnlock(s->sc_awdl_lock);
+    }
+    ~MwxAwdlOperation() {
+        if (!sc) return;
+        IOLockLock(sc->sc_awdl_lock);
+        sc->sc_awdl_busy=false;
+        IOLockUnlock(sc->sc_awdl_lock);
+    }
+    bool valid() const { return sc && mwx_awdl_current(sc,epoch); }
+    bool acquired() const { return sc != NULL; }
+};
+
+static bool mwx_awdl_current(mwx_softc *sc, uint32_t epoch)
+{
+    if (!sc || !sc->sc_awdl_lock) return false;
+    IOLockLock(sc->sc_awdl_lock);
+    bool valid=sc->sc_awdl_epoch==epoch && !sc->sc_awdl_stopping &&
+        !sc->sc_detaching && !sc->sc_resetting &&
+        (sc->sc_ic.ic_if.if_flags & IFF_RUNNING);
+    IOLockUnlock(sc->sc_awdl_lock);
+    return valid;
+}
+
+static const uint32_t mwx_awdl_filter_mask=MT_WF_RFCR_DROP_OTHER_BSS |
+    MT_WF_RFCR_DROP_A3_BSSID | MT_WF_RFCR_DROP_A2_BSSID |
+    MT_WF_RFCR_DROP_OTHER_UC | MT_WF_RFCR_DROP_MCAST |
+    MT_WF_RFCR_DROP_MCAST_FILTERED;
+
+static void mwx_awdl_quiesce(mwx_softc *sc,bool drainCalls)
+{
+    if (!sc || !sc->sc_awdl_lock) return;
+    IOLockLock(sc->sc_awdl_lock);
+    ++sc->sc_awdl_epoch;
+    sc->sc_awdl_stopping=true;
+    sc->sc_awdl_enabled=false;
+    bool reserved=sc->sc_awdl_roc.pending || sc->sc_awdl_roc.granted;
+    uint8_t token=sc->sc_awdl_roc.token;
+    sc->sc_awdl_roc.cancel();
+    bool busy=sc->sc_awdl_busy || (drainCalls && sc->sc_awdl_calls);
+    IOLockUnlock(sc->sc_awdl_lock);
+    // Timed sleeps also handle completion before the wait was registered.
+    // The controller releases its gate here if teardown holds it.
+    while (busy) {
+        tsleep_nsec(&sc->sc_awdl_busy,0,"awdl-drain",MSEC_TO_NSEC(10));
+        IOLockLock(sc->sc_awdl_lock);
+        busy=sc->sc_awdl_busy || (drainCalls && sc->sc_awdl_calls);
+        IOLockUnlock(sc->sc_awdl_lock);
+    }
+    if (reserved && !sc->sc_resetting && !sc->sc_detaching &&
+        (sc->sc_ic.ic_if.if_flags & IFF_RUNNING)) {
+        uint8_t request[16]={};
+        mtkawdl::put16(request+4,1); mtkawdl::put16(request+6,12);
+        request[8]=sc->sc_awdl_vif.idx; request[9]=token; request[10]=0xff;
+        mwx_mcu_send_msg(sc,0x00020027,request,sizeof(request),NULL);
+    }
+    memset(sc->sc_awdl_peer_used,0,sizeof(sc->sc_awdl_peer_used));
+    sc->sc_awdl_channel=0;
+}
+
+// The unified RLM TLV configures the secondary BSS for a legacy 20 MHz
+// channel before firmware may grant a remain-on-channel interval.
+static int mwx_awdl_set_channel(mwx_softc *sc,uint8_t chan,uint32_t epoch)
+{
+    struct {
+        uint8_t bss_idx,pad[3];
+        struct {
+            uint16_t tag,len;
+            uint8_t control_channel,center_chan,center_chan2,bw;
+            uint8_t tx_streams,rx_streams,short_st,ht_op_info;
+            uint8_t sco,band,pad[2];
+        } __packed rlm;
+    } __packed req={};
+    req.bss_idx=sc->sc_awdl_vif.idx;
+    req.rlm.tag=htole16(UNI_BSS_INFO_RLM);
+    req.rlm.len=htole16(sizeof(req.rlm));
+    req.rlm.control_channel=req.rlm.center_chan=chan;
+    req.rlm.bw=CMD_CBW_20MHZ;
+    req.rlm.tx_streams=sc->sc_capa.num_streams;
+    req.rlm.rx_streams=sc->sc_capa.antenna_mask;
+    req.rlm.short_st=1;
+    req.rlm.band=chan<=14 ? 0 : 1;
+    int rv=mwx_send_assoc_status(sc,MCU_UNI_CMD_BSS_INFO_UPDATE,&req,sizeof(req));
+    if (!mwx_awdl_current(sc,epoch)) return ECANCELED;
+    if (!rv) {
+        IOLockLock(sc->sc_awdl_lock);
+        if(sc->sc_awdl_epoch==epoch && !sc->sc_awdl_stopping) sc->sc_awdl_channel=chan;
+        else rv=ECANCELED;
+        IOLockUnlock(sc->sc_awdl_lock);
+    }
+    return rv;
+}
+
+void MtkMwx::awdlSetReceiver(void *context, AwdlReceive receiver)
+{
+    if (!com) return;
+    com->sc_awdl_context=context;
+    com->sc_awdl_receive=receiver;
+}
+
+bool MtkMwx::awdlChannelAllowed(uint8_t channel)
+{
+    if (!com || !channel || channel>165) return false;
+    const ieee80211_channel *c=&com->sc_ic.ic_channels[channel];
+    return isset(com->sc_ic.ic_chan_active,channel) &&
+        isset(com->sc_ic.ic_chan_avail,channel) && c->ic_freq && c->ic_flags &&
+        (IEEE80211_IS_CHAN_2GHZ(c) || IEEE80211_IS_CHAN_5GHZ(c)) &&
+        !(c->ic_flags & (IEEE80211_CHAN_PASSIVE | IEEE80211_CHAN_DFS));
+}
+
+static void mwx_awdl_abort(mwx_softc *sc)
+{
+    IOLockLock(sc->sc_awdl_lock);
+    bool reserved=sc->sc_awdl_roc.pending || sc->sc_awdl_roc.granted;
+    uint8_t token=sc->sc_awdl_roc.token;
+    sc->sc_awdl_roc.cancel();
+    IOLockUnlock(sc->sc_awdl_lock);
+    if (reserved) {
+        uint8_t request[16]={};
+        mtkawdl::put16(request+4,1); mtkawdl::put16(request+6,12);
+        request[8]=sc->sc_awdl_vif.idx; request[9]=token;
+        request[10]=0xff;
+        mwx_mcu_send_msg(sc,0x00020027,request,sizeof(request),NULL);
+    }
+}
+
+void MtkMwx::awdlAbort()
+{
+    MwxAwdlCall call(com);
+    if(!call.valid()) return;
+    MwxAwdlOperation operation(com);
+    if(operation.valid()) mwx_awdl_abort(com);
+}
+
+static int mwx_awdl_remove_station(mwx_softc *sc,uint32_t epoch,unsigned index)
+{
+    if(!sc->sc_awdl_station_pending[index]) return 0;
+    uint16_t wcid=MWX_WTBL_STA+index;
+    mbuf_t m=mwx_alloc_sta_req_tlv(sizeof(sta_req_hdr));
+    if(!m) return ENOBUFS;
+    uint16_t count=0;
+    auto basic=(sta_rec_basic *)mwx_append_tlv(m,&count,STA_REC_BASIC,sizeof(sta_rec_basic));
+    basic->conn_type=htole32(index==3 ? STA_TYPE_BC | NETWORK_INFRA : STA_TYPE_STA | NETWORK_P2P);
+    basic->conn_state=CONN_STATE_DISCONNECT;
+    basic->extra_info=htole16(EXTRA_INFO_VER);
+    if(index==3) memset(basic->peer_addr,0xff,6);
+    else memcpy(basic->peer_addr,sc->sc_awdl_peers[index].ni.ni_macaddr,6);
+    auto wtbl=(sta_rec_wtbl *)mwx_append_tlv(m,&count,STA_REC_WTBL,sizeof(sta_rec_wtbl));
+    wtbl->wlan_idx_lo=wcid; wtbl->operation=WTBL_RESET_AND_SET;
+    m=mwx_fill_sta_req_hdr(m,&sc->sc_awdl_vif,sc->sc_awdl_vif.omac_idx,wcid,count);
+    int seq=0; uint32_t status=0;
+    int rv=m ? mwx_mcu_send_mbuf(sc,MCU_UNI_CMD_STA_REC_UPDATE,m,&seq) : ENOBUFS;
+    if(sc->sc_awdl_epoch!=epoch) return ECANCELED;
+    if(!rv) rv=mwx_mcu_wait_resp_int(sc,MCU_UNI_CMD_STA_REC_UPDATE,seq,&status);
+    MWX_DEV_LOG(sc,"AWDL remove station WCID=%u transport=%d firmware=%u\n",wcid,rv,status);
+    if(sc->sc_awdl_epoch!=epoch) return ECANCELED;
+    if(rv || status) return rv ? rv : EIO;
+    sc->sc_awdl_station_pending[index]=false;
+    if(index<3) sc->sc_awdl_peer_used[index]=false;
+    return 0;
+}
+
+static int mwx_awdl_remove_context(mwx_softc *sc,uint32_t epoch)
+{
+    // V9's first broadcast add succeeds, but re-add returns 0x10003.
+    // Explicitly disconnect owned WCIDs before removing the BSS/OMAC. Match
+    // the primary STA teardown; deleting DEV_INFO alone is not STA teardown.
+    for(unsigned i=0;i<4;++i) {
+        int rv=mwx_awdl_remove_station(sc,epoch,i);
+        if(rv) return rv;
+    }
+    if(!sc->sc_awdl_configured) return 0;
+    int rv=mt7921_mcu_uni_add_dev(sc,&sc->sc_awdl_vif,&sc->sc_awdl_vif.vif_mn,0);
+    if(sc->sc_awdl_epoch!=epoch) return ECANCELED;
+    if(!rv) sc->sc_awdl_configured=false;
+    return rv;
+}
+
+IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable)
+{
+    mwx_softc *sc=com;
+    if (!sc || !sc->sc_awdl_lock) return kIOReturnNotReady;
+    MwxAwdlCall call(sc);
+    if(!call.valid()) return enable ? kIOReturnNotReady : kIOReturnSuccess;
+    if (!enable) {
+        // This call participates in the outer stop/detach drain; its own
+        // disable only waits for firmware ownership, avoiding self-deadlock.
+        mwx_awdl_quiesce(sc,false);
+        bool running=!sc->sc_detaching && !sc->sc_resetting &&
+            (sc->sc_ic.ic_if.if_flags & IFF_RUNNING);
+        MwxAwdlOperation cleanup(sc,true);
+        if(running && !cleanup.acquired()) return kIOReturnBusy;
+        int rv=0;
+        if(running && sc->sc_awdl_configured) {
+            // Restore only the filter bits this context changed; preserve
+            // unrelated filter updates made while AWDL was enabled.
+            if(sc->sc_awdl_filter_active) {
+                mwx_rmw(sc,MT_WF_RFCR(0),sc->sc_awdl_filter,mwx_awdl_filter_mask);
+                sc->sc_awdl_filter_active=false;
+            }
+            rv=mwx_awdl_remove_context(sc,cleanup.epoch);
+        }
+        if(cleanup.acquired() && sc->sc_awdl_epoch!=cleanup.epoch)
+            return kIOReturnAborted;
+        IOLockLock(sc->sc_awdl_lock);
+        if(cleanup.acquired() && sc->sc_awdl_epoch!=cleanup.epoch) {
+            IOLockUnlock(sc->sc_awdl_lock); return kIOReturnAborted;
+        }
+        if(running && !sc->sc_detaching && !sc->sc_resetting) sc->sc_awdl_stopping=false;
+        IOLockUnlock(sc->sc_awdl_lock);
+        return rv ? kIOReturnIOError : kIOReturnSuccess;
+    }
+    if (!address || !mtkawdl::unicast(address)) return kIOReturnBadArgument;
+    // A duplicate native enable does not change firmware state. It must not
+    // fail merely because a ROC/peer command currently owns the MCU context.
+    IOLockLock(sc->sc_awdl_lock);
+    bool alreadyEnabled=sc->sc_awdl_enabled && !sc->sc_awdl_stopping &&
+        !sc->sc_detaching && !sc->sc_resetting &&
+        (sc->sc_ic.ic_if.if_flags & IFF_RUNNING);
+    bool sameAddress=!memcmp(address,sc->sc_awdl_address,6);
+    IOLockUnlock(sc->sc_awdl_lock);
+    if(alreadyEnabled) return sameAddress ? kIOReturnSuccess : kIOReturnBusy;
+    MwxAwdlOperation operation(sc);
+    if (!operation.valid()) {
+        MWX_DEV_LOG(sc,"AWDL enable blocked busy=%d stopping=%d reset=%d running=%d\n",
+                    sc->sc_awdl_busy,sc->sc_awdl_stopping,sc->sc_resetting,
+                    !!(sc->sc_ic.ic_if.if_flags & IFF_RUNNING));
+        return kIOReturnNotReady;
+    }
+    if(sc->sc_awdl_enabled) return !memcmp(address,sc->sc_awdl_address,6) ?
+        kIOReturnSuccess : kIOReturnBusy;
+    // A failed partial enable must be removed before retrying the same OMAC.
+    if(sc->sc_awdl_configured) {
+        int rv=mwx_awdl_remove_context(sc,operation.epoch);
+        if(!operation.valid()) return kIOReturnAborted;
+        if(rv) return kIOReturnIOError;
+    }
+    mwx_vif &v=sc->sc_awdl_vif;
+    memset(&v,0,sizeof(v)); v.idx=1; v.omac_idx=1; v.wmm_idx=1;
+    memset(sc->sc_awdl_peer_used,0,sizeof(sc->sc_awdl_peer_used));
+    v.vif_mn.wcid=MWX_WTBL_RESERVED-1;
+    memcpy(sc->sc_awdl_address,address,6);
+    mwx_mac_wtbl_update(sc,v.vif_mn.wcid);
+    // Remember a partial context even if teardown interrupts a later wait.
+    sc->sc_awdl_configured=true;
+    mwxController()->setProperty("MTKAWDLFirmwareStage","device-bss");
+    int rv=mt7921_mcu_uni_add_dev(sc,&v,&v.vif_mn,1);
+    mwxController()->setProperty("MTKAWDLFirmwareTransportStatus",static_cast<uint64_t>(rv),32);
+    MWX_DEV_LOG(sc,"AWDL enable device-bss result=%d\n",rv);
+    if(!operation.valid()) return kIOReturnAborted;
+    if(rv) return kIOReturnIOError;
+    // A separate multicast/legacy TX entry; no infrastructure encryption or
+    // header translation. Firmware owns ACK/retries on the raw 802.11 frame.
+    mbuf_t m=mwx_alloc_sta_req_tlv(sizeof(sta_req_hdr));
+    if(!m) { mwx_awdl_remove_context(sc,operation.epoch); return kIOReturnNoMemory; }
+    uint16_t count=0;
+    sta_rec_basic *basic=(sta_rec_basic *)mwx_append_tlv(m,&count,STA_REC_BASIC,sizeof(*basic));
+    // MT76's broadcast station record always uses CONNECTION_INFRA_BC,
+    // including an IBSS BSS; BC|IBSS is not a firmware connection type.
+    basic->conn_type=htole32(STA_TYPE_BC | NETWORK_INFRA);
+    basic->conn_state=CONN_STATE_PORT_SECURE;
+    basic->extra_info=htole16(EXTRA_INFO_VER | EXTRA_INFO_NEW);
+    memset(basic->peer_addr,0xff,6);
+    sta_rec_wtbl *wtbl=(sta_rec_wtbl *)mwx_append_tlv(m,&count,STA_REC_WTBL,sizeof(*wtbl));
+    wtbl->wlan_idx_lo=v.vif_mn.wcid; wtbl->operation=WTBL_RESET_AND_SET;
+    uint16_t wcount=0;
+    wtbl_generic *generic=(wtbl_generic *)mwx_append_tlv(m,&wcount,WTBL_GENERIC,sizeof(*generic));
+    memset(generic->peer_addr,0xff,6); generic->muar_idx=0xe;
+    wtbl_rx *rx=(wtbl_rx *)mwx_append_tlv(m,&wcount,WTBL_RX,sizeof(*rx));
+    rx->rca1=rx->rca2=rx->rv=1;
+    wtbl->tlv_num=htole16(wcount);
+    wtbl->len=htole16(sizeof(*wtbl)+sizeof(*generic)+sizeof(*rx));
+    m=mwx_fill_sta_req_hdr(m,&v,v.omac_idx,v.vif_mn.wcid,count);
+    int seq=0; uint32_t status=0;
+    mwxController()->setProperty("MTKAWDLFirmwareStage","broadcast-station");
+    sc->sc_awdl_station_pending[3]=true;
+    rv=m ? mwx_mcu_send_mbuf(sc,MCU_UNI_CMD_STA_REC_UPDATE,m,&seq) : ENOBUFS;
+    if(!operation.valid()) return kIOReturnAborted;
+    if(!rv) rv=mwx_mcu_wait_resp_int(sc,MCU_UNI_CMD_STA_REC_UPDATE,seq,&status);
+    mwxController()->setProperty("MTKAWDLFirmwareTransportStatus",static_cast<uint64_t>(rv),32);
+    mwxController()->setProperty("MTKAWDLFirmwareResponseStatus",static_cast<uint64_t>(status),32);
+    MWX_DEV_LOG(sc,"AWDL enable broadcast-station transport=%d firmware=%u\n",rv,status);
+    if(!operation.valid()) return kIOReturnAborted;
+    if(!rv && !status) {
+        mwxController()->setProperty("MTKAWDLFirmwareStage","tx-queues");
+        rv=mt7921_mcu_set_tx(sc,&v);
+        mwxController()->setProperty("MTKAWDLFirmwareTransportStatus",static_cast<uint64_t>(rv),32);
+        MWX_DEV_LOG(sc,"AWDL enable tx-queues result=%d\n",rv);
+    }
+    if(!operation.valid()) return kIOReturnAborted;
+    if(rv || status) {
+        mwx_awdl_remove_context(sc,operation.epoch);
+        return kIOReturnIOError;
+    }
+    IOLockLock(sc->sc_awdl_lock);
+    if(sc->sc_awdl_epoch!=operation.epoch || sc->sc_awdl_stopping) {
+        IOLockUnlock(sc->sc_awdl_lock); return kIOReturnAborted;
+    }
+    sc->sc_awdl_filter=mwx_read(sc,MT_WF_RFCR(0)) & mwx_awdl_filter_mask;
+    mwx_clear(sc,MT_WF_RFCR(0),mwx_awdl_filter_mask);
+    sc->sc_awdl_filter_active=true;
+    sc->sc_awdl_enabled=true;
+    IOLockUnlock(sc->sc_awdl_lock);
+    mwxController()->setProperty("MTKAWDLFirmwareStage","enabled");
+    return kIOReturnSuccess;
+}
+
+IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
+{
+    MwxAwdlCall call(com);
+    if(!call.valid()) return kIOReturnNotReady;
+    if(!com || !com->sc_awdl_enabled || com->sc_resetting || com->sc_detaching)
+        return kIOReturnNotReady;
+    if(com->sc_ic.ic_state==IEEE80211_S_SCAN ||
+       (com->sc_ic.ic_flags & IEEE80211_F_BGSCAN) ||
+       (com->sc_flags & (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN))) {
+        // Native AWDL real-time mode expects the infrastructure scan to yield
+        // before the first ROC. Abort the active firmware scan instead of
+        // returning NotReady forever while the scheduler spins every 2 ms.
+        int scanRv=mt7921_mcu_hw_scan_cancel(com);
+        if(scanRv) { ++com->sc_awdl_roc_scan_blocked; return kIOReturnNotReady; }
+        com->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
+        com->sc_ic.ic_flags &= ~IEEE80211_F_BGSCAN;
+        if(com->sc_ic.ic_state==IEEE80211_S_SCAN)
+            task_add(systq,&com->sc_scan_task);
+        ++com->sc_awdl_roc_scan_blocked;
+        return kIOReturnNotReady;
+    }
+    if(!awdlChannelAllowed(channel) || !durationMs || durationMs>70) return kIOReturnBadArgument;
+    MwxAwdlOperation operation(com);
+    if(!operation.valid()) { ++com->sc_awdl_roc_busy_blocked; return kIOReturnNotReady; }
+    mwx_awdl_abort(com);
+    if(!operation.valid()) return kIOReturnAborted;
+    if(com->sc_awdl_channel!=channel) {
+        int rv=mwx_awdl_set_channel(com,channel,operation.epoch);
+        if(!operation.valid()) return kIOReturnAborted;
+        if(rv) return kIOReturnIOError;
+    }
+    uint8_t token=com->sc_awdl_roc.token+1;
+    if(!token) token=1;
+    // Firmware returns only an 8-bit token. Do not reuse one inside the
+    // response window, including after disable/enable or a reset.
+    uint64_t now=mwx_awdl_now();
+    for(unsigned i=0;i<255 && com->sc_awdl_token_used[token] &&
+        now-com->sc_awdl_token_used[token]<1000000;++i) {
+        if(++token==0) token=1;
+    }
+    if(com->sc_awdl_token_used[token] && now-com->sc_awdl_token_used[token]<1000000)
+        return kIOReturnBusy;
+    uint8_t request[28]={};
+    mtkawdl::put16(request+6,24);
+    request[8]=com->sc_awdl_vif.idx; request[9]=token;
+    request[10]=channel; request[12]=channel<=14 ? 1 : 2;
+    request[14]=channel; request[17]=channel; request[19]=1;
+    com->sc_awdl_vif.vif_mn.ni.ni_chan=&com->sc_ic.ic_channels[channel];
+    mtkawdl::put32(request+20,durationMs); request[24]=0xff;
+    IOLockLock(com->sc_awdl_lock);
+    if(com->sc_awdl_epoch!=operation.epoch || com->sc_awdl_stopping) {
+        IOLockUnlock(com->sc_awdl_lock); return kIOReturnAborted;
+    }
+    com->sc_awdl_token_used[token]=now ? now : 1;
+    com->sc_awdl_roc.request(token,channel,now);
+    IOLockUnlock(com->sc_awdl_lock);
+    int rv=mwx_mcu_send_msg(com,0x00020027,request,sizeof(request),NULL);
+    if(rv) ++com->sc_awdl_roc_send_failed;
+    else ++com->sc_awdl_roc_submitted;
+    if(rv || com->sc_awdl_roc_submitted<=4)
+        MWX_DEV_LOG(com,"AWDL ROC submit token=%u channel=%u duration=%u result=%d\n",
+                    token,channel,durationMs,rv);
+    if(!operation.valid()) return kIOReturnAborted;
+    if(rv) {
+        IOLockLock(com->sc_awdl_lock);
+        com->sc_awdl_roc.cancel();
+        IOLockUnlock(com->sc_awdl_lock);
+    }
+    return rv ? kIOReturnIOError : kIOReturnSuccess;
+}
+
+bool MtkMwx::awdlCanTransmit(uint8_t channel)
+{
+    if(!com || !com->sc_awdl_lock) return false;
+    IOLockLock(com->sc_awdl_lock);
+    bool ready=com->sc_awdl_enabled && !com->sc_resetting && !com->sc_detaching &&
+        !com->sc_awdl_stopping && com->sc_awdl_roc.canTransmit(channel,mwx_awdl_now());
+    IOLockUnlock(com->sc_awdl_lock);
+    return ready;
+}
+
+bool MtkMwx::awdlGrantSnapshot(mtkawdl::Reservation &grant)
+{
+    if(!com || !com->sc_awdl_lock) return false;
+    IOLockLock(com->sc_awdl_lock);
+    bool ready=com->sc_awdl_enabled && !com->sc_resetting && !com->sc_detaching &&
+        !com->sc_awdl_stopping;
+    if(ready) grant=com->sc_awdl_roc;
+    IOLockUnlock(com->sc_awdl_lock);
+    return ready;
+}
+
+bool MtkMwx::awdlIsEnabled()
+{
+    if(!com || !com->sc_awdl_lock) return false;
+    IOLockLock(com->sc_awdl_lock);
+    bool enabled=com->sc_awdl_enabled && !com->sc_awdl_stopping &&
+        !com->sc_resetting && !com->sc_detaching;
+    IOLockUnlock(com->sc_awdl_lock);
+    return enabled;
+}
+void MtkMwx::awdlPublishDiagnostics()
+{
+    if(!com || !com->sc_awdl_lock) return;
+    IOLockLock(com->sc_awdl_lock);
+    uint64_t events=com->sc_awdl_roc_events, grants=com->sc_awdl_roc_grants,
+             rejected=com->sc_awdl_roc_rejected;
+    bool pending=com->sc_awdl_roc.pending;
+    IOLockUnlock(com->sc_awdl_lock);
+    // Publish outside the receive lock; called at most once per second.
+    mwxController()->setProperty("MTKAWDLROCEvents",events,64);
+    mwxController()->setProperty("MTKAWDLROCGrants",grants,64);
+    mwxController()->setProperty("MTKAWDLROCRejected",rejected,64);
+    mwxController()->setProperty("MTKAWDLROCPending",pending);
+    mwxController()->setProperty("MTKAWDLROCSubmitted",com->sc_awdl_roc_submitted,64);
+    mwxController()->setProperty("MTKAWDLROCSendFailed",com->sc_awdl_roc_send_failed,64);
+    mwxController()->setProperty("MTKAWDLROCScanBlocked",com->sc_awdl_roc_scan_blocked,64);
+    mwxController()->setProperty("MTKAWDLROCBusyBlocked",com->sc_awdl_roc_busy_blocked,64);
+}
+
+IOReturn MtkMwx::awdlTransmit(mbuf_t frame,uint8_t channel)
+{
+    if(!frame) return kIOReturnBadArgument;
+    MwxAwdlCall call(com);
+    if(!call.valid()) { mbuf_freem(frame); return kIOReturnNotReady; }
+    MwxAwdlOperation operation(com);
+    if(!operation.valid()) { mbuf_freem(frame); return kIOReturnNotReady; }
+    if(!awdlCanTransmit(channel) || mbuf_len(frame)<24 ||
+       mbuf_len(frame)!=mbuf_pkthdr_len(frame) ||
+       memcmp((uint8_t *)mbuf_data(frame)+16,mtkawdl::bssid,6) ||
+       memcmp((uint8_t *)mbuf_data(frame)+10,com->sc_awdl_address,6)) {
+        mbuf_freem(frame); return kIOReturnNotReady;
+    }
+    ieee80211_node *node=&com->sc_awdl_vif.vif_mn.ni;
+    const uint8_t *destination=(uint8_t *)mbuf_data(frame)+4;
+    if(!(destination[0]&1)) {
+        node=NULL;
+        for(unsigned i=0;i<3;++i) if(com->sc_awdl_peer_used[i] &&
+            !memcmp(com->sc_awdl_peers[i].ni.ni_macaddr,destination,6)) {
+            node=&com->sc_awdl_peers[i].ni; break;
+        }
+        if(!node) { mbuf_freem(frame); return kIOReturnNotReady; }
+    }
+    node->ni_chan=&com->sc_ic.ic_channels[channel];
+    int rv=mwx_tx(com,frame,node);
+    return rv ? kIOReturnNoResources : kIOReturnSuccess;
+}
+
+IOReturn MtkMwx::awdlPeer(const uint8_t *address,bool add)
+{
+    MwxAwdlCall call(com);
+    if(!call.valid()) return kIOReturnNotReady;
+    if(!com || !com->sc_awdl_enabled || com->sc_resetting || com->sc_detaching)
+        return kIOReturnNotReady;
+    if(!address || !mtkawdl::unicast(address)) return kIOReturnBadArgument;
+    // The caller may pass node.ni_macaddr itself when deleting a peer.
+    // Preserve it before clearing that node after the firmware response.
+    uint8_t peerAddress[6]; memcpy(peerAddress,address,6); address=peerAddress;
+    MwxAwdlOperation operation(com);
+    if(!operation.valid()) return kIOReturnNotReady;
+    int index=-1;
+    for(unsigned i=0;i<3;++i) if(com->sc_awdl_peer_used[i] &&
+        !memcmp(address,com->sc_awdl_peers[i].ni.ni_macaddr,6)) { index=i; break; }
+    if(index>=0 && add) return kIOReturnSuccess;
+    if(index<0 && !add) return kIOReturnSuccess;
+    if(index<0) for(unsigned i=0;i<3;++i) if(!com->sc_awdl_peer_used[i]) { index=i; break; }
+    if(index<0) return kIOReturnNoResources;
+    // Primary nodes use 1..14. AWDL unicast uses 15..17, broadcast 18;
+    // infrastructure broadcast retains 19.
+    mwx_node &node=com->sc_awdl_peers[index];
+    uint16_t wcid=MWX_WTBL_STA+index;
+    if(add && com->sc_awdl_station_pending[index]) {
+        int rv=mwx_awdl_remove_station(com,operation.epoch,index);
+        if(!operation.valid()) return kIOReturnAborted;
+        if(rv) return kIOReturnIOError;
+    }
+    mbuf_t m=mwx_alloc_sta_req_tlv(sizeof(sta_req_hdr));
+    if(!m) return kIOReturnNoMemory;
+    uint16_t count=0;
+    auto basic=(sta_rec_basic *)mwx_append_tlv(m,&count,STA_REC_BASIC,sizeof(sta_rec_basic));
+    // Remote stations belong to the local P2P GO transport context.
+    basic->conn_type=htole32(STA_TYPE_STA | NETWORK_P2P);
+    basic->conn_state=add ? CONN_STATE_PORT_SECURE : CONN_STATE_DISCONNECT;
+    basic->extra_info=htole16(EXTRA_INFO_VER | (add ? EXTRA_INFO_NEW : 0));
+    memcpy(basic->peer_addr,address,6);
+    auto wtbl=(sta_rec_wtbl *)mwx_append_tlv(m,&count,STA_REC_WTBL,sizeof(sta_rec_wtbl));
+    wtbl->wlan_idx_lo=wcid; wtbl->operation=WTBL_RESET_AND_SET;
+    uint16_t wcount=0, wlen=sizeof(*wtbl);
+    if(add) {
+        auto generic=(wtbl_generic *)mwx_append_tlv(m,&wcount,WTBL_GENERIC,sizeof(wtbl_generic));
+        memcpy(generic->peer_addr,address,6); generic->muar_idx=com->sc_awdl_vif.omac_idx;
+        auto rx=(wtbl_rx *)mwx_append_tlv(m,&wcount,WTBL_RX,sizeof(wtbl_rx));
+        rx->rca1=rx->rca2=rx->rv=1;
+        auto trans=(wtbl_hdr_trans *)mwx_append_tlv(m,&wcount,WTBL_HDR_TRANS,sizeof(wtbl_hdr_trans));
+        trans->no_rx_trans=1;
+        wlen+=sizeof(*generic)+sizeof(*rx)+sizeof(*trans);
+    }
+    wtbl->tlv_num=htole16(wcount); wtbl->len=htole16(wlen);
+    m=mwx_fill_sta_req_hdr(m,&com->sc_awdl_vif,com->sc_awdl_vif.omac_idx,wcid,count);
+    int seq=0; uint32_t status=0;
+    if(add) {
+        memcpy(node.ni.ni_macaddr,address,6);
+        com->sc_awdl_station_pending[index]=true;
+    }
+    int rv=m ? mwx_mcu_send_mbuf(com,MCU_UNI_CMD_STA_REC_UPDATE,m,&seq) : ENOBUFS;
+    if(!operation.valid()) return kIOReturnAborted;
+    if(!rv) rv=mwx_mcu_wait_resp_int(com,MCU_UNI_CMD_STA_REC_UPDATE,seq,&status);
+    if(!operation.valid()) return kIOReturnAborted;
+    if(rv || status) return kIOReturnIOError;
+    IOLockLock(com->sc_awdl_lock);
+    if(com->sc_awdl_epoch!=operation.epoch || com->sc_awdl_stopping) {
+        IOLockUnlock(com->sc_awdl_lock); return kIOReturnAborted;
+    }
+    memset(&node,0,sizeof(node)); node.wcid=wcid;
+    if(add) memcpy(node.ni.ni_macaddr,address,6);
+    com->sc_awdl_peer_used[index]=add;
+    com->sc_awdl_station_pending[index]=add;
+    IOLockUnlock(com->sc_awdl_lock);
+    MWX_DEV_LOG(com,"AWDL peer %s WCID=%u add=%d\n",ether_sprintf(address),wcid,add);
+    return kIOReturnSuccess;
 }

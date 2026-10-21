@@ -88,7 +88,7 @@ private: virtual void _abi_0928() __asm__("__ZN25IOSkywalkNetworkInterface17setR
     virtual void _RESERVEDIOSkywalkNetworkInterface7();
     virtual void _RESERVEDIOSkywalkNetworkInterface8();
     virtual void _RESERVEDIOSkywalkNetworkInterface9();
-    void reportLinkStatus(unsigned int, unsigned int);
+    IOReturn reportLinkStatus(unsigned int, unsigned int);
     struct ExpansionData { RegistrationInfo *fRegistrationInfo; ifnet_t fBSDInterface; };
     uint8_t _layout0[0x10];
     ExpansionData *mExpansionData;

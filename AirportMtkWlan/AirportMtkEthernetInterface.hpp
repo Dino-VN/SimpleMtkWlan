@@ -22,6 +22,8 @@ class AirportMtkEthernetInterface : public IOEthernetInterface {
     OSDeclareDefaultStructors(AirportMtkEthernetInterface)
     
 public:
+    void free() override;
+    SInt32 performCommand(IONetworkController *, unsigned long, void *, void *) override;
     virtual IOReturn attachToDataLinkLayer( IOOptionBits options,
                                             void *       parameter ) override;
     
@@ -45,6 +47,7 @@ public:
                                  void *          param   = 0 ) override;
     
     virtual IOService * getProvider( void ) const override;
+    const char *getNamePrefix() const override;
     
 private:
 #ifdef AIRPORT_WCL
@@ -52,6 +55,7 @@ private:
 #endif
     IO80211SkywalkInterface *interface;
     bool isAttach;
+    bool retainsInterface;
 };
 
 #endif /* AirportMtkEthernetInterface_hpp */

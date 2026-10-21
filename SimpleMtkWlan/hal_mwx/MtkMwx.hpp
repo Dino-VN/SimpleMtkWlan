@@ -23,6 +23,7 @@
 
 struct mwx_softc;
 struct pci_attach_args;
+namespace mtkawdl { struct Reservation; }
 
 class MtkMwx : public MtkHalService, MtkDriverInfo, MtkDriverController {
     OSDeclareDefaultStructors(MtkMwx)
@@ -56,6 +57,22 @@ public:
     IOEthernetController *mwxController();
     int mwxSleepNsec(void *ident, int priority, const char *wmesg, uint64_t timo);
     void mwxWakeup(void *ident);
+
+    // Called on the driver's main workloop. RX callback borrows the frame;
+    // awdlTransmit always consumes its mbuf, including on error.
+    typedef bool (*AwdlReceive)(void *, const uint8_t *, size_t, uint8_t, int8_t);
+    void awdlSetReceiver(void *context, AwdlReceive receiver);
+    IOReturn awdlEnable(const uint8_t *address, bool enable);
+    IOReturn awdlReserve(uint8_t channel, uint32_t durationMs);
+    bool awdlCanTransmit(uint8_t channel);
+    bool awdlGrantSnapshot(mtkawdl::Reservation &grant);
+    bool awdlIsEnabled();
+    void awdlPublishDiagnostics();
+    void awdlAbort();
+    IOReturn awdlTransmit(mbuf_t frame, uint8_t channel);
+    bool awdlChannelAllowed(uint8_t channel);
+    IOReturn awdlPeer(const uint8_t *address, bool add);
+    unsigned awdlPeerCapacity() const { return 3; }
 
 private:
     void releaseAll();
