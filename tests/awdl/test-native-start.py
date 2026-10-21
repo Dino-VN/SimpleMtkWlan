@@ -17,6 +17,11 @@ functions='\n'.join(fn(source,s) for s in [
  'bool AirportMtkAwdlInterface::start(',
  'bool AirportMtkAwdlInterface::createDataPath(',
  'void AirportMtkAwdlInterface::releaseDataPath(',
+ 'IOReturn AirportMtkAwdlInterface::enable(unsigned',
+ 'IOReturn AirportMtkAwdlInterface::disable(unsigned',
+ 'IOReturn AirportMtkAwdlInterface::dataPathGated(',
+ 'void AirportMtkAwdlInterface::enableDatapath(',
+ 'void AirportMtkAwdlInterface::disableDatapath(',
  'void AirportMtkAwdlInterface::setDataPathEnabled(',
  'unsigned AirportMtkAwdlInterface::submitNative(',
  'void AirportMtkAwdlInterface::drainCompletions(',
@@ -49,6 +54,8 @@ int live=0,factory=0,failFactory=0,add=0,failAdd=0;
 bool resourceAvailable=true,deferralFail=false,superFail=false,infoFail=false,registerFail=false,macFail=false,macMismatch=false;
 int nativeStarts=0,publications=0,completionsDone=0,outstanding=0;
 bool rejectCompletion=false,rejectRX=false,prepareFail=false,allocateFail=false;
+IOReturn nativeEnableStatus=0;
+std::function<void()> nativeDisableObserver;
 struct OSObject { virtual ~OSObject(){}; virtual void release(){delete this;} };
 struct Gate{IOReturn runAction(IOReturn(*fn)(OSObject*,void*,void*,void*,void*),void*a,void*b=nullptr){return fn(nullptr,a,b,nullptr,nullptr);}void commandSleep(void*,AbsoluteTime,unsigned){assert(false);}void commandWakeup(void*,bool){}}gate;
 Gate*_fCommandGate=&gate;
@@ -112,6 +119,7 @@ struct WorkLoop {
 };
 struct Timer {bool pending=false;void setTimeoutMS(unsigned){pending=true;} void cancelTimeout(){pending=false;}};
 using mbuf_t=std::vector<uint8_t>*;
+std::vector<uint8_t> lastFrame;
 void mbuf_freem(mbuf_t m){delete m;}
 uint64_t awdlNow(){return 123;}
 void *bsdAddress=nullptr;
@@ -126,6 +134,8 @@ struct NativeProtocol:IOService {
  void deferBSDAttach(bool value){deferred=value;if(!value){assert(registered);++publications;}}
  void *getProperty(const char*){return deferred&&!deferralFail?this:nullptr;}
  bool start(IOService*){++nativeStarts;assert(deferred);auto identity=getSelfMacAddr();assert(mtkawdl::unicast(identity.bytes));agentStarted=!superFail;return !superFail;}
+ virtual IOReturn enable(unsigned options){assert(options==7);return nativeEnableStatus;}
+ virtual IOReturn disable(unsigned options){assert(options==7);if(nativeDisableObserver)nativeDisableObserver();return 0;}
  void stop(IOService*){registered=false;}
 };
 using IO80211SkywalkInterface=NativeProtocol;
@@ -154,9 +164,11 @@ struct AirportMtkAwdlInterface:NativeProtocol {
  bool initRegistrationInfo(IOSkywalkEthernetInterface::RegistrationInfo*,unsigned,unsigned){return !infoFail;}
  IOReturn registerEthernetInterface(IOSkywalkEthernetInterface::RegistrationInfo *info,IOSkywalkPacketQueue**,unsigned count,IOSkywalkPacketBufferPool*,IOSkywalkPacketBufferPool*,unsigned){const char *prefix=nullptr;uint32_t unit=1;memcpy(&prefix,info->bytes+0x30,sizeof(prefix));memcpy(&unit,info->bytes+0x38,sizeof(unit));assert(!strcmp(prefix,"awdl")&&unit==0);uint32_t subfamily=0,media=0;memcpy(&subfamily,info->bytes+0x0c,4);memcpy(&media,info->bytes+0x28,4);assert(subfamily==3&&media==0x80);assert(count==3&&queuesAdded==3&&deferred);registered=!registerFail;return registerFail?7:0;}
  bool start(IOService*);bool createDataPath();void releaseDataPath();void drainCompletions();void inputNative(const uint8_t*,size_t);void setDataPathEnabled(bool);void stop(IOService*);
+ IOReturn enable(unsigned) override;IOReturn disable(unsigned) override;
+ void enableDatapath();void disableDatapath();static IOReturn dataPathGated(OSObject*,void*,void*,void*,void*);
  void shutdown(){stopping=true;setDataPathEnabled(false);}
  mbuf_t makeFrame(const uint8_t*p,size_t n){return new std::vector<uint8_t>(p,p+n);}
- unsigned output(mbuf_t m){delete m;++queueCount;return 0;}
+ unsigned output(mbuf_t m){lastFrame=*m;delete m;++queueCount;return 0;}
  static unsigned submitNative(OSObject*,IOSkywalkTxSubmissionQueue*,IOSkywalkPacket *const*,unsigned,void*);
 };
 struct AirportMtkWlan:IOService {
@@ -196,10 +208,27 @@ int main(){
  assert(p->setMacAddress(invalid)==kIOReturnBadArgument);
  p->enabled=true;assert(p->setMacAddress(changed)==kIOReturnBusy);p->enabled=false;
  p->stopping=true;assert(p->setMacAddress(changed)==kIOReturnNotReady);p->stopping=false;
- p->bsd=nullptr;p->setDataPathEnabled(true);p->enabled=true;
+ p->bsd=nullptr;p->enabled=true;
+ // BSD's native enable entry must activate the queues; base enable does not.
+ NativeProtocol *bsdProvider=p;
+ assert(!p->dataPathEnabled&&!p->txSubmit->enabled&&!p->rxComplete->enabled);
+ nativeEnableStatus=kIOReturnError;
+ assert(bsdProvider->enable(7)==kIOReturnError&&!p->dataPathEnabled);
+ nativeEnableStatus=0;
+ p->nativeRegistered=false;assert(bsdProvider->enable(7)==kIOReturnNotReady);p->nativeRegistered=true;
+ p->queuesAdded=2;assert(bsdProvider->enable(7)==kIOReturnNotReady);p->queuesAdded=3;
+ _fCommandGate=nullptr;assert(bsdProvider->enable(7)==kIOReturnNotReady&&!p->dataPathEnabled);_fCommandGate=&gate;
+ p->stopping=true;assert(bsdProvider->enable(7)==kIOReturnNotReady);p->stopping=false;
+ assert(bsdProvider->enable(7)==0&&p->dataPathEnabled&&p->txSubmit->enabled&&p->txComplete->enabled&&p->rxComplete->enabled);
+ assert(bsdProvider->enable(7)==0); // Repeated enable remains usable.
  auto packet=tx();unsigned consumed=p->submitNative(p,p->txSubmit,&packet,1,nullptr);
  assert(consumed==1&&p->nativeTx==1&&p->completionCount==1&&outstanding==0&&p->timer->pending);
  outstanding+=consumed;p->drainCompletions();assert(outstanding==0&&p->completionCount==0);
+ // Native virtual address is the buffer base; data offset is applied once.
+ packet=tx();packet->offset=37;packet->bytes[37]=42;packet->bytes[100]=91;
+ consumed=p->submitNative(p,p->txSubmit,&packet,1,nullptr);outstanding+=consumed;
+ assert(consumed==1&&lastFrame.size()==64&&lastFrame.front()==42&&lastFrame.back()==91);
+ p->drainCompletions();assert(outstanding==0);
  // A full deferred buffer applies backpressure without disposing packets.
  std::vector<IOSkywalkPacket*> packets;for(unsigned i=0;i<129;++i)packets.push_back(tx());
  consumed=p->submitNative(p,p->txSubmit,packets.data(),129,nullptr);assert(consumed==128&&p->completionCount==128);
@@ -208,8 +237,11 @@ int main(){
  p->enabled=false;packet=tx();consumed=p->submitNative(p,p->txSubmit,&packet,1,nullptr);outstanding+=consumed;
  rejectCompletion=true;p->drainCompletions();rejectCompletion=false;assert(outstanding==0);
  p->enabled=true;packet=tx();consumed=p->submitNative(p,p->txSubmit,&packet,1,nullptr);outstanding+=consumed;
- p->setDataPathEnabled(false);assert(p->completionCount==0&&outstanding==0&&!p->txSubmit->enabled&&!p->txComplete->enabled);
- p->setDataPathEnabled(true);
+ nativeDisableObserver=[&](){assert(!p->dataPathEnabled&&!p->txSubmit->enabled&&!p->rxComplete->enabled&&p->completionCount==0&&outstanding==0);};
+ assert(bsdProvider->disable(7)==0);assert(p->completionCount==0&&outstanding==0&&!p->dataPathEnabled&&!p->txSubmit->enabled&&!p->txComplete->enabled&&!p->rxComplete->enabled);
+ uint8_t disabledData[64]={42};auto rxBefore=p->nativeRx;p->inputNative(disabledData,64);assert(p->nativeRx==rxBefore);
+ assert(bsdProvider->disable(7)==0&&bsdProvider->enable(7)==0&&p->dataPathEnabled);
+ nativeDisableObserver=nullptr;
  uint8_t data[1514]={42};int before=live;p->inputNative(data,64);assert(live==before&&p->nativeRx==1);
  rejectRX=true;p->inputNative(data,64);rejectRX=false;assert(live==before&&p->nativeRx==1);
  prepareFail=true;p->inputNative(data,64);prepareFail=false;assert(live==before);
@@ -227,7 +259,7 @@ int main(){
  assert(!c.createAwdlInterface()&&!c.awdlInterface&&factory==0&&!strcmp(c.stage,"no-social-channel"));
  c.hal.channels=true;
  c.awdlExperimental=true;c.fNetIf=nullptr;assert(!c.createAwdlInterface()&&factory==0);
- puts("PASS native backend: allocation/add/start/MAC/registration failures; Wi-Fi subfamily/media; nonrecursive MAC agent callback and startup identity; deferred BSD publication; repeat create/stop; TX deferred completion, full buffer, drop/disable/fallback; RX ownership transfer and error cleanup.");
+ puts("PASS native backend: allocation/add/start/MAC/registration failures; Wi-Fi subfamily/media; nonrecursive MAC agent callback and startup identity; deferred BSD publication; BSD enable/disable/re-enable queue activation and failure guards; TX data offset, deferred completion, full buffer, drop/disable/fallback; RX ownership transfer and error cleanup.");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='mtk-native-backend-') as temp:

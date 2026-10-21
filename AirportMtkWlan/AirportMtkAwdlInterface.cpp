@@ -84,6 +84,10 @@ bool AirportMtkAwdlInterface::start(IOService *provider)
     setProperty("MTKAWDLRegistrationSubfamily",static_cast<uint64_t>(subfamily),32);
     setProperty("MTKAWDLRegistrationMedia",static_cast<uint64_t>(media),32);
     setProperty("MTKAWDLNativeQueuesRegistered",true);
+    setProperty("MTKAWDLDataPathEnabled",false);
+    setProperty("MTKAWDLNativeTxPackets",nativeTx,64);
+    setProperty("MTKAWDLNativeRxPackets",nativeRx,64);
+    setProperty("MTKAWDLNativeDroppedPackets",nativeDrops,64);
     // Controller start marks the object ready before releasing BSD deferral.
     return true;
 }
@@ -144,6 +148,30 @@ void *AirportMtkAwdlInterface::getTxCompQueue() { return txComplete; }
 void *AirportMtkAwdlInterface::getRxCompQueue() { return rxComplete; }
 void *AirportMtkAwdlInterface::getTxPacketPool() { return txPool; }
 void *AirportMtkAwdlInterface::getRxPacketPool() { return rxPool; }
+IOReturn AirportMtkAwdlInterface::enable(unsigned int options)
+{
+    if(stopping || !nativeRegistered || queuesAdded!=3 || !_fCommandGate)
+        return kIOReturnNotReady;
+    retain();
+    // Tahoe's Wi-Fi base enable only calls setInterfaceEnable. The native
+    // BCM proximity subclass explicitly starts its queues after that call.
+    IOReturn status=super::enable(options);
+    if(status==kIOReturnSuccess && !stopping) {
+        enableDatapath();
+        if(!dataPathEnabled) status=kIOReturnNotReady;
+    } else if(status==kIOReturnSuccess) status=kIOReturnNotReady;
+    setProperty("MTKAWDLBSDEnableStatus",static_cast<uint64_t>(status),32);
+    release(); return status;
+}
+IOReturn AirportMtkAwdlInterface::disable(unsigned int options)
+{
+    retain();
+    // Stop submission before the native disable can tear down sync/peers.
+    disableDatapath();
+    IOReturn status=super::disable(options);
+    setProperty("MTKAWDLBSDDisableStatus",static_cast<uint64_t>(status),32);
+    release(); return status;
+}
 IOReturn AirportMtkAwdlInterface::dataPathGated(OSObject*,void *arg,void *enable,void*,void*)
 {
     auto self=static_cast<AirportMtkAwdlInterface *>(arg);

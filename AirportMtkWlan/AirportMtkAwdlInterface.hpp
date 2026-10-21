@@ -27,6 +27,8 @@ public:
     void *getRxPacketPool() override;
     int getNumTxQueues() override { return 1; }
     int getTxHeadroom() override { return 0; }
+    IOReturn enable(unsigned int) override;
+    IOReturn disable(unsigned int) override;
     void enableDatapath() override;
     void disableDatapath() override;
     void free() override;
