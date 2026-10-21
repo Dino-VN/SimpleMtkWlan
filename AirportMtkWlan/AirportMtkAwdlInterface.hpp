@@ -28,6 +28,7 @@ public:
     int getNumTxQueues() override { return 1; }
     int getTxHeadroom() override { return 0; }
     UInt getHardwareAssists() override;
+    IOReturn prepareBSDInterface(ifnet_t,unsigned int) override;
     IOReturn enable(unsigned int) override;
     IOReturn disable(unsigned int) override;
     void enableDatapath() override;
@@ -176,6 +177,7 @@ private:
     uint32_t reserveDuration = 0, secondaryMasterChannel = 0;
     ifnet_t bsd = NULL;
     mtkawdl::State state;
+    mtkawdl::DataPeers dataPeers;
     uint8_t requestedChannel = 0, grantedChannel = 0; uint64_t nextAction = 0, requestDeadline = 0;
     uint8_t syncTemplate[2048]; size_t templateLength = 0;
     mbuf_t queue[64] = {}; uint64_t queueTime[64]; unsigned queueHead = 0, queueCount = 0;

@@ -1,5 +1,29 @@
 # Experimental MT7921 AWDL on Tahoe
 
+On 2026-10-22, candidate `C85968EF-BEB5-39DC-B18B-CB230B587434`
+caused two confirmed kernel panics at `IOSkywalkPacketQueue.cpp:321`
+(`default packetCompletion()`). Do not install the historical AWDL RX fix ZIP.
+The fault was pool-allocated RX being prepared with the RX completion queue
+as its source. Skywalk completes RX by calling that source's completion
+callback; the completion queue inherits the panic implementation.
+
+The replacement uses a null source for directly allocated RX, with regression
+coverage that reproduces the old panic callback before verifying success and
+error cleanup. Native cache/traffic registration now keeps data membership and
+replay independent of the three-second synchronization advertisement lifetime.
+Expired radio schedules still cannot authorize a unicast TX slot. Slow RLM
+channel setup runs during idle time before requesting the short ROC near the
+following EAW edge. BSD preparation clears hardware offloads and the enabled
+checksum/TSO capabilities that Tahoe leaves stale when offload is zero.
+These changes require a new boot and actual AirDrop transfer verification;
+passing host regressions and static ABI checks does not establish kernel or
+radio stability. The recovery boot has no native AWDL object.
+
+Bluetooth is currently on and sharingd observes BLE peers marked
+`AirDropUsable`. BLE connection timeouts in an earlier boot and current
+AirDrop pseudonym provisioning errors do not yet identify a Bluetooth driver
+defect. Recheck authentication after AWDL data transport works.
+
 AirDrop is not confirmed working. The implementation is a development
 candidate, not a release with verified AirDrop, Handoff or Continuity support.
 The nearby iPhone did not see this PC with the original driver. macOS refused

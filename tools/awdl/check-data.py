@@ -22,7 +22,10 @@ def run(command):
     return subprocess.check_output(command, stderr=subprocess.PIPE, timeout=45)
 
 def snapshot():
-    interfaces = plistlib.loads(run(['ioreg', '-a', '-r', '-c', 'AirportMtkAwdlInterface']))
+    registry = run(['ioreg', '-a', '-r', '-c', 'AirportMtkAwdlInterface'])
+    if not registry.strip():
+        raise RuntimeError('No native AWDL interface is present on this boot.')
+    interfaces = plistlib.loads(registry)
     if len(interfaces) != 1:
         raise RuntimeError('Expected one AirportMtkAwdlInterface')
     native = {k: v for k, v in interfaces[0].items() if k.startswith('MTKAWDL')
@@ -45,6 +48,7 @@ def check():
     if not re.search(r'\b' + re.escape(args.expected_uuid) + r'\b', identity, re.I):
         result['reasons'].append('The intended kext UUID is not loaded.')
         return result
+    started = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     before = snapshot()
     if args.probe:
         probe = subprocess.run(['ping6', '-c', '3', '-i', '0.5', 'ff02::1%awdl0'],
@@ -73,7 +77,7 @@ def check():
             ('MTKAWDLDataTxFailed', 'HAL rejected data TX; inspect MTKAWDLDataTxStatus.'),
             ('MTKAWDLDataTxExpired', 'Queued data expired while waiting for a usable radio/peer slot.'),
             ('MTKAWDLDataRxInvalid', 'Raw AWDL data failed wire/header validation.'),
-            ('MTKAWDLDataRxUnknownPeer', 'Raw AWDL data came from a peer absent from the host schedule.'),
+            ('MTKAWDLDataRxUnknownPeer', 'Raw AWDL data came from a peer absent from the authorized data cache.'),
             ('MTKAWDLDataRxWrongDestination', 'Raw AWDL data addressed another interface.'),
             ('MTKAWDLDataRxReplay', 'Duplicate/old AWDL data was rejected by the replay window.')):
             if transport_delta.get(key, 0) > 0:
@@ -82,6 +86,20 @@ def check():
             result['transport_findings'].append('No raw AWDL data reached the receiver during this interval.')
     if not after['native'].get('MTKAWDLDataPathEnabled', False):
         result['reasons'].append('The native datapath is disabled or its diagnostic is absent.')
+    if after['native'].get('MTKAWDLBSDOffloadStatus') != 0:
+        result['reasons'].append('BSD offload setup failed or its diagnostic is absent.')
+    unsupported = re.findall(r'\b(?:TSO4|TSO6|PARTIAL_CSUM|ZEROINVERT_CSUM)\b', result['interface'])
+    if unsupported:
+        result['reasons'].append('BSD still enables unsupported offloads: ' + ', '.join(unsupported))
+    try:
+        sanity = run(['/usr/bin/log', 'show', '--start', started, '--style', 'compact',
+                      '--predicate', 'process == "kernel" AND eventMessage CONTAINS "AWDL SANITY FAILURE"']).decode(errors='replace')
+        failures = [line for line in sanity.splitlines() if 'AWDL SANITY FAILURE' in line]
+        result['aw_sanity_failures'] = failures
+        if failures:
+            result['reasons'].append('Native AWDL sanity failures occurred during observation.')
+    except (OSError, subprocess.SubprocessError) as exc:
+        result['reasons'].append('Could not verify native AWDL sanity logs: ' + str(exc))
     if missing:
         result['reasons'].append('This loaded build does not expose all native data counters.')
     if any(value < 0 for value in (*delta.values(), *bsd_delta.values())):

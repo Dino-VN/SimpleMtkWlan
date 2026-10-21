@@ -49,7 +49,7 @@ struct AirportMtkAwdlInterface:Native{
  void*bsd=nullptr;bool timerAdded=false,stopping=false,enabled=false,nativeBaseInitialized=false,receiverRegistered=false,trafficActive=false,trafficPeerInstalled=false;
  unsigned queueHead=0,queueCount=0,templateLength=0,requestedChannel=0,grantedChannel=0;uint64_t nextAction=0,requestDeadline=0;
  void*queue[64]{};uint8_t trafficPeer[6]{},installedTrafficPeer[6]{};
- mtkawdl::State state;mtkawdl::Timeline awTimeline;
+ mtkawdl::DataPeers dataPeers;mtkawdl::State state;mtkawdl::Timeline awTimeline;
  unsigned windowEnds=0;
  void notifyAvailabilityWindowEnd(uint64_t){++windowEnds;awTimeline.close();}
  struct {unsigned version,availability_window_length,availability_window_period,extension_length,synchronization_frame_period,non_election_master;}syncParams{};

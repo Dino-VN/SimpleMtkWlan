@@ -15,6 +15,7 @@ def fn(text, signature):
     return text[begin:text.index('\n}\n',begin)+3]
 functions='\n'.join(fn(source,s) for s in [
  'UInt AirportMtkAwdlInterface::getHardwareAssists(',
+ 'IOReturn AirportMtkAwdlInterface::prepareBSDInterface(',
  'bool AirportMtkAwdlInterface::start(',
  'bool AirportMtkAwdlInterface::createDataPath(',
  'void AirportMtkAwdlInterface::releaseDataPath(',
@@ -46,6 +47,12 @@ stubs=r'''
 #define XYLog(...) ((void)0)
 using IOReturn=unsigned;
 using UInt=unsigned;
+using ifnet_t=void*;
+constexpr unsigned IFCAP_HWCSUM=3,IFCAP_TSO=0x60,IFCAP_LRO=0x80,IFCAP_CSUM_PARTIAL=0x2000,
+ IFCAP_CSUM_ZERO_INVERT=0x4000,IFCAP_LRO_NUM_SEG=0x8000;
+unsigned hwassist=0x37f,capabilities=0xffff;int offloadError=0,capsError=0,bsdPrepareStatus=0;
+int ifnet_set_offload(ifnet_t,unsigned value){if(offloadError)return offloadError;hwassist=value;return 0;}
+int ifnet_set_capabilities_enabled(ifnet_t,unsigned value,unsigned mask){if(capsError)return capsError;capabilities=(capabilities&~mask)|(value&mask);return 0;}
 using IOThread=void*;using AbsoluteTime=uint64_t;
 constexpr unsigned kIOReturnTimeout=10,kMillisecondScale=1,THREAD_UNINT=0;
 IOThread IOThreadSelf(){static int identity;return &identity;}
@@ -56,6 +63,8 @@ int live=0,factory=0,failFactory=0,add=0,failAdd=0;
 bool resourceAvailable=true,deferralFail=false,superFail=false,infoFail=false,registerFail=false,macFail=false,macMismatch=false;
 int nativeStarts=0,publications=0,completionsDone=0,outstanding=0;
 bool rejectCompletion=false,rejectRX=false,prepareFail=false,allocateFail=false;
+bool badRXBuffers=false,badRXOffset=false,badRXLength=false,noRXAddress=false;
+unsigned rxFinalized=0,rxReclaimed=0,rxPreparedCompleted=0;
 IOReturn nativeEnableStatus=0;
 std::function<void()> nativeDisableObserver;
 struct OSObject { virtual ~OSObject(){}; virtual void release(){delete this;} };
@@ -69,7 +78,7 @@ struct IOService:OSObject {
 #define OSSafeReleaseNULL(x) do { if(x) {(x)->release();(x)=nullptr;} } while(0)
 #define OSDynamicCast(type, value) static_cast<type *>(value)
 struct ether_addr {uint8_t bytes[6];};
-namespace mtkawdl { bool unicast(const uint8_t *p) {return p[0] && !(p[0]&1);} }
+namespace mtkawdl { struct DataPeers{void reset(){}}; bool unicast(const uint8_t *p) {return p[0] && !(p[0]&1);} }
 #define IEEE80211_S_RUN 4
 struct IC {uint8_t ic_myaddr[6]={2,1,2,3,4,5};int ic_state=IEEE80211_S_RUN;};
 struct MtkMwx:IOService {IC ic; bool channels=true; std::function<void()> wait;
@@ -77,14 +86,16 @@ struct MtkMwx:IOService {IC ic; bool channels=true; std::function<void()> wait;
  IOReturn awdlEnable(const uint8_t*,bool){if(wait)wait();return 0;}};
 struct IOSkywalkPacketQueue;
 struct IOSkywalkPacket:OSObject {
- unsigned length=64,offset=0,buffers=1; bool prepared=false,tx=false; uint8_t bytes[2048]={};
+ unsigned length=64,offset=0,buffers=1; bool prepared=false,tx=false;
+ IOSkywalkPacketQueue *source=nullptr; uint8_t bytes[2048]={};
  IOSkywalkPacket(){++live;} ~IOSkywalkPacket(){--live;}
  unsigned getDataLength(){return length;} unsigned getDataOffset(){return offset;}
  unsigned getPacketBufferCount(){return buffers;}
- void *getDataVirtualAddress(){assert(prepared);return bytes;}
- IOReturn setDataOffset(unsigned o){assert(prepared);offset=o;return 0;}
- IOReturn setDataLength(unsigned n){assert(prepared);length=n;return n<=2048?0:1;}
- IOReturn prepareWithQueue(IOSkywalkPacketQueue*,unsigned direction,unsigned){assert(direction==2);prepared=true;return prepareFail?1:0;}
+ void *getDataVirtualAddress(){assert(prepared);return !tx&&noRXAddress?nullptr:bytes;}
+ IOReturn setDataOffset(unsigned o){assert(prepared);offset=o;return badRXOffset?1:0;}
+ IOReturn setDataLength(unsigned n){assert(prepared);length=n;return n<=2048&&!badRXLength?0:1;}
+ IOReturn prepareWithQueue(IOSkywalkPacketQueue *q,unsigned direction,unsigned){assert(direction==2);source=q;prepared=true;buffers=badRXBuffers?2:1;return prepareFail?1:0;}
+ void completeWithQueue(IOSkywalkPacketQueue*,unsigned);
 };
 struct IOSkywalkPacketBufferPool:OSObject {
  struct PoolOptions{unsigned packets,buffers,size,maxBuffers,segment,flags;uint64_t reserved;};
@@ -92,14 +103,24 @@ struct IOSkywalkPacketBufferPool:OSObject {
  static IOSkywalkPacketBufferPool *withName(const char*,OSObject*,unsigned,const PoolOptions *o){
   assert(o->size==2048&&o->maxBuffers==1);return ++factory==failFactory?nullptr:new IOSkywalkPacketBufferPool;}
  IOReturn allocatePacket(IOSkywalkPacket **p,unsigned flags){assert(flags==1);if(allocateFail)return 1;*p=new IOSkywalkPacket;return 0;}
- void deallocatePacket(IOSkywalkPacket *p){if(p->tx){assert(outstanding>0);--outstanding;++completionsDone;}delete p;}
+ void deallocatePacket(IOSkywalkPacket *p){if(p->tx){assert(outstanding>0);--outstanding;++completionsDone;}
+  else {++rxReclaimed;if(p->prepared){p->completeWithQueue(nullptr,2);++rxPreparedCompleted;}}
+  delete p;}
 };
 struct IOSkywalkPacketQueue:OSObject {
  bool enabled=false,added=false;IOSkywalkPacketBufferPool *pool;
  IOSkywalkPacketQueue(IOSkywalkPacketBufferPool *p):pool(p){++live;}
  ~IOSkywalkPacketQueue(){assert(!added);--live;}
  void disable(){enabled=false;} void enable(){enabled=true;}
+ virtual void packetCompletion(IOSkywalkPacket*,IOSkywalkPacketQueue*){assert(false&&"default packetCompletion(): completion queues cannot be RX sources");}
 };
+// Pinned Skywalk completeWithQueue finalizes RX and calls the recorded source
+// if non-null. Completion queues inherit the panic implementation above.
+void IOSkywalkPacket::completeWithQueue(IOSkywalkPacketQueue *destination,unsigned direction){
+ assert(prepared&&direction==2);++rxFinalized;
+ if(source)source->packetCompletion(this,destination);
+ prepared=false;
+}
 struct IOSkywalkTxSubmissionQueue:IOSkywalkPacketQueue {
  using IOSkywalkPacketQueue::IOSkywalkPacketQueue;
  static IOSkywalkTxSubmissionQueue *withPool(IOSkywalkPacketBufferPool*p,unsigned,unsigned,OSObject*,
@@ -113,7 +134,7 @@ struct IOSkywalkTxCompletionQueue:IOSkywalkPacketQueue {
 struct IOSkywalkRxCompletionQueue:IOSkywalkPacketQueue {
  using IOSkywalkPacketQueue::IOSkywalkPacketQueue;
  static IOSkywalkRxCompletionQueue *withPool(IOSkywalkPacketBufferPool*p,unsigned,unsigned,OSObject*,void*,void*,unsigned){return ++factory==failFactory?nullptr:new IOSkywalkRxCompletionQueue(p);}
- IOReturn enqueuePackets(IOSkywalkPacket *const *p,unsigned count,unsigned){assert(count==1&&p[0]->prepared);if(rejectRX)return 1;assert(p[0]->bytes[0]==42);delete p[0];return 0;}
+ IOReturn enqueuePackets(IOSkywalkPacket *const *p,unsigned count,unsigned){assert(count==1&&p[0]->prepared);if(rejectRX||!enabled)return 1;assert(p[0]->bytes[0]==42);p[0]->completeWithQueue(this,2);delete p[0];return 0;}
 };
 struct WorkLoop {
  IOReturn addEventSource(IOSkywalkPacketQueue*q){if(++add==failAdd)return 9;q->added=true;return 0;}
@@ -128,6 +149,7 @@ void *bsdAddress=nullptr;
 void ifnet_set_lladdr(void *bsd,const void *mac,unsigned length){assert(length==6);memcpy(bsd,mac,6);}
 struct NativeProtocol:IOService {
  virtual unsigned getHardwareAssists(){return 0x37f;}
+ virtual IOReturn prepareBSDInterface(ifnet_t,unsigned){return bsdPrepareStatus;}
  ether_addr agentMac={}; bool agentStarted=false; unsigned macDepth=0;
  virtual IOReturn setMacAddress(ether_addr&)=0;
  virtual ether_addr getSelfMacAddr(){return agentMac;}
@@ -145,7 +167,7 @@ using IO80211SkywalkInterface=NativeProtocol;
 struct IOSkywalkEthernetInterface {struct RegistrationInfo {uint8_t bytes[0x130];};};
 struct AirportMtkWlan;
 struct AirportMtkAwdlInterface:NativeProtocol {
- AirportMtkWlan *owner=nullptr;MtkMwx *hal=nullptr;bool stopping=false,nativeStarted=false,nativeRegistered=false,dataPathEnabled=false,enabled=false;
+ AirportMtkWlan *owner=nullptr;MtkMwx *hal=nullptr;bool trafficActive=false,trafficPeerInstalled=false;uint8_t installedTrafficPeer[6]{};mtkawdl::DataPeers dataPeers;bool stopping=false,nativeStarted=false,nativeRegistered=false,dataPathEnabled=false,enabled=false;
  IOSkywalkPacketBufferPool *txPool=nullptr,*rxPool=nullptr;
  IOSkywalkTxSubmissionQueue *txSubmit=nullptr;IOSkywalkTxCompletionQueue *txComplete=nullptr;IOSkywalkRxCompletionQueue *rxComplete=nullptr;
  unsigned queuesAdded=0,completionCount=0,queueCount=0;IOSkywalkPacket *completions[128]={};
@@ -167,6 +189,7 @@ struct AirportMtkAwdlInterface:NativeProtocol {
  bool initRegistrationInfo(IOSkywalkEthernetInterface::RegistrationInfo*,unsigned,unsigned){return !infoFail;}
  IOReturn registerEthernetInterface(IOSkywalkEthernetInterface::RegistrationInfo *info,IOSkywalkPacketQueue**,unsigned count,IOSkywalkPacketBufferPool*,IOSkywalkPacketBufferPool*,unsigned){const char *prefix=nullptr;uint32_t unit=1;memcpy(&prefix,info->bytes+0x30,sizeof(prefix));memcpy(&unit,info->bytes+0x38,sizeof(unit));assert(!strcmp(prefix,"awdl")&&unit==0);uint32_t subfamily=0,media=0;memcpy(&subfamily,info->bytes+0x0c,4);memcpy(&media,info->bytes+0x28,4);assert(subfamily==3&&media==0x80);assert(count==3&&queuesAdded==3&&deferred);registered=!registerFail;return registerFail?7:0;}
  unsigned getHardwareAssists() override;
+ IOReturn prepareBSDInterface(ifnet_t,unsigned) override;
  bool start(IOService*);bool createDataPath();void releaseDataPath();void drainCompletions();void inputNative(const uint8_t*,size_t);void setDataPathEnabled(bool);void stop(IOService*);
  IOReturn enable(unsigned) override;IOReturn disable(unsigned) override;
  void enableDatapath();void disableDatapath();static IOReturn dataPathGated(OSObject*,void*,void*,void*,void*);
@@ -194,6 +217,13 @@ IOSkywalkPacket *tx(){auto p=new IOSkywalkPacket;p->tx=p->prepared=true;return p
 int main(){
  AirportMtkAwdlInterface offload;NativeProtocol *offloadBase=&offload;
  assert(offloadBase->getHardwareAssists()==0);
+ assert(!offloadBase->prepareBSDInterface(&offload,0)&&!hwassist);
+ assert(!(capabilities&(IFCAP_HWCSUM|IFCAP_TSO|IFCAP_LRO|IFCAP_CSUM_PARTIAL|IFCAP_CSUM_ZERO_INVERT|IFCAP_LRO_NUM_SEG)));
+ assert(capabilities&0x400); // Preserve Skywalk support.
+ bsdPrepareStatus=kIOReturnNotReady;hwassist=123;
+ assert(offloadBase->prepareBSDInterface(&offload,0)==kIOReturnNotReady&&hwassist==123);bsdPrepareStatus=0;
+ offloadError=1;assert(offloadBase->prepareBSDInterface(&offload,0)==kIOReturnError);offloadError=0;
+ capsError=1;assert(offloadBase->prepareBSDInterface(&offload,0)==kIOReturnError);capsError=0;
  for(int n=1;n<=5;++n){reset();failFactory=n;failure();}
  for(int n=1;n<=3;++n){reset();failAdd=n;failure();}
  reset();resourceAvailable=false;failure();assert(factory==0&&nativeStarts==0);
@@ -248,10 +278,19 @@ int main(){
  uint8_t disabledData[64]={42};auto rxBefore=p->nativeRx;p->inputNative(disabledData,64);assert(p->nativeRx==rxBefore);
  assert(bsdProvider->disable(7)==0&&bsdProvider->enable(7)==0&&p->dataPathEnabled);
  nativeDisableObserver=nullptr;
- uint8_t data[1514]={42};int before=live;p->inputNative(data,64);assert(live==before&&p->nativeRx==1);
+ uint8_t data[1514]={42};int before=live;
+ unsigned finalizedBefore=rxFinalized,reclaimedBefore=rxReclaimed;
+ p->inputNative(data,64);assert(live==before&&p->nativeRx==1);
+ assert(rxFinalized==finalizedBefore+1&&rxReclaimed==reclaimedBefore);
  rejectRX=true;p->inputNative(data,64);rejectRX=false;assert(live==before&&p->nativeRx==1);
  prepareFail=true;p->inputNative(data,64);prepareFail=false;assert(live==before);
  allocateFail=true;p->inputNative(data,64);allocateFail=false;assert(live==before);
+ for(bool *fault:{&badRXBuffers,&badRXOffset,&badRXLength,&noRXAddress}){
+  *fault=true;p->inputNative(data,64);*fault=false;assert(live==before&&p->nativeRx==1);
+ }
+ p->rxComplete->disable();p->inputNative(data,64);p->rxComplete->enable();assert(live==before&&p->nativeRx==1);
+ assert(rxReclaimed==reclaimedBefore+7&&rxPreparedCompleted==7);
+ assert(rxFinalized==finalizedBefore+8);
  p->inputNative(nullptr,64);p->inputNative(data,1515);p->inputNative(data,13);assert(live==before);
  // Firmware wait allows gated submissions between first drain and timer cancel.
  c.hal.wait=[&](){auto packet=tx();unsigned n=p->submitNative(p,p->txSubmit,&packet,1,nullptr);outstanding+=n;assert(p->completionCount==1);};

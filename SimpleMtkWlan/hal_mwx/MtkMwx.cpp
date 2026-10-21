@@ -8859,6 +8859,25 @@ IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable)
     return kIOReturnSuccess;
 }
 
+IOReturn MtkMwx::awdlPrepareChannel(uint8_t channel)
+{
+    MwxAwdlCall call(com);
+    if(!call.valid() || !com->sc_awdl_enabled || com->sc_resetting || com->sc_detaching)
+        return kIOReturnNotReady;
+    if(!awdlChannelAllowed(channel)) return kIOReturnBadArgument;
+    MwxAwdlOperation operation(com);
+    if(!operation.valid()) return kIOReturnNotReady;
+    if(com->sc_awdl_channel==channel) return kIOReturnSuccess;
+    IOLockLock(com->sc_awdl_lock);
+    bool inUse=com->sc_awdl_roc.pending ||
+        (com->sc_awdl_roc.granted && mwx_awdl_now()<com->sc_awdl_roc.deadline);
+    IOLockUnlock(com->sc_awdl_lock);
+    if(inUse) return kIOReturnBusy;
+    int error=mwx_awdl_set_channel(com,channel,operation.epoch);
+    if(!operation.valid()) return kIOReturnAborted;
+    return error ? kIOReturnIOError : kIOReturnSuccess;
+}
+
 IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
 {
     MwxAwdlCall call(com);

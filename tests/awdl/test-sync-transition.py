@@ -16,6 +16,7 @@ code=r'''
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <cstring>
 #define XYLog(...) ((void)0)
 using IOReturn=unsigned;using AbsoluteTime=uint64_t;using IOThread=void*;
 constexpr unsigned kIOReturnSuccess=0,kIOReturnNotReady=1,kIOReturnBusy=2,kIOReturnTimeout=3,kMillisecondScale=1,THREAD_UNINT=0;
@@ -40,7 +41,7 @@ struct Hal{
 };
 struct AirportMtkAwdlInterface:OSObject{
  Hal radio;Hal*hal=&radio;Timer clock;Timer*timer=&clock;
- bool stopping=false,enabled=false;IOThread syncOwner=nullptr;
+ struct{void reset(){}}dataPeers;bool trafficActive=false,trafficPeerInstalled=false;uint8_t installedTrafficPeer[6]{};bool stopping=false,enabled=false;IOThread syncOwner=nullptr;
  uint64_t syncRequests=0,syncWaits=0,syncFailures=0;
  struct{uint8_t mac[6]={2,1,2,3,4,5};}state;
  uint64_t nextAction=0,requestDeadline=0;unsigned requestedChannel=0,grantedChannel=0,queueCount=0,queueHead=0;

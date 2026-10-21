@@ -34,8 +34,9 @@ struct Packet{std::vector<uint8_t> bytes;};using mbuf_t=Packet*;
 void mbuf_freem(mbuf_t m){delete m;}void*mbuf_data(mbuf_t m){return m->bytes.data();}
 struct Hal{
  bool on=true;mtkawdl::Reservation grant{};unsigned reserves=0,aborts=0,transmits=0;
- uint8_t requested=0;uint32_t duration=0;std::function<void()> onReserve;
- bool awdlIsEnabled(){return on;}bool awdlChannelAllowed(unsigned c){return c==6||c==44;}
+ uint8_t requested=0,preparedChannel=0;unsigned prepares=0;
+ uint32_t duration=0;std::function<void()> onReserve,onPrepare;
+ IOReturn awdlPrepareChannel(unsigned c){++prepares;preparedChannel=c;if(onPrepare)onPrepare();return 0;}bool awdlIsEnabled(){return on;}bool awdlChannelAllowed(unsigned c){return c==6||c==44;}
  bool awdlGrantSnapshot(mtkawdl::Reservation &out){out=grant;return on;}
  bool awdlCanTransmit(unsigned c){return grant.canTransmit(c,clockUS);}
  void awdlAbort(){++aborts;grant.cancel();}
@@ -51,7 +52,7 @@ struct AirportMtkAwdlInterface{
  Hal radio;Hal*hal=&radio;Timer t;Timer*timer=&t;
  bool enabled=true,stopping=false,trafficActive=false,trafficPeerInstalled=false;
  uint8_t trafficPeer[6]{},installedTrafficPeer[6]{};
- mtkawdl::State state;mtkawdl::Timeline awTimeline;mtkawdl::Window requestedWindow{};
+ mtkawdl::DataPeers dataPeers;mtkawdl::State state;mtkawdl::Timeline awTimeline;mtkawdl::Window requestedWindow{};
  apple80211_awdl_sync_state syncState{};
  struct NativePeerSample{mtkawdl::Advertisement advertisement;uint8_t peer[6];uint64_t received;bool valid;};
  NativePeerSample nativePeerSamples[16]{};uint64_t advertisersRequests=0;
@@ -129,10 +130,12 @@ int main(){
  // Reentrant end must not dispatch duplicate ends.
  callback.onEnd=[&]{callback.notifyAvailabilityWindowEnd(clockUS);};
  callback.notifyAvailabilityWindowEnd(clockUS);assert(callback.events.size()==2);
- // Prepare the next different channel only in the last 8ms before its edge.
+ // Slow RLM configuration happens early; the short ROC stays near the edge.
  AirportMtkAwdlInterface prepare;init(prepare);prepare.radio.grant.cancel();
  prepare.state.sequence.channels[1]=prepare.state.ownSequence.channels[1]=44;
- clockUS+=20000;prepare.serviceInGate();assert(prepare.radio.reserves==0);
+ prepare.radio.onPrepare=[&]{clockUS+=20000;};
+ clockUS+=20000;prepare.serviceInGate();assert(prepare.radio.reserves==0&&prepare.radio.prepares==1&&prepare.radio.preparedChannel==44);
+ prepare.radio.onPrepare=nullptr;
  clockUS=1000000+4*mtkawdl::awUs-7000;prepare.serviceInGate();
  assert(prepare.radio.reserves==1&&prepare.radio.requested==44&&prepare.radio.duration==70);
  assert(prepare.events.empty());

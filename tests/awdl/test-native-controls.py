@@ -26,7 +26,7 @@ code = r'''
 #include <AWDL/AwdlProtocol.hpp>
 using IOReturn = unsigned;
 constexpr unsigned APPLE80211_VERSION = 1, kIOReturnSuccess = 0,
-                   kIOReturnBadArgument = 1, kIOReturnUnsupported = 2;
+                   kIOReturnBadArgument = 1, kIOReturnUnsupported = 2,kIOReturnNoResources=7;
 #define __IO80211_TARGET __MAC_26_0
 struct apple80211_channel { uint32_t version,channel,flags; };
 '''+'\n'.join(structs)+r'''
@@ -45,7 +45,7 @@ struct Timer { unsigned calls = 0; void setTimeoutMS(unsigned n) { assert(n==1);
 struct AirportMtkAwdlInterface {
     struct Hal { bool awdlChannelAllowed(unsigned c) { return c==6 || c==11 || c==44 || c==149; } } radio;
     Hal *hal = &radio;
-    mtkawdl::State state;
+    mtkawdl::DataPeers dataPeers;mtkawdl::State state;
     apple80211_awdl_sync_channel_sequence channelSequence{};
     apple80211_awdl_sync_params syncParams{};
     uint64_t nextAction = 0; uint32_t secondaryMasterChannel = 0;

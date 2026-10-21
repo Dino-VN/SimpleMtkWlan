@@ -159,6 +159,58 @@ struct Peer {
         return s.channels[(count/(unsigned(s.step)+1))%s.count];
     }
 };
+// Native cache/traffic registration is authoritative for data membership;
+// synchronization advertisements have a separate, short-lived radio schedule.
+// Keeping replay state here prevents schedule expiry from reopening old data.
+struct DataPeers {
+    struct Entry {
+        Peer replayState;
+        uint64_t seen;
+        bool cached, traffic;
+    } entries[maxPeers]={};
+    void reset() { memset(entries,0,sizeof(entries)); }
+    bool live(const Entry &e,uint64_t now) const {
+        return e.replayState.used && (e.cached || e.traffic ||
+            (now>=e.seen && now-e.seen<=peerLifetimeUs));
+    }
+    int find(const uint8_t *mac,uint64_t now) const {
+        for(unsigned i=0;i<maxPeers;++i)
+            if(live(entries[i],now) && !memcmp(entries[i].replayState.mac,mac,6)) return i;
+        return -1;
+    }
+    int observe(const uint8_t *mac,uint64_t now) {
+        if(!unicast(mac)) return -1;
+        int i=find(mac,now);
+        if(i<0) for(unsigned j=0;j<maxPeers;++j) if(!live(entries[j],now)) {
+            i=j; memset(&entries[i],0,sizeof(entries[i]));
+            memcpy(entries[i].replayState.mac,mac,6); entries[i].replayState.used=true; break;
+        }
+        if(i>=0) entries[i].seen=now;
+        return i;
+    }
+    bool canObserve(const uint8_t *mac,uint64_t now) const {
+        if(!unicast(mac)) return false;
+        if(find(mac,now)>=0) return true;
+        for(unsigned i=0;i<maxPeers;++i) if(!live(entries[i],now)) return true;
+        return false;
+    }
+    bool setCached(const uint8_t *mac,bool value,uint64_t now) {
+        int i=value ? observe(mac,now) : find(mac,now);
+        if(i<0) return !value;
+        entries[i].cached=value;
+        // Native cache removal revokes authorization and replay even if the
+        // last advertisement is recent. A traffic registration may still own it.
+        if(!value && !entries[i].traffic) memset(&entries[i],0,sizeof(entries[i]));
+        return true;
+    }
+    bool setTraffic(const uint8_t *mac,bool value,uint64_t now) {
+        int i=value ? observe(mac,now) : find(mac,now);
+        if(i<0) return !value;
+        entries[i].traffic=value;
+        if(!value && !entries[i].cached) memset(&entries[i],0,sizeof(entries[i]));
+        return true;
+    }
+};
 struct State {
     uint8_t mac[6], master[6], sync[6], forcedSync[6];
     Sequence sequence, ownSequence; Peer peers[maxPeers];

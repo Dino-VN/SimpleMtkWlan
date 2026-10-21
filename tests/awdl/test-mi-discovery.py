@@ -20,10 +20,11 @@ code=r'''
 #define __IO80211_TARGET __MAC_26_0
 using IOReturn=unsigned;
 constexpr unsigned APPLE80211_VERSION=1,kIOReturnSuccess=0,kIOReturnBadArgument=1,
- kIOReturnUnsupported=2,kIOReturnNotReady=3,kIOReturnNoMemory=4,
+ kIOReturnUnsupported=2,kIOReturnNotReady=3,kIOReturnNoMemory=4,kIOReturnNoResources=5,
  APPLE80211_C_FLAG_20MHZ=1,APPLE80211_C_FLAG_2GHZ=8,APPLE80211_C_FLAG_5GHZ=16;
 uint64_t clockUS=1000000;uint64_t awdlNow(){return clockUS;}
 struct apple80211_channel{uint32_t version,channel,flags;};
+struct apple80211_peer_cache_control{uint8_t bytes[0x1d0];};
 '''+ '\n'.join(structs)+r'''
 struct Timer{unsigned ms=0;void setTimeoutMS(unsigned n){ms=n;}void setTimeoutUS(unsigned n){ms=(n+999)/1000;}void cancelTimeout(){}};
 struct Packet{std::vector<uint8_t> bytes;};using mbuf_t=Packet*;
@@ -33,21 +34,22 @@ struct IO80211Buffer{uint8_t bytes[2048]{};unsigned length=0,returned=0;
  void setLength(unsigned n){length=n;}void returnBuffer(){++returned;}};
 struct IO80211BufferPool{IO80211Buffer b;bool missing=false;IO80211Buffer*getBuffer(){return missing?nullptr:&b;}};
 struct Hal{
- bool grant=true,on=true;IOReturn txResult=0;uint64_t observedAt=clockUS;unsigned transmitted=0;std::vector<std::vector<uint8_t>> frames;
- bool awdlIsEnabled(){return on;}void awdlAbort(){}bool awdlChannelAllowed(unsigned c){return c==6||c==149;}
+ bool grant=true,on=true;IOReturn txResult=0,peerResult=0;unsigned peerCalls=0;uint64_t observedAt=clockUS;unsigned transmitted=0;std::vector<std::vector<uint8_t>> frames;
+ IOReturn awdlPrepareChannel(unsigned){return 0;}bool awdlIsEnabled(){return on;}void awdlAbort(){}bool awdlChannelAllowed(unsigned c){return c==6||c==149;}
  bool awdlGrantSnapshot(mtkawdl::Reservation &out){
   out={};out.granted=grant;out.channel=6;out.token=1;out.grantObservedAt=observedAt;
   out.deadline=clockUS+70000;return on;
  }
  bool awdlCanTransmit(unsigned){return grant;}IOReturn awdlReserve(unsigned,unsigned){return 0;}
- IOReturn awdlPeer(const uint8_t*,bool){return 0;}
+ IOReturn awdlPeer(const uint8_t*,bool){++peerCalls;return peerResult;}
  IOReturn awdlTransmit(mbuf_t m,unsigned){++transmitted;frames.push_back(m->bytes);delete m;return txResult;}
 };
 struct AirportMtkAwdlInterface{
  Hal radio;Hal*hal=&radio;Timer t;Timer*timer=&t;IO80211BufferPool pool;
+ void *owner=nullptr;void retain(){}void release(){}
  bool enabled=true,stopping=false,trafficPeerInstalled=false,trafficActive=false;
  uint8_t trafficPeer[6]{},installedTrafficPeer[6]{};
- mtkawdl::State state;mtkawdl::Timeline awTimeline;mtkawdl::Window requestedWindow{};
+ mtkawdl::DataPeers dataPeers;mtkawdl::State state;mtkawdl::Timeline awTimeline;mtkawdl::Window requestedWindow{};
  struct NativePeerSample{mtkawdl::Advertisement advertisement;uint8_t peer[6];uint64_t received;bool valid;};
  NativePeerSample nativePeerSamples[16]{};unsigned nativePeerSampleNext=0;
  void notifyAvailabilityWindowStart(uint8_t,uint64_t){}
@@ -80,8 +82,13 @@ struct AirportMtkAwdlInterface{
  IOReturn setAWDL_AF_TX_MODE(apple80211_awdl_af_tx_mode*);
  IOReturn setAWDL_OOB_AUTO_REQUEST(apple80211_awdl_oob_request*);
  void serviceInGate();static bool receive(void*,const uint8_t*,size_t,uint8_t,int8_t);
+ IOReturn setPEER_CACHE_CONTROL(apple80211_peer_cache_control*);
 };
-'''+fn('IOReturn AirportMtkAwdlInterface::setAWDL_AF_TX_MODE(')+fn('IOReturn AirportMtkAwdlInterface::setAWDL_OOB_AUTO_REQUEST(')+fn('void AirportMtkAwdlInterface::serviceInGate(')+fn('bool AirportMtkAwdlInterface::receive(')+r'''
+unsigned cacheCompletions=0;
+void awdlControllerMessage(void*,AirportMtkAwdlInterface*,unsigned id,void*p,unsigned n,bool){
+ assert(id==0x33&&n==0x1d0);auto*b=(uint8_t*)p;assert(mtkawdl::le32(b+4)==1||mtkawdl::le32(b+4)==3);++cacheCompletions;
+}
+'''+fn('IOReturn AirportMtkAwdlInterface::setAWDL_AF_TX_MODE(')+fn('IOReturn AirportMtkAwdlInterface::setAWDL_OOB_AUTO_REQUEST(')+fn('IOReturn AirportMtkAwdlInterface::setPEER_CACHE_CONTROL(')+fn('void AirportMtkAwdlInterface::serviceInGate(')+fn('bool AirportMtkAwdlInterface::receive(')+r'''
 int main(){
  AirportMtkAwdlInterface d;const uint8_t local[]={2,1,2,3,4,5},peer[]={2,1,2,3,4,6};
  d.state.init(local,clockUS);
@@ -166,6 +173,45 @@ int main(){
  d.serviceInGate();assert(d.queueCount==32&&d.dataTxExpired==33);
  for(unsigned i=0;i<32;++i)assert(d.queue[(d.queueHead+i)%64]->bytes.back()==i*2+1);
  clockUS+=1000000;d.serviceInGate();assert(!d.queueCount&&d.dataTxExpired==65);
+ // Cache membership outlives the host's 3-second synchronization schedule.
+ apple80211_peer_cache_control cache{};mtkawdl::put32(cache.bytes,1);memcpy(cache.bytes+8,peer,6);
+ d.radio.peerResult=kIOReturnNotReady;
+ unsigned completionBefore=cacheCompletions;
+ assert(d.setPEER_CACHE_CONTROL(&cache)==kIOReturnNotReady&&cacheCompletions==completionBefore);
+ int failedMember=d.dataPeers.find(peer,clockUS);
+ assert(failedMember<0||!d.dataPeers.entries[failedMember].cached);
+ d.radio.peerResult=0;assert(d.setPEER_CACHE_CONTROL(&cache)==0);
+ int member=d.dataPeers.find(peer,clockUS);assert(member>=0&&d.dataPeers.entries[member].cached);
+ d.state.nativeElectionManaged=true;d.state.nativeParentSelected=true;clockUS+=4000000;d.state.elect(clockUS);
+ assert(d.state.find(peer)<0&&d.dataPeers.find(peer,clockUS)>=0);
+ memcpy(eth,local,6);wn=mtkawdl::encodeData(wire,sizeof(wire),eth,sizeof(eth),80);
+ unsigned receivedBefore=d.received.size();d.receive(&d,wire,wn,6,-40);assert(d.received.size()==receivedBefore+1);
+ d.receive(&d,wire,wn,6,-40);assert(d.received.size()==receivedBefore+1);
+ // Repeating cache add must keep the existing replay window.
+ assert(d.setPEER_CACHE_CONTROL(&cache)==0);d.receive(&d,wire,wn,6,-40);assert(d.received.size()==receivedBefore+1);
+ mtkawdl::put32(cache.bytes+4,2);assert(d.setPEER_CACHE_CONTROL(&cache)==0);
+ assert(d.dataPeers.find(peer,clockUS)<0);unsigned unknownBefore=d.dataRxUnknownPeer;
+ d.receive(&d,wire,wn,6,-40);assert(d.dataRxUnknownPeer==unknownBefore+1);
+ // Trusted traffic registration needs no fabricated synchronization peer.
+ assert(d.dataPeers.setTraffic(peer,true,clockUS));assert(d.state.find(peer)<0);
+ clockUS+=5000000;assert(d.dataPeers.find(peer,clockUS)>=0);
+ unsigned peerCallsBefore=d.radio.peerCalls;
+ assert(d.setPEER_CACHE_CONTROL(&cache)==0&&d.radio.peerCalls==peerCallsBefore);
+ assert(d.dataPeers.find(peer,clockUS)>=0); // Cache delete cannot tear down traffic's station.
+ d.trafficActive=d.trafficPeerInstalled=true;memcpy(d.trafficPeer,peer,6);memcpy(d.installedTrafficPeer,peer,6);
+ d.serviceInGate();assert(d.trafficPeerInstalled&&d.radio.peerCalls==peerCallsBefore);
+ // Ending traffic must keep a station still owned by native cache.
+ mtkawdl::put32(cache.bytes+4,0);assert(d.setPEER_CACHE_CONTROL(&cache)==0);
+ d.trafficActive=false;peerCallsBefore=d.radio.peerCalls;d.serviceInGate();
+ assert(!d.trafficPeerInstalled&&d.radio.peerCalls==peerCallsBefore);
+ assert(d.dataPeers.setCached(peer,false,clockUS));
+ assert(d.dataPeers.setTraffic(peer,false,clockUS)&&d.dataPeers.find(peer,clockUS)<0);
+ mtkawdl::DataPeers full;for(unsigned i=0;i<mtkawdl::maxPeers;++i){uint8_t mac[6]={2,0,0,0,0,uint8_t(i)};assert(full.setCached(mac,true,clockUS));}
+ assert(!full.canObserve(peer,clockUS)&&!full.setCached(peer,true,clockUS));
+ d.dataPeers=full;peerCallsBefore=d.radio.peerCalls;
+ assert(d.setPEER_CACHE_CONTROL(&cache)==kIOReturnNoResources&&d.radio.peerCalls==peerCallsBefore);
+ d.dataPeers.reset();
+ assert(d.dataPeers.observe(peer,clockUS)>=0);clockUS+=mtkawdl::peerLifetimeUs+1;assert(d.dataPeers.find(peer,clockUS)<0);
  puts("PASS actual MI/control/RX: borrowed ABI/copy, bitmap/cancel, granted MIF, PSF modes, native discovery, data/aggregate RX, per-MSDU replay, peer/destination gates, atomic malformed-tail rejection, TX submission/failure and no-grant expiry.");
 }
 '''

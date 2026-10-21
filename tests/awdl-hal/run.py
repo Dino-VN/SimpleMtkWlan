@@ -122,10 +122,10 @@ int mwx_mcu_wait_resp_int(mwx_softc*sc,int,int,uint32_t*status){assert(!sc->sc_a
 int scan_cancel_status=0,scan_cancels=0,scan_tasks=0,systq=0;
 int mt7921_mcu_hw_scan_cancel(mwx_softc*){++scan_cancels;return scan_cancel_status;}
 void task_add(int,int*){++scan_tasks;}
-class MtkMwx {public:mwx_softc *com;MtkMwx *mwxController(){return this;}void setProperty(const char*,const char*){}void setProperty(const char*,uint64_t,unsigned){}bool awdlChannelAllowed(uint8_t);void awdlAbort();IOReturn awdlEnable(const uint8_t*,bool);IOReturn awdlReserve(uint8_t,uint32_t);bool awdlCanTransmit(uint8_t);IOReturn awdlPeer(const uint8_t*,bool);};
+class MtkMwx {public:mwx_softc *com;MtkMwx *mwxController(){return this;}void setProperty(const char*,const char*){}void setProperty(const char*,uint64_t,unsigned){}bool awdlChannelAllowed(uint8_t);void awdlAbort();IOReturn awdlPrepareChannel(uint8_t);IOReturn awdlEnable(const uint8_t*,bool);IOReturn awdlReserve(uint8_t,uint32_t);bool awdlCanTransmit(uint8_t);IOReturn awdlPeer(const uint8_t*,bool);};
 '''+structs+r'''
 mbuf*mwx_fill_sta_req_hdr(mbuf*m,mwx_vif*v,uint8_t omac,uint16_t wcid,uint16_t count){auto*p=(sta_req_hdr*)m->bytes;p->bss_idx=v->idx;p->wlan_idx_lo=wcid;p->wlan_idx_hi=wcid>>8;p->tlv_num=count;p->is_tlv_append=1;p->muar_idx=omac;return m;}
-'''+helpers+'\n'+function('static void mwx_awdl_strip_deaggregate(')+'\n'+function('bool MtkMwx::awdlChannelAllowed(')+'\n'+function('static void mwx_awdl_abort(')+'\n'+function('void MtkMwx::awdlAbort(')+'\n'+function('static int mwx_awdl_remove_station(')+'\n'+function('static int mwx_awdl_remove_context(mwx_softc')+'\n'+function('IOReturn MtkMwx::awdlEnable(')+'\n'+function('IOReturn MtkMwx::awdlReserve(')+'\n'+function('bool MtkMwx::awdlCanTransmit(')+'\n'+function('IOReturn MtkMwx::awdlPeer(')+r'''
+'''+helpers+'\n'+function('static void mwx_awdl_strip_deaggregate(')+'\n'+function('bool MtkMwx::awdlChannelAllowed(')+'\n'+function('static void mwx_awdl_abort(')+'\n'+function('void MtkMwx::awdlAbort(')+'\n'+function('static int mwx_awdl_remove_station(')+'\n'+function('static int mwx_awdl_remove_context(mwx_softc')+'\n'+function('IOReturn MtkMwx::awdlEnable(')+'\n'+function('IOReturn MtkMwx::awdlPrepareChannel(')+'\n'+function('IOReturn MtkMwx::awdlReserve(')+'\n'+function('bool MtkMwx::awdlCanTransmit(')+'\n'+function('IOReturn MtkMwx::awdlPeer(')+r'''
 IOLock lock;
 mwx_softc make(){mwx_softc sc{};sc.sc_awdl_lock=&lock;sc.sc_ic.ic_if.if_flags=1;sc.sc_capa={2,3};sc.sc_awdl_vif.idx=sc.sc_awdl_vif.omac_idx=1;sc.sc_awdl_vif.vif_mn.wcid=18;sc.sc_awdl_enabled=true;
  for(int ch:{6,44,149}){sc.sc_ic.ic_channels[ch].ic_freq=ch<=14?2407+ch*5:5000+ch*5;sc.sc_ic.ic_channels[ch].ic_flags=1;sc.sc_ic.ic_chan_active[ch/8]|=1U<<(ch%8);sc.sc_ic.ic_chan_avail[ch/8]|=1U<<(ch%8);}return sc;}
@@ -141,6 +141,15 @@ int main(){
  rx=raw;rx.len=50;mwx_awdl_strip_deaggregate(&rx,3);assert(rx.offset==0);
  uint8_t addr[6]={2,1,2,3,4,5};
  reset();auto sc=make();MtkMwx hal{&sc};
+ assert(hal.awdlPrepareChannel(6)==0&&commands.size()==1&&commands[0]==MCU_UNI_CMD_BSS_INFO_UPDATE&&!sc.sc_awdl_roc.pending);
+ auto preparedCalls=commands.size();assert(hal.awdlPrepareChannel(6)==0&&commands.size()==preparedCalls);
+ assert(hal.awdlPrepareChannel(0)==kIOReturnBadArgument);
+ sc.sc_awdl_roc.request(7,6,clock_us);assert(hal.awdlPrepareChannel(44)==kIOReturnBusy&&commands.size()==preparedCalls);
+ assert(sc.sc_awdl_roc.grant(7,6,70,clock_us));assert(hal.awdlPrepareChannel(44)==kIOReturnBusy);
+ clock_us+=70001;assert(hal.awdlPrepareChannel(44)==0&&sc.sc_awdl_channel==44);
+ reset();sc=make();fail_at=1;assert(hal.awdlPrepareChannel(6)==kIOReturnIOError&&!sc.sc_awdl_channel);
+ reset();sc=make();on_wait=[](mwx_softc*s){++s->sc_awdl_epoch;s->sc_awdl_stopping=true;};assert(hal.awdlPrepareChannel(6)==kIOReturnAborted&&!sc.sc_awdl_channel);
+ reset();sc=make();
  assert(!hal.awdlChannelAllowed(0)&&!hal.awdlChannelAllowed(166)&&hal.awdlChannelAllowed(6));
  sc.sc_ic.ic_chan_active[0]=0;assert(!hal.awdlChannelAllowed(6));sc=make();sc.sc_ic.ic_chan_avail[0]=0;assert(!hal.awdlChannelAllowed(6));sc=make();sc.sc_ic.ic_channels[6].ic_flags|=IEEE80211_CHAN_PASSIVE;assert(!hal.awdlChannelAllowed(6));sc=make();
  for(int ch:{6,44,149}){reset();sc=make();assert(hal.awdlReserve(ch,30)==0);assert(commands[0]==0x20002);std::vector<uint8_t> rlm={1,0,0,0,2,0,16,0,(uint8_t)ch,(uint8_t)ch,0,0,2,3,1,0,0,(uint8_t)(ch<=14?0:1),0,0};assert(wire[0]==rlm);auto&roc=wire.back();assert(roc.size()==28&&roc[8]==1&&roc[10]==ch&&roc[14]==ch&&roc[19]==1&&mtkawdl::le32(roc.data()+20)==30);assert(!hal.awdlCanTransmit(ch));assert(!sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token+1,ch,30,clock_us));assert(sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,ch,30,clock_us));assert(hal.awdlCanTransmit(ch));clock_us+=30001;assert(!hal.awdlCanTransmit(ch));}

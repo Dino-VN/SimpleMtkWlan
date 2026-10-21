@@ -64,6 +64,7 @@ public:
     void awdlSetReceiver(void *context, AwdlReceive receiver);
     IOReturn awdlEnable(const uint8_t *address, bool enable);
     IOReturn awdlReserve(uint8_t channel, uint32_t durationMs);
+    IOReturn awdlPrepareChannel(uint8_t channel);
     bool awdlCanTransmit(uint8_t channel);
     bool awdlGrantSnapshot(mtkawdl::Reservation &grant);
     bool awdlIsEnabled();
