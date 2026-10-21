@@ -14,7 +14,7 @@ code=r'''
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
-#include <AWDL/AwdlProtocol.hpp>
+#include <AWDL/AwdlTimeline.hpp>
 #define XYLog(...) ((void)0)
 #define bzero(p,n) memset(p,0,n)
 #define OSSafeReleaseNULL(x) do{if(x){(x)->release();(x)=nullptr;}}while(0)
@@ -49,7 +49,9 @@ struct AirportMtkAwdlInterface:Native{
  void*bsd=nullptr;bool timerAdded=false,stopping=false,enabled=false,nativeBaseInitialized=false,receiverRegistered=false,trafficActive=false,trafficPeerInstalled=false;
  unsigned queueHead=0,queueCount=0,templateLength=0,requestedChannel=0,grantedChannel=0;uint64_t nextAction=0,requestDeadline=0;
  void*queue[64]{};uint8_t trafficPeer[6]{},installedTrafficPeer[6]{};
- mtkawdl::State state;
+ mtkawdl::State state;mtkawdl::Timeline awTimeline;
+ unsigned windowEnds=0;
+ void notifyAvailabilityWindowEnd(uint64_t){++windowEnds;awTimeline.close();}
  struct {unsigned version,availability_window_length,availability_window_period,extension_length,synchronization_frame_period,non_election_master;}syncParams{};
  struct{unsigned version,unk1,unk2,unk3,unk4;}extension{};
  struct{unsigned version,election_id;}electionId{};
@@ -75,7 +77,9 @@ int main(){
  baseFreed=lowerFreed=receiverSet=transportStopped=added=removed=0;
  AirportMtkAwdlInterface obj;
  bool ok=obj.initWithController(&owner,&mac,&radio);assert(ok==(failure==5));
+ if(ok)obj.awTimeline.open=true;
  obj.shutdown();obj.free();
+ assert(obj.windowEnds==(ok?1U:0U));
  assert(lowerFreed==1&&baseFreed==(failure>=2?1U:0U));
  assert(receiverSet==(ok?1U:0U)&&transportStopped==(ok?1U:0U));
  assert(added==removed);

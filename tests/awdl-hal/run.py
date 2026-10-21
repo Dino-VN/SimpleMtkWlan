@@ -27,6 +27,8 @@ code=r'''
 #define IFF_RUNNING 1
 #define IEEE80211_S_SCAN 1
 #define IEEE80211_F_BGSCAN 2
+#define MWX_FLAG_SCANNING 16
+#define MWX_FLAG_BGSCAN 32
 #define IEEE80211_CHAN_PASSIVE 4
 #define IEEE80211_CHAN_DFS 8
 #define MSEC_TO_NSEC(n) ((n)*1000000ULL)
@@ -73,6 +75,7 @@ struct mwx_softc {
  mtkawdl::Reservation sc_awdl_roc;uint8_t sc_awdl_address[6];
  uint64_t sc_awdl_roc_submitted=0,sc_awdl_roc_send_failed=0,sc_awdl_roc_scan_blocked=0,sc_awdl_roc_busy_blocked=0;
  bool sc_awdl_enabled,sc_awdl_configured,sc_awdl_filter_active;uint32_t sc_awdl_filter;
+ uint32_t sc_flags=0;int sc_scan_task=0;
  IOLock*sc_awdl_lock;uint32_t sc_awdl_epoch;bool sc_awdl_busy,sc_awdl_stopping;unsigned sc_awdl_calls;
  uint8_t sc_awdl_channel;uint64_t sc_awdl_token_used[256];
  bool sc_detaching,sc_resetting;struct {uint8_t num_streams,antenna_mask;}sc_capa;
@@ -112,6 +115,9 @@ void*mwx_append_tlv(mbuf*m,uint16_t*count,int tag,int len){assert(m->len+len<=si
 mbuf*mwx_fill_sta_req_hdr(mbuf*,mwx_vif*,uint8_t,uint16_t,uint16_t);
 int mwx_mcu_send_mbuf(mwx_softc*sc,int cmd,mbuf*m,int*seq){*seq=9;int rv=capture(sc,cmd,m->bytes,m->len);delete m;return rv;}
 int mwx_mcu_wait_resp_int(mwx_softc*sc,int,int,uint32_t*status){assert(!sc->sc_awdl_lock->locked);if(on_wait)on_wait(sc);*status=fw_status?fw_status:reply_status;return 0;}
+int scan_cancel_status=0,scan_cancels=0,scan_tasks=0,systq=0;
+int mt7921_mcu_hw_scan_cancel(mwx_softc*){++scan_cancels;return scan_cancel_status;}
+void task_add(int,int*){++scan_tasks;}
 class MtkMwx {public:mwx_softc *com;MtkMwx *mwxController(){return this;}void setProperty(const char*,const char*){}void setProperty(const char*,uint64_t,unsigned){}bool awdlChannelAllowed(uint8_t);void awdlAbort();IOReturn awdlEnable(const uint8_t*,bool);IOReturn awdlReserve(uint8_t,uint32_t);bool awdlCanTransmit(uint8_t);IOReturn awdlPeer(const uint8_t*,bool);};
 '''+structs+r'''
 mbuf*mwx_fill_sta_req_hdr(mbuf*m,mwx_vif*v,uint8_t omac,uint16_t wcid,uint16_t count){auto*p=(sta_req_hdr*)m->bytes;p->bss_idx=v->idx;p->wlan_idx_lo=wcid;p->wlan_idx_hi=wcid>>8;p->tlv_num=count;p->is_tlv_append=1;p->muar_idx=omac;return m;}
@@ -119,15 +125,19 @@ mbuf*mwx_fill_sta_req_hdr(mbuf*m,mwx_vif*v,uint8_t omac,uint16_t wcid,uint16_t c
 IOLock lock;
 mwx_softc make(){mwx_softc sc{};sc.sc_awdl_lock=&lock;sc.sc_ic.ic_if.if_flags=1;sc.sc_capa={2,3};sc.sc_awdl_vif.idx=sc.sc_awdl_vif.omac_idx=1;sc.sc_awdl_vif.vif_mn.wcid=18;sc.sc_awdl_enabled=true;
  for(int ch:{6,44,149}){sc.sc_ic.ic_channels[ch].ic_freq=ch<=14?2407+ch*5:5000+ch*5;sc.sc_ic.ic_channels[ch].ic_flags=1;sc.sc_ic.ic_chan_active[ch/8]|=1U<<(ch%8);sc.sc_ic.ic_chan_avail[ch/8]|=1U<<(ch%8);}return sc;}
-void reset(){wire.clear();commands.clear();calls=fail_at=fw_status=0;model=false;memset(owned,0,sizeof(owned));reply_status=0;alloc_fail=false;on_wait=nullptr;on_sleep=nullptr;lock.locked=false;clock_us=100000;}
+void reset(){wire.clear();commands.clear();calls=fail_at=fw_status=0;model=false;memset(owned,0,sizeof(owned));reply_status=0;alloc_fail=false;on_wait=nullptr;on_sleep=nullptr;lock.locked=false;clock_us=100000;scan_cancel_status=scan_cancels=scan_tasks=0;}
 int main(){
  uint8_t addr[6]={2,1,2,3,4,5};
  reset();auto sc=make();MtkMwx hal{&sc};
  assert(!hal.awdlChannelAllowed(0)&&!hal.awdlChannelAllowed(166)&&hal.awdlChannelAllowed(6));
  sc.sc_ic.ic_chan_active[0]=0;assert(!hal.awdlChannelAllowed(6));sc=make();sc.sc_ic.ic_chan_avail[0]=0;assert(!hal.awdlChannelAllowed(6));sc=make();sc.sc_ic.ic_channels[6].ic_flags|=IEEE80211_CHAN_PASSIVE;assert(!hal.awdlChannelAllowed(6));sc=make();
  for(int ch:{6,44,149}){reset();sc=make();assert(hal.awdlReserve(ch,30)==0);assert(commands[0]==0x20002);std::vector<uint8_t> rlm={1,0,0,0,2,0,16,0,(uint8_t)ch,(uint8_t)ch,0,0,2,3,1,0,0,(uint8_t)(ch<=14?0:1),0,0};assert(wire[0]==rlm);auto&roc=wire.back();assert(roc.size()==28&&roc[8]==1&&roc[10]==ch&&roc[14]==ch&&roc[19]==1&&mtkawdl::le32(roc.data()+20)==30);assert(!hal.awdlCanTransmit(ch));assert(!sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token+1,ch,30,clock_us));assert(sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,ch,30,clock_us));assert(hal.awdlCanTransmit(ch));clock_us+=30001;assert(!hal.awdlCanTransmit(ch));}
- reset();sc=make();assert(hal.awdlReserve(6,0)==kIOReturnBadArgument&&commands.empty());assert(hal.awdlReserve(6,66)==kIOReturnBadArgument);sc.sc_ic.ic_state=IEEE80211_S_SCAN;assert(hal.awdlReserve(6,30)==kIOReturnNotReady&&sc.sc_awdl_roc_scan_blocked==1&&sc.sc_awdl_roc_submitted==0);
- sc.sc_ic.ic_state=0;sc.sc_awdl_busy=true;assert(hal.awdlReserve(6,30)==kIOReturnNotReady&&sc.sc_awdl_roc_busy_blocked==1&&commands.empty());sc.sc_awdl_busy=false;
+ reset();sc=make();assert(hal.awdlReserve(6,0)==kIOReturnBadArgument&&commands.empty());assert(hal.awdlReserve(6,71)==kIOReturnBadArgument);sc.sc_ic.ic_state=IEEE80211_S_SCAN;assert(hal.awdlReserve(6,30)==kIOReturnNotReady&&sc.sc_awdl_roc_scan_blocked==1&&sc.sc_awdl_roc_submitted==0);
+ assert(scan_cancels==1&&scan_tasks==1);
+ sc.sc_ic.ic_state=0;sc.sc_flags=MWX_FLAG_SCANNING|MWX_FLAG_BGSCAN;
+ scan_cancel_status=5;assert(hal.awdlReserve(6,70)==kIOReturnNotReady&&sc.sc_flags);
+ scan_cancel_status=0;assert(hal.awdlReserve(6,70)==kIOReturnNotReady&&!sc.sc_flags);
+ sc.sc_awdl_busy=true;assert(hal.awdlReserve(6,30)==kIOReturnNotReady&&sc.sc_awdl_roc_busy_blocked==1&&commands.empty());sc.sc_awdl_busy=false;
  assert(hal.awdlReserve(6,30)==0&&sc.sc_awdl_roc_submitted==1);
  sc.sc_awdl_busy=true;memcpy(sc.sc_awdl_address,addr,6);auto before=commands.size();assert(hal.awdlEnable(addr,true)==0&&commands.size()==before);uint8_t other[6]={2,8,7,6,5,4};assert(hal.awdlEnable(other,true)==kIOReturnBusy);sc.sc_awdl_busy=false;
  reset();sc=make();fail_at=1;assert(hal.awdlReserve(6,30)==kIOReturnIOError&&commands.size()==1&&!sc.sc_awdl_roc.pending);

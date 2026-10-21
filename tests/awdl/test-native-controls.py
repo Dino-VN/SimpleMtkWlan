@@ -92,6 +92,23 @@ int main() {
     params.synchronization_frame_period=440;
     assert(!interface.setAWDL_SYNC_PARAMS(&params)&&interface.state.syncRole==2);
     assert(!memcmp(interface.state.forcedSync,master,6));
+    // Native owns the programmed sequence even while following a peer whose
+    // advertised sequence differs. RX and timer election must preserve it.
+    interface.state.nativeElectionManaged=true;
+    interface.state.nativeParentSelected=true;
+    memcpy(interface.state.nativeParent,master,6);
+    auto &p=interface.state.peers[0];p.used=true;p.seen=p.epoch=awdlNow();
+    memcpy(p.mac,master,6);p.advertisement.sequence=interface.state.sequence;
+    p.advertisement.sequence.channels[0]=44;p.advertisement.presence=4;
+    memcpy(p.advertisement.master,master,6);memcpy(p.advertisement.sync,master,6);
+    interface.state.elect(awdlNow());assert(interface.state.synchronized);
+    sequence.seqs[2].channel=149;
+    assert(!interface.setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE(&sequence));
+    interface.state.elect(awdlNow());
+    assert(interface.state.sequence.channels[0]==149&&interface.state.channel(awdlNow())==149);
+    // Native mode 1 can synchronize to a distinct immediate master (KC
+    // programChipWithNewMaster). It is not restricted to the local MAC.
+    assert(interface.state.setSyncRole(1,master));
     apple80211_awdl_secondary_master_channel secondary{1,149};
     assert(!interface.setAWDL_SECONDARY_MASTER_CHANNEL(&secondary)&&interface.secondaryMasterChannel==149);
     secondary.secondary_master_channel=166;

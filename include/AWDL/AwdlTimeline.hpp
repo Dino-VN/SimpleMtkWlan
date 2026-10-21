@@ -21,26 +21,43 @@ inline bool currentWindow(const State &s,uint64_t now,Window &out) {
 struct Timeline {
     Window active={};
     bool open=false, emitted=false;
-    uint64_t lastStart=0, lastWindowStart=0, starts=0, ends=0, late=0;
+    uint64_t radioEnd=0;
+    uint8_t role=1, token=0;
+    uint64_t grantObservedAt=0;
+    uint64_t lastStart=0, lastWindowStart=0, starts=0, ends=0, late=0, shortGrants=0;
     uint16_t lastCounter=0;
     uint8_t sync[6]={}, root[6]={};
-    // Open only at an observed EAW boundary with a real grant covering its
-    // remainder. Eight ms bound host dispatch lateness inside native's 10ms
-    // tolerance; timestamps still report observations, not a fabricated edge.
+    uint8_t lastSync[6]={}, lastRoot[6]={};
+    uint8_t lastPresence=0;
+    // Report an actual grant near the EAW edge. A firmware grant may be
+    // shorter than the requested dwell: track its real end instead of hiding
+    // the whole AW or promising radio availability until the scheduled end.
     bool begin(const Window &w,const Reservation &grant,uint64_t now,
-               const uint8_t *parent,const uint8_t *master) {
+               const uint8_t *parent,const uint8_t *master,uint8_t nativeRole=1) {
         if(open || !w.channel || now<w.start || now>=w.end || now-w.start>8000 ||
-           !grant.canTransmit(w.channel,now) || grant.deadline+2000<w.end ||
+           !grant.canTransmit(w.channel,now) || !grant.grantObservedAt ||
            grant.grantObservedAt>now) { ++late; return false; }
-        if(emitted && lastWindowStart==w.start) return false;
+        uint64_t end=grant.deadline<w.end ? grant.deadline : w.end;
+        // Native sanityCheckAWEnd allows +/-10 TU, not an arbitrary partial
+        // dwell. Never announce a 32ms grant as a complete 64TU native AW.
+        if(end-now+10*1024<unsigned(w.presence)*awUs) { ++shortGrants; return false; }
+        // RX clock corrections can move an edge by a fraction of a TU.
+        // Identify the last notified window by counter/presence/master too;
+        // its timestamp alone must not permit a second start for that AW.
+        uint64_t edgeDelta=w.start>=lastWindowStart ? w.start-lastWindowStart : lastWindowStart-w.start;
+        if(emitted && lastCounter==w.counter && lastPresence==w.presence &&
+           !memcmp(lastSync,parent,6) && !memcmp(lastRoot,master,6) &&
+           edgeDelta<unsigned(w.presence)*awUs) return false;
         active=w; open=true; emitted=true; lastWindowStart=w.start;
-        // Record observed start, never fabricate a grant at scheduled start.
-        lastStart=now; lastCounter=w.counter; ++starts;
-        memcpy(sync,parent,6); memcpy(root,master,6); return true;
+        radioEnd=end;
+        role=nativeRole; token=grant.token; grantObservedAt=grant.grantObservedAt;
+        lastStart=now; lastCounter=w.counter; lastPresence=w.presence; ++starts;
+        memcpy(sync,parent,6); memcpy(root,master,6);
+        memcpy(lastSync,parent,6); memcpy(lastRoot,master,6); return true;
     }
-    bool due(uint64_t now) const { return open && now>=active.end; }
+    bool due(uint64_t now) const { return open && now>=radioEnd; }
     void close() { if(open) { open=false; ++ends; } }
-    void reset() { open=false; emitted=false; lastWindowStart=0; }
+    void reset() { open=false; emitted=false; lastWindowStart=radioEnd=0; }
 };
 }
 #endif

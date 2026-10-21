@@ -151,8 +151,6 @@ private:
     uint8_t miTemplate[2048] = {}; size_t miTemplateLength = 0;
     uint64_t miStart = 0, miSubmitted = 0, miFailed = 0;
     uint16_t miCounter = 0; bool miCounterValid = false;
-    uint16_t awStartCounter = 0; bool awStartCounterValid = false;
-    bool awWindowOpen = false; uint64_t awWindowEnd = 0;
     mtkawdl::Timeline awTimeline;
     mtkawdl::Window requestedWindow={};
     struct NativePeerSample {

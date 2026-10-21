@@ -192,7 +192,8 @@ struct State {
     }
     bool setSyncRole(unsigned role,const uint8_t *address) {
         if (role<1 || role>3 || !address || !unicast(address) ||
-            (role==2 ? !memcmp(address,mac,6) : memcmp(address,mac,6))) return false;
+            (role==2 ? !memcmp(address,mac,6) :
+             role==3 ? memcmp(address,mac,6) : (!nativeElectionManaged && memcmp(address,mac,6)))) return false;
         if (syncRole==role && !memcmp(forcedSync,address,6)) return true;
         syncRole=role; memcpy(forcedSync,address,6);
         synchronized=false; sequence=ownSequence; presence=ownPresence;
@@ -258,7 +259,12 @@ struct State {
         }
         synchronized=true;
         const Peer &p=peers[best]; memcpy(master,p.advertisement.master,6);
-        memcpy(sync,p.mac,6); sequence=p.advertisement.sequence; presence=p.advertisement.presence;
+        memcpy(sync,p.mac,6);
+        // Native programs our radio sequence independently of its selected
+        // synchronization parent. A peer supplies the clock, not an implicit
+        // replacement for the sequence accepted by the native setter.
+        sequence=nativeElectionManaged ? ownSequence : p.advertisement.sequence;
+        presence=nativeElectionManaged ? ownPresence : p.advertisement.presence;
         masterMetric=p.advertisement.metric; masterCounter=p.advertisement.masterCounter;
         distance=p.advertisement.distance+1;
         epoch=p.epoch; baseCounter=p.baseCounter;

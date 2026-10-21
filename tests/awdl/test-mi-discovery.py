@@ -16,7 +16,7 @@ code=r'''
 #include <cstring>
 #include <cstdio>
 #include <vector>
-#include <AWDL/AwdlProtocol.hpp>
+#include <AWDL/AwdlTimeline.hpp>
 #define __IO80211_TARGET __MAC_26_0
 using IOReturn=unsigned;
 constexpr unsigned APPLE80211_VERSION=1,kIOReturnSuccess=0,kIOReturnBadArgument=1,
@@ -25,7 +25,7 @@ constexpr unsigned APPLE80211_VERSION=1,kIOReturnSuccess=0,kIOReturnBadArgument=
 uint64_t clockUS=1000000;uint64_t awdlNow(){return clockUS;}
 struct apple80211_channel{uint32_t version,channel,flags;};
 '''+ '\n'.join(structs)+r'''
-struct Timer{unsigned ms=0;void setTimeoutMS(unsigned n){ms=n;}void cancelTimeout(){}};
+struct Timer{unsigned ms=0;void setTimeoutMS(unsigned n){ms=n;}void setTimeoutUS(unsigned n){ms=(n+999)/1000;}void cancelTimeout(){}};
 struct Packet{std::vector<uint8_t> bytes;};using mbuf_t=Packet*;
 void mbuf_freem(mbuf_t m){delete m;}void *mbuf_data(mbuf_t m){return m->bytes.data();}
 struct IO80211Buffer{uint8_t bytes[2048]{};unsigned length=0,returned=0;
@@ -33,8 +33,12 @@ struct IO80211Buffer{uint8_t bytes[2048]{};unsigned length=0,returned=0;
  void setLength(unsigned n){length=n;}void returnBuffer(){++returned;}};
 struct IO80211BufferPool{IO80211Buffer b;bool missing=false;IO80211Buffer*getBuffer(){return missing?nullptr:&b;}};
 struct Hal{
- bool grant=true,on=true;unsigned transmitted=0;std::vector<std::vector<uint8_t>> frames;
+ bool grant=true,on=true;uint64_t observedAt=clockUS;unsigned transmitted=0;std::vector<std::vector<uint8_t>> frames;
  bool awdlIsEnabled(){return on;}void awdlAbort(){}bool awdlChannelAllowed(unsigned c){return c==6||c==149;}
+ bool awdlGrantSnapshot(mtkawdl::Reservation &out){
+  out={};out.granted=grant;out.channel=6;out.token=1;out.grantObservedAt=observedAt;
+  out.deadline=clockUS+70000;return on;
+ }
  bool awdlCanTransmit(unsigned){return grant;}IOReturn awdlReserve(unsigned,unsigned){return 0;}
  IOReturn awdlPeer(const uint8_t*,bool){return 0;}
  IOReturn awdlTransmit(mbuf_t m,unsigned){++transmitted;frames.push_back(m->bytes);delete m;return 0;}
@@ -43,7 +47,11 @@ struct AirportMtkAwdlInterface{
  Hal radio;Hal*hal=&radio;Timer t;Timer*timer=&t;IO80211BufferPool pool;
  bool enabled=true,stopping=false,trafficPeerInstalled=false,trafficActive=false;
  uint8_t trafficPeer[6]{},installedTrafficPeer[6]{};
- mtkawdl::State state;
+ mtkawdl::State state;mtkawdl::Timeline awTimeline;mtkawdl::Window requestedWindow{};
+ struct NativePeerSample{mtkawdl::Advertisement advertisement;uint8_t peer[6];uint64_t received;bool valid;};
+ NativePeerSample nativePeerSamples[16]{};unsigned nativePeerSampleNext=0;
+ void notifyAvailabilityWindowStart(uint8_t,uint64_t){}
+ void notifyAvailabilityWindowEnd(uint64_t){awTimeline.close();}
  apple80211_awdl_af_tx_mode afMode{};
  struct{unsigned synchronization_frame_period=440;}syncParams;
  struct{int peer_rssi_threshold=-70;}rssiThresholds;
