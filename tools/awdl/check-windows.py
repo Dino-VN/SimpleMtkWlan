@@ -41,8 +41,8 @@ def check():
     time.sleep(args.seconds)
     after = snapshot()
     logs = run(['/usr/bin/log','show','--start',started,'--style','ndjson',
-                '--predicate','process == "kernel" AND (eventMessage CONTAINS "AWDL SANITY FAILURE" OR eventMessage CONTAINS[c] "aw start event missing")']).decode(errors='replace')
-    messages, missing = [], []
+                '--predicate','process == "kernel" AND (eventMessage CONTAINS "AWDL SANITY FAILURE" OR eventMessage CONTAINS[c] "aw start event missing" OR eventMessage CONTAINS[c] "Did not get AW start event")']).decode(errors='replace')
+    messages, missing, warnings = [], [], []
     for line in logs.splitlines():
         try:
             record = json.loads(line)
@@ -53,7 +53,10 @@ def check():
             messages.append(message)
         if 'awdl0' in message and 'aw start event missing' in message.lower():
             missing.append(message)
-    result.update(before=before, after=after, sanity_failures=messages, missing_start_errors=missing)
+        if 'awdl0' in message and 'did not get aw start event' in message.lower():
+            warnings.append(message)
+    result.update(before=before, after=after, sanity_failures=messages,
+                  missing_start_errors=missing, missing_start_warnings=warnings)
     # Monotonic notification counters belong to one interface instance.
     starts = after.get('MTKAWDLAWStartNotifications', 0) - before.get('MTKAWDLAWStartNotifications', 0)
     ends = after.get('MTKAWDLAWEndNotifications', 0) - before.get('MTKAWDLAWEndNotifications', 0)
@@ -61,7 +64,7 @@ def check():
     result.update(start_delta=starts, end_delta=ends, balance=balance)
     if messages:
         result['reasons'].append('Native AWDL sanity failures were recorded.')
-    if missing:
+    if missing or warnings:
         result['reasons'].append('Native AWDL reported missing AW-start events.')
     if starts < 0 or ends < 0:
         result['reasons'].append('Interface counters reset during observation.')
@@ -73,7 +76,7 @@ def check():
         result['reasons'].append('AWDL synchronization is disabled.')
     if not result['reasons']:
         result['status'] = 'passed'
-    elif messages or missing or starts < 0 or ends < 0 or balance != int(bool(after.get('MTKAWDLAWWindowOpen', False))):
+    elif messages or missing or warnings or starts < 0 or ends < 0 or balance != int(bool(after.get('MTKAWDLAWWindowOpen', False))):
         result['status'] = 'failed'
     return result
 

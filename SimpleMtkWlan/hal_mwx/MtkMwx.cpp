@@ -8925,10 +8925,12 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
     if(!operation.valid()) { ++com->sc_awdl_roc_busy_blocked; return kIOReturnNotReady; }
     mwx_awdl_abort(com);
     if(!operation.valid()) return kIOReturnAborted;
-    // ROC describes the temporary radio grant, not the secondary BSS's RLM.
-    // Keep both contexts on the requested channel. Schedule this operation
-    // during the preceding idle slot, rather than waiting at the AW edge.
-    if(com->sc_awdl_channel!=channel) {
+    // Initialize the secondary BSS RLM once. MT7921's ROC acquire carries
+    // the temporary channel/band/width itself (Linux mt7921_mcu_set_roc).
+    // Reprogramming RLM synchronously at every temporary channel switch
+    // blocks the AW timer and can consume the whole next window. Keep the
+    // BSS base context stable; only a matching ROC event permits RF TX.
+    if(!com->sc_awdl_channel) {
         int rv=mwx_awdl_set_channel(com,channel,operation.epoch);
         if(!operation.valid()) return kIOReturnAborted;
         if(rv) return kIOReturnIOError;
@@ -9051,6 +9053,7 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKAWDLROCLastDurationMS",static_cast<uint64_t>(last.durationMs),32);
     mwxController()->setProperty("MTKAWDLROCRequestedAtUS",radio.requestedAt,64);
     mwxController()->setProperty("MTKAWDLROCResponseTimeoutUS",static_cast<uint64_t>(mtkawdl::rocResponseTimeoutUs),32);
+    mwxController()->setProperty("MTKAWDLBSSBaseChannel",static_cast<uint64_t>(com->sc_awdl_channel),32);
     mwxController()->setProperty("MTKAWDLROCSubmitted",com->sc_awdl_roc_submitted,64);
     mwxController()->setProperty("MTKAWDLROCSendFailed",com->sc_awdl_roc_send_failed,64);
     mwxController()->setProperty("MTKAWDLROCScanBlocked",com->sc_awdl_roc_scan_blocked,64);

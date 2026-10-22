@@ -25,10 +25,11 @@ constexpr uint32_t rocLeadUs=55000;
 // Prepare the BSS and ROC before the edge, and keep one grant for adjacent
 // equal channels. A grant alone never changes the announced schedule.
 struct RadioPlan { Window window; uint64_t requestAt; uint32_t durationMs; };
-inline bool planRadio(const State &s,uint64_t now,RadioPlan &out,uint32_t leadUs=rocLeadUs) {
+inline bool planRadio(const State &s,uint64_t now,RadioPlan &out,uint32_t leadUs=rocLeadUs,
+                      bool skipCurrent=false) {
     Window target={};
     if(!currentWindow(s,now,target)) return false;
-    if(!target.channel || now-target.start>8000) {
+    if(skipCurrent || !target.channel || now-target.start>8000) {
         for(unsigned i=0;i<s.sequence.count;++i) {
             if(!currentWindow(s,target.end,target)) return false;
             if(target.channel) break;
@@ -105,6 +106,10 @@ struct Timeline {
         memcpy(lastSync,parent,6); memcpy(lastRoot,master,6); return true;
     }
     bool due(uint64_t now) const { return open && now>=radioEnd; }
+    uint32_t switchLeadUS() const {
+        uint64_t lateStart=lastStart-active.start;
+        return lateStart<10*1024 ? static_cast<uint32_t>(10*1024-lateStart) : 0;
+    }
     void close() { if(open) { open=false; ++ends; } }
     void reset() { open=false; emitted=false; lastWindowStart=radioEnd=0; }
 };

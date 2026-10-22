@@ -309,6 +309,128 @@ int main(){
  clockUS=1000000+4*mtkawdl::awUs-24000;delayedRlm.serviceInGate();
  assert(delayedRlm.reserveWaitUS==200000&&delayedRlm.reserveInvalidations==0&&
         delayedRlm.radio.aborts==0&&delayedRlm.radio.grant.pending&&delayedRlm.requestedChannel==44);
+ // Native follower loses its selected peer, while unrelated valid RX keeps
+ // arriving. Keep the selected clock in holdover and the real granted AWs
+ // progressing; fresh advertisements must not silently select another tree.
+ AirportMtkAwdlInterface holdover;init(holdover);
+ holdover.state.baseCounter=65532;
+ holdover.state.nativeElectionManaged=true;holdover.state.selectNativeParent(peer);
+ auto &lost=holdover.state.peers[0];lost.used=true;lost.seen=lost.epoch=clockUS;
+ lost.baseCounter=65532;
+ memcpy(lost.mac,peer,6);memcpy(lost.advertisement.master,peer,6);
+ holdover.state.elect(clockUS);assert(holdover.state.setSyncRole(2,peer));
+ holdover.state.elect(clockUS);holdover.serviceInGate();
+ uint64_t holdoverOrigin=clockUS,holdoverStop=clockUS+5000000,dueHoldover=0;
+ uint8_t holdoverToken=1;
+ holdover.radio.onReserve=[&]{holdover.radio.grant.request(++holdoverToken,6,clockUS);dueHoldover=clockUS+3000;};
+ while(clockUS<holdoverStop) {
+  auto &unrelated=holdover.state.peers[1];unrelated.used=true;unrelated.seen=clockUS;
+  const uint8_t other[]={2,1,2,3,4,7};memcpy(unrelated.mac,other,6);
+  memcpy(unrelated.advertisement.master,other,6);
+  if(holdover.radio.grant.pending&&clockUS>=dueHoldover)
+   assert(holdover.radio.grant.grant(holdoverToken,6,holdover.radio.duration,clockUS));
+  holdover.serviceInGate();clockUS+=holdover.t.us+250;
+ }
+ assert(clockUS-holdoverOrigin>mtkawdl::peerLifetimeUs&&!lost.used);
+ assert(holdover.awTimeline.starts>=76&&holdover.state.channel(clockUS)==6);
+ assert(!memcmp(holdover.state.sync,peer,6)&&holdover.state.nativeClockHoldover);
+ assert(!holdover.state.synchronized&&holdover.state.nativeHoldoverTransitions==1);
+ unsigned holdStarts=0,holdEnds=0;uint16_t previousHold=65528;
+ uint32_t lastHoldStart=0,holdStart=0;
+ for(const auto &e:holdover.events) {
+  if(e.id==41) {
+   assert(holdStarts==holdEnds);uint16_t c=mtkawdl::le32(e.bytes.data());
+   assert(c==uint16_t(previousHold+4));previousHold=c;
+   holdStart=mtkawdl::be32(e.bytes.data()+20);
+   if(holdStarts) {int64_t gap=int64_t(uint32_t(holdStart-lastHoldStart))-4*int64_t(mtkawdl::awUs);
+    assert(gap>=-5*1024&&gap<=5*1024);}
+   assert(!memcmp(e.bytes.data()+8,peer,6));lastHoldStart=holdStart;++holdStarts;
+  } else {assert(holdStarts==holdEnds+1);++holdEnds;
+   uint32_t dwell=mtkawdl::be32(e.bytes.data()+4)-holdStart;
+   assert(dwell/1024>=54&&dwell/1024<=74);}
+ }
+ // Holdover still advertises the real counter and selected tree, and sends
+ // multicast only under the live grant. It does not recreate expired peers.
+ uint8_t holdFrame[512];mtkawdl::Advertisement holdWire{};
+ size_t holdSize=mtkawdl::buildAction(holdover.state,holdFrame,sizeof(holdFrame),clockUS);
+ assert(mtkawdl::parseAction(holdFrame,holdSize,holdWire));
+ assert(holdWire.counter==holdover.state.counter(clockUS)&&!memcmp(holdWire.master,peer,6));
+ holdSize=mtkawdl::refreshAction(holdover.state,holdFrame,holdSize,clockUS);
+ assert(mtkawdl::parseAction(holdFrame,holdSize,holdWire)&&holdWire.counter==holdover.state.counter(clockUS));
+ uint8_t holdData[24]{};holdData[4]=1;
+ holdover.queue[0]=holdover.makeFrame(holdData,sizeof(holdData));
+ holdover.queueHead=0;holdover.queueTime[0]=clockUS;holdover.queueCount=1;
+ assert(holdover.radio.awdlCanTransmit(6));holdover.serviceInGate();
+ assert(!holdover.queueCount&&holdover.dataTxSubmitted==1&&!lost.used);
+ // The selected source returns with a small phase offset. Resume bounded
+ // tracking without adopting a new AW counter after the holdover.
+ lost.used=true;lost.seen=clockUS;lost.epoch=holdoverOrigin-100;
+ lost.baseCounter=65532;
+ uint64_t returnEdge=holdover.awTimeline.radioEnd;
+ uint16_t holdCounter=holdover.state.counter(returnEdge);
+ clockUS=returnEdge;holdover.serviceInGate();
+ assert(!holdover.state.nativeClockHoldover&&holdover.state.counter(clockUS)==holdCounter);
+ assert(holdover.state.clockCorrections==1);
+ // A different missing native parent cannot inherit the old holdover.
+ mtkawdl::State missingParent=holdover.state;missingParent.discardControls();
+ const uint8_t missingMac[]={2,1,2,3,4,8};missingParent.selectNativeParent(missingMac);
+ missingParent.elect(clockUS);assert(!missingParent.radioScheduleReady()&&!missingParent.channel(clockUS));
+ assert(!mtkawdl::buildAction(missingParent,holdFrame,sizeof(holdFrame),clockUS));
+ // Observing a new parent with an incompatible counter does not validate
+ // its clock or grant permission to enter holdover when that peer expires.
+ auto &incompatible=missingParent.peers[2];incompatible.used=true;incompatible.seen=clockUS;
+ incompatible.epoch=clockUS;incompatible.baseCounter=10000;
+ memcpy(incompatible.mac,missingMac,6);memcpy(incompatible.advertisement.master,missingMac,6);
+ missingParent.elect(clockUS);assert(missingParent.clockRejected&&!missingParent.nativeClockValidated);
+ missingParent.elect(clockUS+mtkawdl::peerLifetimeUs+1);
+ assert(!missingParent.nativeClockHoldover&&!missingParent.radioScheduleReady());
+ // Non-election master wins even if a previously selected peer is live.
+ mtkawdl::State ownMaster=holdover.state;ownMaster.discardControls();
+ assert(ownMaster.setSyncRole(3,local));ownMaster.elect(clockUS);
+ assert(!ownMaster.nativeClockHoldover&&!ownMaster.synchronized&&!memcmp(ownMaster.master,local,6));
+ // Before ever acquiring the selected clock, follower stays quiet despite
+ // an otherwise valid RF grant. Holdover never invents initial sync.
+ AirportMtkAwdlInterface neverSelected;init(neverSelected);
+ neverSelected.state.nativeElectionManaged=true;
+ assert(neverSelected.state.setSyncRole(2,peer));neverSelected.serviceInGate();
+ assert(!neverSelected.state.nativeClockHoldover&&neverSelected.events.empty()&&neverSelected.radio.transmits==0);
+
+ // Compare the measured RLM+grant path with ROC-only temporary switching.
+ // Exact observed channel groups, ~15ms RLM and 13.424ms ROC response.
+ unsigned coverage[2]{};
+ for(unsigned scenario=0;scenario<2;++scenario) {
+  AirportMtkAwdlInterface grouped;init(grouped);
+  const uint8_t groups[16]={6,6,6,6,44,44,44,44,6,6,6,6,44,44,44,44};
+  memcpy(grouped.state.sequence.channels,groups,16);grouped.state.ownSequence=grouped.state.sequence;
+  grouped.radio.give(1,6,273);uint64_t groupDue=0,stop=clockUS+4000000;uint8_t token=1;
+  grouped.radio.onReserve=[&]{if(scenario==0)clockUS+=15019;
+   grouped.radio.grant.request(++token,grouped.radio.requested,clockUS);groupDue=clockUS+13424;};
+  while(clockUS<stop) {
+   if(grouped.radio.grant.pending&&clockUS>=groupDue)
+    assert(grouped.radio.grant.grant(token,grouped.radio.requested,grouped.radio.duration,clockUS));
+   grouped.serviceInGate();clockUS+=grouped.t.us+100;
+  }
+  unsigned groupEnds=0;uint32_t groupStart=0,previousStart=0;uint16_t previous=0;
+  for(const auto&e:grouped.events) {
+   if(e.id==41) {
+    assert(coverage[scenario]==groupEnds);uint16_t counter=mtkawdl::le32(e.bytes.data());
+    uint64_t stamp=mtkawdl::be32(e.bytes.data()+20);mtkawdl::Window expected{};
+    assert(mtkawdl::currentWindow(grouped.state,stamp,expected));
+    assert(counter==expected.counter&&stamp>=expected.start&&stamp-expected.start<=8000);
+    assert(mtkawdl::le32(e.bytes.data()+28)==expected.channel);
+    if(scenario==1&&coverage[scenario]) {
+     assert(counter==uint16_t(previous+4));
+     int64_t gap=int64_t(uint32_t(stamp-previousStart))-4*int64_t(mtkawdl::awUs);
+     assert(gap>=-5*1024&&gap<=5*1024);
+    }
+    groupStart=previousStart=stamp;previous=counter;++coverage[scenario];
+   } else {assert(coverage[scenario]==groupEnds+1);++groupEnds;
+    uint32_t dwell=mtkawdl::be32(e.bytes.data()+4)-groupStart;
+    assert(dwell/1024>=54&&dwell/1024<=74);}
+  }
+ }
+ fprintf(stderr,"measured grouped coverage RLM=%u ROC-only=%u\n",coverage[0],coverage[1]);
+ assert(coverage[1]>coverage[0]);
  // Honor the driver's requested timer interval; fixed 1ms polling can hide
  // misses when the production timer asks for 2ms. Include bounded jitter.
  for(unsigned latency:{3000,8000}) {
@@ -347,7 +469,7 @@ int main(){
           presence,latency,jitter,(unsigned long long)sweep.awTimeline.starts,
           (unsigned long long)sweep.awTimeline.ends);
   assert(sweep.awTimeline.starts==20);
-  unsigned starts=0,ends=0;uint32_t startTime=0;
+  unsigned starts=0,ends=0;uint32_t startTime=0,previousTime=0;
   for(const auto&event:sweep.events){
    if(event.id==41){
     assert(starts==ends);
@@ -355,6 +477,9 @@ int main(){
     mtkawdl::Window expected{};assert(mtkawdl::currentWindow(sweep.state,edge,expected));
     startTime=mtkawdl::be32(event.bytes.data()+20);
     assert(startTime>=edge&&startTime-edge<=8000);
+    if(starts) {int64_t gap=int64_t(uint32_t(startTime-previousTime))-int64_t(length);
+     assert(gap>=-5*1024&&gap<=5*1024);}
+    previousTime=startTime;
     assert(mtkawdl::le32(event.bytes.data())==expected.counter);
     assert(mtkawdl::le32(event.bytes.data()+28)==expected.channel);++starts;
    }else{

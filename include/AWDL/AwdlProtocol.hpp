@@ -236,6 +236,8 @@ struct State {
     // The selected clock survives opmode changes and temporary peer expiry.
     // Effective radio controls are a transaction applied between AW events.
     bool nativeClockSelected, nativeTimelineStarted, controlsHeld, controlsDirty;
+    bool nativeClockHoldover, nativeClockValidated;
+    uint64_t nativeHoldoverTransitions;
     uint8_t clockParent[6], clockRoot[6];
     uint64_t controlsDeferred;
     struct Controls {
@@ -260,7 +262,10 @@ struct State {
                 memcpy(pendingControls.parent,address,6); pendingControls.parentSelected=true;
                 controlsDirty=true; ++controlsDeferred;
             }
-        } else { memcpy(nativeParent,address,6); nativeParentSelected=true; }
+        } else {
+            if(memcmp(nativeParent,address,6)) nativeClockHoldover=false;
+            memcpy(nativeParent,address,6); nativeParentSelected=true;
+        }
     }
     bool releaseControls(uint64_t now) {
         if(!controlsHeld) return false;
@@ -292,8 +297,13 @@ struct State {
         return period-uint32_t((uint64_t(baseCounter%presence)*awUs+elapsed%period)%period);
     }
     uint8_t channel(uint64_t now) const {
-        if (syncRole==2 && !synchronized) return 0;
+        if (!radioScheduleReady()) return 0;
         return validSequence(sequence) ? sequence.channels[(counter(now)/(unsigned(sequence.step)+1))%sequence.count] : 0;
+    }
+    bool radioScheduleReady() const {
+        return syncRole!=2 || synchronized || (nativeClockHoldover && nativeElectionManaged &&
+            nativeClockSelected && nativeClockValidated && nativeParentSelected &&
+            !memcmp(clockParent,nativeParent,6));
     }
     bool setSyncRole(unsigned role,const uint8_t *address) {
         if (role<1 || role>3 || !address || !unicast(address) ||
@@ -309,7 +319,7 @@ struct State {
         if (syncRole==role && !memcmp(forcedSync,address,6)) return true;
         holdClock(0);
         syncRole=role; memcpy(forcedSync,address,6);
-        synchronized=false; sequence=ownSequence; presence=ownPresence;
+        synchronized=false; nativeClockHoldover=false; sequence=ownSequence; presence=ownPresence;
         memcpy(master,mac,6); memcpy(sync,mac,6); masterMetric=metric;
         masterCounter=selfCounter; distance=0; return true;
     }
@@ -360,7 +370,7 @@ struct State {
         if(controlsHeld) return;
         // Only a top master advances its own election counter. Followers
         // advertise the counter learned from their selected master.
-        if(now<electionEpoch || synchronized) electionEpoch=now;
+        if(now<electionEpoch || synchronized || nativeClockHoldover) electionEpoch=now;
         else {
             uint64_t intervals=(now-electionEpoch)/3140000;
             selfCounter+=uint32_t(intervals); electionEpoch+=intervals*3140000;
@@ -375,11 +385,11 @@ struct State {
             if(!p.used || !memcmp(p.advertisement.master,mac,6)) continue;
             const Advertisement &a=p.advertisement;
             if(a.distance>=10 || !memcmp(a.sync,mac,6)) continue;
+            if(syncRole==3) continue;
             if(nativeElectionManaged) {
                 if(!memcmp(p.mac,nativeParent,6)) best=i;
                 continue;
             }
-            if(syncRole==3) continue;
             if(syncRole==2) { if(!memcmp(p.mac,forcedSync,6)) best=i; continue; }
             // omdrop-owl's iOS 26 captures show metric precedes counter.
             int32_t rank=int32_t(a.masterCounter-selfCounter);
@@ -392,6 +402,20 @@ struct State {
                 (a.distance<b.distance || (a.distance==b.distance && memcmp(p.mac,peers[best].mac,6)>0)))))) best=i;
         }
         if(best<0) {
+            // Native selected this firmware-clock equivalent and still owns
+            // the configured sequence. A short RX cache expiry must not stop
+            // all radio reservations or silently promote us to another tree.
+            // Holdover retains the last clock; it does not claim peer RF sync.
+            if(nativeElectionManaged && nativeClockSelected && nativeClockValidated &&
+               nativeParentSelected && syncRole!=3 &&
+               !memcmp(clockParent,nativeParent,6)) {
+                if(!nativeClockHoldover) ++nativeHoldoverTransitions;
+                nativeClockHoldover=true; synchronized=false;
+                sequence=ownSequence; presence=ownPresence;
+                memcpy(master,clockRoot,6); memcpy(sync,clockParent,6);
+                return;
+            }
+            nativeClockHoldover=false;
             // Preserve the current AW clock when an elected master expires,
             // but restore our own advertised channel sequence.
             if(synchronized) { sequence=ownSequence; presence=ownPresence; holdClock(0); }
@@ -402,7 +426,7 @@ struct State {
         bool sameClock=nativeElectionManaged ? nativeClockSelected &&
             !memcmp(clockParent,p.mac,6) && !memcmp(clockRoot,p.advertisement.master,6) :
             synchronized && !memcmp(sync,p.mac,6) && !memcmp(master,p.advertisement.master,6);
-        synchronized=true;
+        nativeClockHoldover=false; synchronized=true;
         memcpy(master,p.advertisement.master,6);
         memcpy(sync,p.mac,6);
         // Native programs our radio sequence independently of its selected
@@ -414,7 +438,7 @@ struct State {
         distance=p.advertisement.distance+1;
         bool adopt=!nativeElectionManaged || (!nativeClockSelected && !nativeTimelineStarted);
         if(nativeElectionManaged && !sameClock) {
-            nativeClockSelected=true; memcpy(clockParent,p.mac,6);
+            nativeClockSelected=true; nativeClockValidated=false; memcpy(clockParent,p.mac,6);
             memcpy(clockRoot,p.advertisement.master,6);
         }
         if(adopt) {
@@ -423,6 +447,7 @@ struct State {
             // Once announced, even a different parent is a bounded clock
             // observation; no event-only renumbering can preserve RF sync.
             epoch=p.epoch; baseCounter=p.baseCounter; clockSampleAt=p.seen;
+            if(nativeElectionManaged) nativeClockValidated=true;
         } else if(!sameClock || p.seen>clockSampleAt) {
             uint64_t local=now>=epoch ? now-epoch : 0;
             uint64_t remote=now>=p.epoch ? now-p.epoch : 0;
@@ -434,6 +459,7 @@ struct State {
             if(delta>5*1024 || delta<-5*1024) {
                 clockSampleAt=p.seen; ++clockRejected; return;
             }
+            if(nativeElectionManaged) nativeClockValidated=true;
             if(now<clockHoldUntil) {
                 if(p.seen>clockDeferredAt) { clockDeferredAt=p.seen; ++clockDeferred; }
                 // Do not consume the sample. At the safe edge elect() uses
@@ -502,7 +528,7 @@ inline size_t buildAction(State &s,uint8_t *f,size_t capacity,uint64_t now) {
     const size_t syncLength=39+s.sequence.count+2;
     const size_t size=40+3+syncLength+3+40+3+15+3+2+3+9;
     if(capacity<size || !validSequence(s.sequence) || !validPresence(s.presence) ||
-        s.sequence.step+1!=s.presence || (s.syncRole==2 && !s.synchronized)) return 0;
+        s.sequence.step+1!=s.presence || !s.radioScheduleReady()) return 0;
     memset(f,0,size); f[0]=0xd0; memset(f+4,0xff,6);
     memcpy(f+10,s.mac,6); memcpy(f+16,bssid,6); put16(f+22,s.frameCounter++<<4);
     f[24]=127; f[26]=0x17; f[27]=0xf2; f[28]=8; f[29]=0x10; f[30]=3;
@@ -571,7 +597,7 @@ inline size_t refreshAction(State &s,uint8_t *f,size_t n,uint64_t now) {
     static const uint8_t action[6]={127,0,0x17,0xf2,8,0x10};
     if(n<40 || f[0]!=0xd0 || (f[1]&0xc7) || memcmp(f+24,action,6) ||
         (f[30]!=0 && f[30]!=3) || !validSequence(s.sequence) ||
-        s.sequence.step+1!=s.presence || (s.syncRole==2 && !s.synchronized)) return 0;
+        s.sequence.step+1!=s.presence || !s.radioScheduleReady()) return 0;
     bool hasSync=false,hasElection=false,hasSequence=false,hasLegacyElection=false;
     for(size_t at=40;at<n;) {
         if(n-at<3) return 0;

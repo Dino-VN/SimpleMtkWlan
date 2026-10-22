@@ -234,14 +234,25 @@ int main(){
   assert(sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,ch,300,clock_us));
   assert(hal.awdlCanTransmit(ch));clock_us+=300001;assert(!hal.awdlCanTransmit(ch));
  }
- // Cached RLM needs no redundant update; switching aborts old grant,
- // configures the new BSS channel, then submits the new acquire.
+ // Initial RLM stays stable: temporary switches use the exact ROC channel
+ // without a synchronous BSS wait at the next AW boundary.
  reset();sc=make();sc.sc_awdl_channel=6;
  assert(hal.awdlReserve(6,70)==0&&commands.size()==1&&commands[0]==0x20027);
  assert(sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,6,70,clock_us));
  commands.clear();wire.clear();assert(hal.awdlReserve(44,70)==0);
- assert(commands.size()==3&&commands[0]==0x20027&&wire[0].size()==16);
- assert(commands[1]==MCU_UNI_CMD_BSS_INFO_UPDATE&&commands[2]==0x20027&&wire[2].size()==28);
+ assert(commands.size()==2&&commands[0]==0x20027&&wire[0].size()==16);
+ assert(commands[1]==0x20027&&wire[1].size()==28&&wire[1][10]==44);
+ assert(sc.sc_awdl_channel==6&&!hal.awdlCanTransmit(44));
+ // A slow RLM response callback cannot run during subsequent ROC switches.
+ // After the raw matching event, TX uses the granted channel, not base RLM.
+ on_wait=[](mwx_softc*){if(commands.back()==MCU_UNI_CMD_BSS_INFO_UPDATE)clock_us+=504334;};
+ uint64_t switchingAt=clock_us;
+ assert(hal.awdlReserve(149,70)==0&&clock_us==switchingAt&&commands.back()==0x20027);
+ std::vector<uint8_t> switched(24);mtkawdl::put16(switched.data()+6,20);
+ switched[8]=1;switched[9]=sc.sc_awdl_roc.token;switched[11]=149;switched[17]=1;
+ mtkawdl::put32(switched.data()+20,70);clock_us+=3000;
+ mwx_awdl_roc_event(&sc,switched.data(),switched.size(),clock_us);
+ assert(hal.awdlCanTransmit(149)&&!hal.awdlCanTransmit(6)&&sc.sc_awdl_channel==6);
  // Failed/stale RLM must not request ROC or publish a configured channel.
  reset();sc=make();fw_status=7;
  assert(hal.awdlReserve(44,70)==kIOReturnIOError&&commands.size()==1&&!sc.sc_awdl_channel&&!sc.sc_awdl_roc.pending);

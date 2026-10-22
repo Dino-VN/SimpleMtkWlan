@@ -692,6 +692,13 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLClockRejected",state.clockRejected,64);
     setProperty("MTKAWDLClockDeferred",state.clockDeferred,64);
     setProperty("MTKAWDLClockHoldUntilUS",state.clockHoldUntil,64);
+    setProperty("MTKAWDLClockHoldover",state.nativeClockHoldover);
+    setProperty("MTKAWDLClockHoldoverTransitions",state.nativeHoldoverTransitions,64);
+    setProperty("MTKAWDLNativeParentSelected",state.nativeParentSelected);
+    setProperty("MTKAWDLSelectedClockValidated",state.nativeClockValidated);
+    setProperty("MTKAWDLClockParent",state.clockParent,6);
+    setProperty("MTKAWDLSelectedParent",state.nativeParent,6);
+    setProperty("MTKAWDLSelectedPeerLive",state.synchronized && !state.nativeClockHoldover);
     setProperty("MTKAWDLControlsDeferred",state.controlsDeferred,64);
     setProperty("MTKAWDLControlsPending",state.controlsDirty);
     setProperty("MTKAWDLReserveWaitUS",reserveWaitUS,64);
@@ -776,9 +783,9 @@ void AirportMtkAwdlInterface::serviceInGate()
         mtkawdl::Window next={}; mtkawdl::Reservation live={};
         bool snapshot=hal->awdlGrantSnapshot(live);
         bool nextValid=mtkawdl::currentWindow(state,awTimeline.active.end,next);
-        uint64_t startDelay=awTimeline.lastStart-awTimeline.active.start;
-        uint64_t early=startDelay<10*1024 ? 10*1024-startDelay : 0;
-        if(early>8000) early=8000;
+        // Use the native 10-TU end tolerance after accounting for this
+        // start's lateness. The prior 8ms cap left usable switching time idle.
+        uint64_t early=awTimeline.switchLeadUS();
         if(snapshot && nextValid && next.channel && hal->awdlChannelAllowed(next.channel) &&
            !mtkawdl::grantCoversWindow(next,live,next.start) &&
            early && awTimeline.active.end-now<=early) {
@@ -937,7 +944,11 @@ void AirportMtkAwdlInterface::serviceInGate()
         bool pending=grant.pending && now<grant.deadline;
         if(!pending) {
             mtkawdl::RadioPlan plan={};
-            if(!mtkawdl::planRadio(state,now,plan,reserveLeadUS)) { timer->setTimeoutMS(2); return; }
+            // Once an EAW ended early, reserve its successor even when a
+            // short presence still leaves us inside the start tolerance.
+            // Reacquiring the closed EAW wastes the switching head start.
+            bool skipCurrent=awTimeline.emitted && now<awTimeline.active.end;
+            if(!mtkawdl::planRadio(state,now,plan,reserveLeadUS,skipCurrent)) { timer->setTimeoutMS(2); return; }
             mtkawdl::Window target=plan.window;
             if(!target.channel || !hal->awdlChannelAllowed(target.channel)) {
                 timer->setTimeoutMS(1); return;
@@ -1101,6 +1112,14 @@ void AirportMtkAwdlInterface::serviceInGate()
     // Wake on the recorded radio end instead of overshooting it by a tick.
     uint64_t delay=awTimeline.open && awTimeline.radioEnd>now ? awTimeline.radioEnd-now : 2000;
     if(delay>2000) delay=2000;
+    if(awTimeline.open && awTimeline.matchesSchedule(state)) {
+        mtkawdl::Window next={};
+        uint64_t prepareAt=awTimeline.active.end-awTimeline.switchLeadUS();
+        if(prepareAt>now && mtkawdl::currentWindow(state,awTimeline.active.end,next) &&
+           next.channel && hal->awdlChannelAllowed(next.channel) &&
+           !mtkawdl::grantCoversWindow(next,grant,next.start) && prepareAt-now<delay)
+            delay=prepareAt-now;
+    }
     timer->setTimeoutUS(static_cast<uint32_t>(delay));
 }
 
