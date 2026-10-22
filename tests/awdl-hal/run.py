@@ -62,8 +62,9 @@ code=r'''
 #define CONN_STATE_PORT_SECURE 2
 #define CONN_STATE_DISCONNECT 0
 #define MWX_DEV_LOG(...) ((void)0)
+#define MBUF_DONTWAIT 0
 using IOReturn=int;
-enum { kIOReturnSuccess=0,kIOReturnNotReady=1,kIOReturnBadArgument=2,kIOReturnBusy=3,kIOReturnNoMemory=4,kIOReturnIOError=5,kIOReturnAborted=6,kIOReturnNoResources=7 };
+enum { kIOReturnSuccess=0,kIOReturnNotReady=1,kIOReturnBadArgument=2,kIOReturnBusy=3,kIOReturnNoMemory=4,kIOReturnIOError=5,kIOReturnAborted=6,kIOReturnNoResources=7,kIOReturnNotFound=8 };
 struct IOLock { bool locked=false; };
 void IOLockLock(IOLock *p){assert(!p->locked);p->locked=true;}
 void IOLockUnlock(IOLock *p){assert(p->locked);p->locked=false;}
@@ -76,6 +77,9 @@ struct mwx_softc {
  mwx_vif sc_awdl_vif; mwx_node sc_awdl_peers[3];bool sc_awdl_peer_used[3],sc_awdl_station_pending[4];
  mtkawdl::Reservation sc_awdl_roc;uint8_t sc_awdl_address[6];
  uint64_t sc_awdl_roc_submitted=0,sc_awdl_roc_send_failed=0,sc_awdl_roc_scan_blocked=0,sc_awdl_roc_busy_blocked=0;
+ uint64_t sc_awdl_tx_submitted=0,sc_awdl_tx_bad_frame=0,sc_awdl_tx_no_grant=0,sc_awdl_tx_busy=0,
+ sc_awdl_tx_no_peer=0,sc_awdl_tx_backpressure=0,sc_awdl_tx_copy_failed=0,sc_awdl_tx_dma_failed=0;
+ int sc_awdl_tx_errno=0;
  bool sc_awdl_enabled,sc_awdl_configured,sc_awdl_filter_active;uint32_t sc_awdl_filter;
  uint32_t sc_flags=0;int sc_scan_task=0;
  IOLock*sc_awdl_lock;uint32_t sc_awdl_epoch;bool sc_awdl_busy,sc_awdl_stopping;unsigned sc_awdl_calls;
@@ -84,10 +88,21 @@ struct mwx_softc {
 };
 static bool mwx_awdl_current(mwx_softc*,uint32_t);
 static void mwx_awdl_quiesce(mwx_softc*,bool drainCalls=true);
-struct mbuf { uint8_t bytes[256]{};size_t len=0,offset=0; };
+struct mbuf { uint8_t bytes[256]{};size_t len=0,offset=0,packetLen=0; };
 size_t mbuf_len(mbuf*m){return m->len;}
+size_t mbuf_pkthdr_len(mbuf*m){return m->packetLen;}
+void*mbuf_data(mbuf*m){return m->bytes+m->offset;}
+int txLive=0,txCalls=0,txResult=0;bool txFull=false,copyFailure=false;
+ieee80211_node*txNode=nullptr;std::vector<uint8_t> lastTx;
+void mbuf_freem(mbuf*m){--txLive;delete m;}
 void m_adj(mbuf*m,size_t n){assert(n<=m->len);m->offset+=n;m->len-=n;}
 using mbuf_t=mbuf*;
+int mbuf_dup(mbuf*m,int,mbuf_t*out){if(copyFailure)return ENOMEM;*out=new mbuf(*m);++txLive;return 0;}
+bool mwx_tx_full(mwx_softc*){return txFull;}
+int mwx_tx(mwx_softc*,mbuf*m,ieee80211_node*n){
+ ++txCalls;txNode=n;lastTx.assign((uint8_t*)mbuf_data(m),(uint8_t*)mbuf_data(m)+m->len);
+ mbuf_freem(m);return txResult;
+}
 std::vector<std::vector<uint8_t>> wire;
 std::vector<int> commands;
 std::function<void(mwx_softc*)> on_wait;
@@ -122,10 +137,10 @@ int mwx_mcu_wait_resp_int(mwx_softc*sc,int,int,uint32_t*status){assert(!sc->sc_a
 int scan_cancel_status=0,scan_cancels=0,scan_tasks=0,systq=0;
 int mt7921_mcu_hw_scan_cancel(mwx_softc*){++scan_cancels;return scan_cancel_status;}
 void task_add(int,int*){++scan_tasks;}
-class MtkMwx {public:mwx_softc *com;MtkMwx *mwxController(){return this;}void setProperty(const char*,const char*){}void setProperty(const char*,uint64_t,unsigned){}bool awdlChannelAllowed(uint8_t);void awdlAbort();IOReturn awdlPrepareChannel(uint8_t);IOReturn awdlEnable(const uint8_t*,bool);IOReturn awdlReserve(uint8_t,uint32_t);bool awdlCanTransmit(uint8_t);IOReturn awdlPeer(const uint8_t*,bool);};
+class MtkMwx {public:mwx_softc *com;MtkMwx *mwxController(){return this;}void setProperty(const char*,const char*){}void setProperty(const char*,uint64_t,unsigned){}bool awdlChannelAllowed(uint8_t);void awdlAbort();IOReturn awdlPrepareChannel(uint8_t);IOReturn awdlEnable(const uint8_t*,bool);IOReturn awdlReserve(uint8_t,uint32_t);bool awdlCanTransmit(uint8_t);IOReturn awdlPeer(const uint8_t*,bool);IOReturn awdlTransmit(mbuf_t,uint8_t);IOReturn awdlTryTransmit(mbuf_t*,uint8_t);};
 '''+structs+r'''
 mbuf*mwx_fill_sta_req_hdr(mbuf*m,mwx_vif*v,uint8_t omac,uint16_t wcid,uint16_t count){auto*p=(sta_req_hdr*)m->bytes;p->bss_idx=v->idx;p->wlan_idx_lo=wcid;p->wlan_idx_hi=wcid>>8;p->tlv_num=count;p->is_tlv_append=1;p->muar_idx=omac;return m;}
-'''+helpers+'\n'+function('static void mwx_awdl_strip_deaggregate(')+'\n'+function('bool MtkMwx::awdlChannelAllowed(')+'\n'+function('static void mwx_awdl_abort(')+'\n'+function('void MtkMwx::awdlAbort(')+'\n'+function('static int mwx_awdl_remove_station(')+'\n'+function('static int mwx_awdl_remove_context(mwx_softc')+'\n'+function('IOReturn MtkMwx::awdlEnable(')+'\n'+function('IOReturn MtkMwx::awdlPrepareChannel(')+'\n'+function('IOReturn MtkMwx::awdlReserve(')+'\n'+function('bool MtkMwx::awdlCanTransmit(')+'\n'+function('IOReturn MtkMwx::awdlPeer(')+r'''
+'''+helpers+'\n'+function('static void mwx_awdl_strip_deaggregate(')+'\n'+function('bool MtkMwx::awdlChannelAllowed(')+'\n'+function('static void mwx_awdl_abort(')+'\n'+function('void MtkMwx::awdlAbort(')+'\n'+function('static int mwx_awdl_remove_station(')+'\n'+function('static int mwx_awdl_remove_context(mwx_softc')+'\n'+function('IOReturn MtkMwx::awdlEnable(')+'\n'+function('IOReturn MtkMwx::awdlPrepareChannel(')+'\n'+function('IOReturn MtkMwx::awdlReserve(')+'\n'+function('bool MtkMwx::awdlCanTransmit(')+'\n'+function('IOReturn MtkMwx::awdlPeer(')+'\n'+function('IOReturn MtkMwx::awdlTransmit(')+'\n'+function('IOReturn MtkMwx::awdlTryTransmit(')+r'''
 IOLock lock;
 mwx_softc make(){mwx_softc sc{};sc.sc_awdl_lock=&lock;sc.sc_ic.ic_if.if_flags=1;sc.sc_capa={2,3};sc.sc_awdl_vif.idx=sc.sc_awdl_vif.omac_idx=1;sc.sc_awdl_vif.vif_mn.wcid=18;sc.sc_awdl_enabled=true;
  for(int ch:{6,44,149}){sc.sc_ic.ic_channels[ch].ic_freq=ch<=14?2407+ch*5:5000+ch*5;sc.sc_ic.ic_channels[ch].ic_flags=1;sc.sc_ic.ic_chan_active[ch/8]|=1U<<(ch%8);sc.sc_ic.ic_chan_avail[ch/8]|=1U<<(ch%8);}return sc;}
@@ -210,7 +225,42 @@ int main(){
  on_wait=[](mwx_softc*s){++s->sc_awdl_epoch;};
  assert(hal.awdlEnable(nullptr,false)==kIOReturnAborted);
  assert(sc.sc_awdl_configured&&sc.sc_awdl_station_pending[3]&&commands.size()==1);
- puts("PASS actual HAL AWDL builders: regulatory guards, golden RLM/ROC/WTBL packets, grant expiry, token quarantine, peer capacity and aliased delete, firmware failures, teardown injection, busy drain, masked filter restore, station ownership/re-enable/retry/stale teardown.");
+ // Queue submission retains the original on every transient path. The raw
+ // consuming TX primitive may free an attempted DMA packet even on failure.
+ reset();sc=make();memcpy(sc.sc_awdl_address,addr,6);
+ auto packet=[&](bool multicast){auto*m=new mbuf;++txLive;m->len=m->packetLen=56;
+  memcpy(m->bytes+10,addr,6);memcpy(m->bytes+16,mtkawdl::bssid,6);
+  memcpy(m->bytes+4,addr,6);m->bytes[4]=multicast?1:2;m->bytes[55]=91;return m;};
+ auto grant=[&]{sc.sc_awdl_roc.request(11,6,clock_us);assert(sc.sc_awdl_roc.grant(11,6,70,clock_us));};
+ mbuf_t queued=packet(true),original=queued;
+ assert(hal.awdlTryTransmit(&queued,6)==kIOReturnNotReady&&queued==original&&txLive==1&&txCalls==0);
+ assert(sc.sc_awdl_tx_no_grant==1);grant();
+ sc.sc_awdl_busy=true;assert(hal.awdlTryTransmit(&queued,6)==kIOReturnNotReady&&queued==original);sc.sc_awdl_busy=false;
+ assert(sc.sc_awdl_tx_busy==1&&!sc.sc_awdl_calls);
+ txFull=true;assert(hal.awdlTryTransmit(&queued,6)==kIOReturnNoResources&&queued==original&&txCalls==0);txFull=false;
+ assert(sc.sc_awdl_tx_backpressure==1);
+ copyFailure=true;assert(hal.awdlTryTransmit(&queued,6)==kIOReturnNoMemory&&queued==original&&txLive==1);copyFailure=false;
+ assert(sc.sc_awdl_tx_copy_failed==1);
+ for(int err:{ENOBUFS,EFBIG,EBUSY}){
+  txResult=err;assert(hal.awdlTryTransmit(&queued,6)==kIOReturnNoResources&&queued==original&&txLive==1);
+  assert(queued->bytes[55]==91&&sc.sc_awdl_tx_errno==err&&!sc.sc_awdl_busy&&!sc.sc_awdl_calls);
+ }
+ assert(sc.sc_awdl_tx_dma_failed==3);
+ txResult=0;assert(hal.awdlTryTransmit(&queued,6)==0&&!queued&&txLive==0);
+ assert(txNode==&sc.sc_awdl_vif.vif_mn.ni&&lastTx.back()==91&&sc.sc_awdl_tx_submitted==1);
+ queued=packet(false);original=queued;int callsBefore=txCalls;
+ assert(hal.awdlTryTransmit(&queued,6)==kIOReturnNotFound&&queued==original&&txCalls==callsBefore&&sc.sc_awdl_tx_no_peer==1);
+ sc.sc_awdl_peer_used[1]=true;memcpy(sc.sc_awdl_peers[1].ni.ni_macaddr,queued->bytes+4,6);
+ assert(hal.awdlTryTransmit(&queued,6)==0&&!queued&&!txLive&&txNode==&sc.sc_awdl_peers[1].ni);
+ queued=packet(true);queued->packetLen=55;
+ assert(hal.awdlTryTransmit(&queued,6)==kIOReturnBadArgument&&!queued&&!txLive&&sc.sc_awdl_tx_bad_frame==1);
+ queued=packet(true);queued->bytes[10]^=4;
+ assert(hal.awdlTryTransmit(&queued,6)==kIOReturnBadArgument&&!queued&&!txLive&&sc.sc_awdl_tx_bad_frame==2);
+ // Management remains always consumed, including blocked/invalid requests.
+ sc.sc_awdl_roc.cancel();assert(hal.awdlTransmit(packet(true),6)==kIOReturnNotReady&&!txLive);
+ sc.sc_awdl_stopping=true;assert(hal.awdlTransmit(packet(true),6)==kIOReturnNotReady&&!txLive);
+ assert(hal.awdlTryTransmit(nullptr,6)==kIOReturnBadArgument);
+ puts("PASS actual HAL AWDL builders and TX: regulatory/ROC/WTBL, grant/token/teardown, retained data on no-grant/busy/peer/ring/copy/DMA failure, exact packet ownership, broadcast/unicast node selection and consumed management API.");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='mtk-awdl-hal-') as tmp:

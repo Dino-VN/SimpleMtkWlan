@@ -167,7 +167,7 @@ using IO80211SkywalkInterface=NativeProtocol;
 struct IOSkywalkEthernetInterface {struct RegistrationInfo {uint8_t bytes[0x130];};};
 struct AirportMtkWlan;
 struct AirportMtkAwdlInterface:NativeProtocol {
- AirportMtkWlan *owner=nullptr;MtkMwx *hal=nullptr;bool trafficActive=false,trafficPeerInstalled=false;uint8_t installedTrafficPeer[6]{};mtkawdl::DataPeers dataPeers;bool stopping=false,nativeStarted=false,nativeRegistered=false,dataPathEnabled=false,enabled=false;
+ AirportMtkWlan *owner=nullptr;MtkMwx *hal=nullptr;bool trafficActive=false,trafficPeerInstalled=false;uint8_t installedTrafficPeer[6]{};uint8_t discoveryTxPeers[3][6]{};mtkawdl::DataPeers dataPeers;bool stopping=false,nativeStarted=false,nativeRegistered=false,dataPathEnabled=false,enabled=false;
  IOSkywalkPacketBufferPool *txPool=nullptr,*rxPool=nullptr;
  IOSkywalkTxSubmissionQueue *txSubmit=nullptr;IOSkywalkTxCompletionQueue *txComplete=nullptr;IOSkywalkRxCompletionQueue *rxComplete=nullptr;
  unsigned queuesAdded=0,completionCount=0,queueCount=0;IOSkywalkPacket *completions[128]={};

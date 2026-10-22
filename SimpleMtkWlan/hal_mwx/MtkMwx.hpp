@@ -71,6 +71,9 @@ public:
     void awdlPublishDiagnostics();
     void awdlAbort();
     IOReturn awdlTransmit(mbuf_t frame, uint8_t channel);
+    // Queue API: leave *frame owned by the caller on a transient failure;
+    // clear it after successful submission or permanent rejection.
+    IOReturn awdlTryTransmit(mbuf_t *frame, uint8_t channel);
     bool awdlChannelAllowed(uint8_t channel);
     IOReturn awdlPeer(const uint8_t *address, bool add);
     unsigned awdlPeerCapacity() const { return 3; }

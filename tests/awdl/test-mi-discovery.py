@@ -20,7 +20,7 @@ code=r'''
 #define __IO80211_TARGET __MAC_26_0
 using IOReturn=unsigned;
 constexpr unsigned APPLE80211_VERSION=1,kIOReturnSuccess=0,kIOReturnBadArgument=1,
- kIOReturnUnsupported=2,kIOReturnNotReady=3,kIOReturnNoMemory=4,kIOReturnNoResources=5,
+ kIOReturnUnsupported=2,kIOReturnNotReady=3,kIOReturnNoMemory=4,kIOReturnNoResources=5,kIOReturnNotFound=6,
  APPLE80211_C_FLAG_20MHZ=1,APPLE80211_C_FLAG_2GHZ=8,APPLE80211_C_FLAG_5GHZ=16;
 uint64_t clockUS=1000000;uint64_t awdlNow(){return clockUS;}
 struct apple80211_channel{uint32_t version,channel,flags;};
@@ -34,21 +34,28 @@ struct IO80211Buffer{uint8_t bytes[2048]{};unsigned length=0,returned=0;
  void setLength(unsigned n){length=n;}void returnBuffer(){++returned;}};
 struct IO80211BufferPool{IO80211Buffer b;bool missing=false;IO80211Buffer*getBuffer(){return missing?nullptr:&b;}};
 struct Hal{
- bool grant=true,on=true;IOReturn txResult=0,peerResult=0;unsigned peerCalls=0;uint64_t observedAt=clockUS;unsigned transmitted=0;std::vector<std::vector<uint8_t>> frames;
+ bool grant=true,on=true,missingStation=false;IOReturn txResult=0,peerResult=0;unsigned peerCalls=0;uint64_t observedAt=clockUS;unsigned transmitted=0;std::vector<std::vector<uint8_t>> frames;
  IOReturn awdlPrepareChannel(unsigned){return 0;}bool awdlIsEnabled(){return on;}void awdlAbort(){}bool awdlChannelAllowed(unsigned c){return c==6||c==149;}
  bool awdlGrantSnapshot(mtkawdl::Reservation &out){
   out={};out.granted=grant;out.channel=6;out.token=1;out.grantObservedAt=observedAt;
   out.deadline=clockUS+70000;return on;
  }
  bool awdlCanTransmit(unsigned){return grant;}IOReturn awdlReserve(unsigned,unsigned){return 0;}
- IOReturn awdlPeer(const uint8_t*,bool){++peerCalls;return peerResult;}
+ std::vector<bool> peerOperations;
+ IOReturn awdlPeer(const uint8_t*,bool add){++peerCalls;peerOperations.push_back(add);return peerResult;}
  IOReturn awdlTransmit(mbuf_t m,unsigned){++transmitted;frames.push_back(m->bytes);delete m;return txResult;}
+ IOReturn awdlTryTransmit(mbuf_t *m,unsigned){
+  if(missingStation&&!((*m)->bytes[4]&1))return kIOReturnNotFound;
+  if(txResult==kIOReturnNotReady||txResult==kIOReturnNoResources||txResult==kIOReturnNoMemory)return txResult;
+  IOReturn result=awdlTransmit(*m,6);*m=nullptr;return result;
+ }
 };
 struct AirportMtkAwdlInterface{
  Hal radio;Hal*hal=&radio;Timer t;Timer*timer=&t;IO80211BufferPool pool;
  void *owner=nullptr;void retain(){}void release(){}
  bool enabled=true,stopping=false,trafficPeerInstalled=false,trafficActive=false;
  uint8_t trafficPeer[6]{},installedTrafficPeer[6]{};
+ uint8_t discoveryTxPeers[3][6]{};
  mtkawdl::DataPeers dataPeers;mtkawdl::State state;mtkawdl::Timeline awTimeline;mtkawdl::Window requestedWindow{};
  struct NativePeerSample{mtkawdl::Advertisement advertisement;uint8_t peer[6];uint64_t received;bool valid;};
  NativePeerSample nativePeerSamples[16]{};unsigned nativePeerSampleNext=0;
@@ -65,7 +72,7 @@ struct AirportMtkAwdlInterface{
  actionNativeDelivered=0,actionInvalid=0,actionNoBuffer=0,nextAction=0,requestDeadline=0;
  int32_t lastActionRSSI=0;unsigned reserveDuration=0,requestedChannel=0,grantedChannel=0;
  IOReturn reserveStatus=0,actionStatus=0,miStatus=0;mbuf_t queue[64]{};
- uint64_t dataTxSubmitted=0,dataTxFailed=0,dataTxExpired=0;IOReturn dataTxStatus=0;
+ uint64_t dataTxSubmitted=0,dataTxFailed=0,dataTxExpired=0,dataTxDeferred=0;IOReturn dataTxStatus=0;
  uint64_t dataRxFrames=0,dataRxInvalid=0,dataRxUnknownPeer=0,dataRxWrongDestination=0,dataRxReplay=0,dataRxDecoded=0;
  std::vector<std::vector<uint8_t>> received;
  uint64_t queueTime[64]{};unsigned queueCount=0,queueHead=0,nativeCalls=0;
@@ -165,7 +172,56 @@ int main(){
   d.queue[tail]=d.makeFrame(wire,wn);d.queueTime[tail]=time;++d.queueCount;};
  d.state.peers[d.state.find(peer)].advertisement.sequence.channels[0]=6;
  memcpy(wire+4,peer,6);enqueue(clockUS);d.serviceInGate();assert(d.dataTxSubmitted==1&&!d.queueCount);
- d.radio.txResult=kIOReturnNotReady;enqueue(clockUS);d.serviceInGate();assert(d.dataTxFailed==1&&d.dataTxStatus==kIOReturnNotReady);
+ assert(d.radio.peerCalls==1&&d.radio.peerOperations.back());
+ enqueue(clockUS);d.serviceInGate();assert(d.radio.peerCalls==1&&d.dataTxSubmitted==2);
+ // Native cache owns the station after discovery; remove it only once all
+ // membership expires. An unknown queued MAC cannot create a new station.
+ assert(d.dataPeers.setCached(peer,true,clockUS));
+ clockUS+=mtkawdl::peerLifetimeUs+1;d.serviceInGate();assert(d.radio.peerCalls==1);
+ assert(d.dataPeers.setCached(peer,false,clockUS));d.serviceInGate();
+ assert(d.radio.peerCalls==2&&!d.radio.peerOperations.back());
+ for(auto &slot:d.discoveryTxPeers)assert(!slot[0]);
+ enqueue(clockUS);d.serviceInGate();assert(d.radio.peerCalls==2);
+ mbuf_freem(d.queue[d.queueHead]);d.queueCount=0;
+ clockUS-=mtkawdl::peerLifetimeUs+1;
+ assert(d.dataPeers.observe(peer,clockUS)>=0);
+ d.state.init(local,clockUS);d.awTimeline.reset();
+ remote.init(peer,clockUS);n=mtkawdl::buildAction(remote,f,sizeof(f),clockUS);
+ assert(d.receive(&d,f,n,6,-40));
+ // Transient grant/peer/busy/ring failures keep the exact original packet.
+ unsigned submitted=d.dataTxSubmitted,attempts=d.radio.transmitted;
+ for(unsigned status:{kIOReturnNotReady,kIOReturnNoResources,kIOReturnNoMemory}){
+  d.radio.txResult=status;enqueue(clockUS);
+  auto original=d.queue[d.queueHead];auto bytes=original->bytes;uint64_t queued=d.queueTime[d.queueHead];
+  for(unsigned retry=0;retry<3;++retry)d.serviceInGate();
+  assert(d.dataTxFailed==0&&d.dataTxStatus==status&&d.queueCount==1);
+  assert(d.queue[d.queueHead]==original&&d.queue[d.queueHead]->bytes==bytes&&d.queueTime[d.queueHead]==queued);
+  assert(d.radio.transmitted==attempts);
+  d.radio.txResult=0;d.serviceInGate();++attempts;++submitted;
+  assert(d.dataTxSubmitted==submitted&&!d.queueCount&&d.radio.frames.back()==bytes);
+ }
+ assert(d.dataTxDeferred==9);
+ // A missing unicast station cannot block multicast behind it. Retain only
+ // that peer's packet, then submit it once native station programming succeeds.
+ d.radio.missingStation=true;enqueue(clockUS);auto unicast=d.queue[d.queueHead];
+ wire[4]=1;enqueue(clockUS);wire[4]=peer[0];
+ d.serviceInGate();++submitted;
+ assert(d.dataTxSubmitted==submitted&&d.queueCount==1&&d.queue[d.queueHead]==unicast);
+ d.radio.missingStation=false;d.serviceInGate();++submitted;
+ assert(d.dataTxSubmitted==submitted&&!d.queueCount);
+ // Shared ring pressure retains FIFO and never refreshes the original age.
+ d.radio.txResult=kIOReturnNoResources;enqueue(clockUS);enqueue(clockUS);
+ auto first=d.queue[d.queueHead],second=d.queue[(d.queueHead+1)%64];
+ unsigned attemptsBefore=d.radio.transmitted;d.serviceInGate();
+ assert(d.queueCount==2&&d.queue[d.queueHead]==first&&d.queue[(d.queueHead+1)%64]==second);
+ d.radio.txResult=0;d.serviceInGate();submitted+=2;
+ assert(!d.queueCount&&d.dataTxSubmitted==submitted&&d.radio.transmitted==attemptsBefore+2);
+ d.radio.txResult=kIOReturnNotReady;enqueue(clockUS-999500);d.serviceInGate();
+ clockUS+=1000;d.serviceInGate();assert(!d.queueCount&&d.dataTxExpired==1);
+ // Return to the earlier schedule epoch for the independent expiry fixture.
+ clockUS-=1000;d.dataTxExpired=0;
+ d.radio.txResult=kIOReturnBadArgument;enqueue(clockUS);d.serviceInGate();assert(d.dataTxFailed==1&&!d.queueCount);
+ d.radio.txResult=0;
  d.radio.grant=false;enqueue(clockUS-1000000);enqueue(clockUS);d.serviceInGate();
  assert(d.dataTxExpired==1&&d.queueCount==1);mbuf_freem(d.queue[d.queueHead]);d.queueCount=0;
  // A full queue with alternating expired/live packets preserves live order.

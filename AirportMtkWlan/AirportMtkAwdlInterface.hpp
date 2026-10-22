@@ -146,7 +146,9 @@ private:
     IOSkywalkPacket *completions[128] = {};
     unsigned completionCount = 0;
     uint64_t nativeTx = 0, nativeRx = 0, nativeDrops = 0;
-    uint64_t dataTxSubmitted = 0, dataTxFailed = 0, dataTxExpired = 0;
+    uint64_t dataTxSubmitted = 0, dataTxFailed = 0, dataTxExpired = 0, dataTxDeferred = 0;
+    // Stations prepared for discovery unicast before native cache registration.
+    uint8_t discoveryTxPeers[3][6] = {};
     uint64_t dataRxFrames = 0, dataRxInvalid = 0, dataRxUnknownPeer = 0;
     uint64_t dataRxWrongDestination = 0, dataRxReplay = 0, dataRxDecoded = 0;
     IOReturn dataTxStatus = kIOReturnNotReady;

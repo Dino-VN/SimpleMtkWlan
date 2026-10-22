@@ -18,7 +18,7 @@ code = r'''
 #include <vector>
 #include <AWDL/AwdlTimeline.hpp>
 using IOReturn=unsigned;
-constexpr unsigned APPLE80211_VERSION=1,kIOReturnSuccess=0,kIOReturnNotReady=1,kIOReturnNoMemory=2,kIOReturnBadArgument=3,kIOReturnUnsupported=4,
+constexpr unsigned APPLE80211_VERSION=1,kIOReturnSuccess=0,kIOReturnNotReady=1,kIOReturnNoMemory=2,kIOReturnBadArgument=3,kIOReturnUnsupported=4,kIOReturnNotFound=5,
  APPLE80211_C_FLAG_20MHZ=1,APPLE80211_C_FLAG_2GHZ=8,APPLE80211_C_FLAG_5GHZ=16,
  APPLE80211_M_AWDL_AVAILABILITY_WINDOW_START=41,
  APPLE80211_M_AWDL_AVAILABILITY_WINDOW_EXTENSIONS_END=43;
@@ -35,15 +35,17 @@ void mbuf_freem(mbuf_t m){delete m;}void*mbuf_data(mbuf_t m){return m->bytes.dat
 struct Hal{
  bool on=true;mtkawdl::Reservation grant{};unsigned reserves=0,aborts=0,transmits=0;
  uint8_t requested=0,preparedChannel=0;unsigned prepares=0;
- uint32_t duration=0;std::function<void()> onReserve,onPrepare;
+ uint32_t duration=0;std::function<void()> onReserve,onPrepare;std::function<void(bool)> onPeer;
  IOReturn awdlPrepareChannel(unsigned c){++prepares;preparedChannel=c;if(onPrepare)onPrepare();return 0;}bool awdlIsEnabled(){return on;}bool awdlChannelAllowed(unsigned c){return c==6||c==44;}
  bool awdlGrantSnapshot(mtkawdl::Reservation &out){out=grant;return on;}
  bool awdlCanTransmit(unsigned c){return grant.canTransmit(c,clockUS);}
  void awdlAbort(){++aborts;grant.cancel();}
  IOReturn awdlReserve(unsigned c,unsigned ms){++reserves;requested=c;duration=ms;
   if(onReserve)onReserve();return 0;}
- IOReturn awdlPeer(const uint8_t*,bool){return 0;}
+ IOReturn peerDeleteResult=0;
+ IOReturn awdlPeer(const uint8_t*,bool add){if(onPeer)onPeer(add);return add?0:peerDeleteResult;}
  IOReturn awdlTransmit(mbuf_t m,unsigned){++transmits;delete m;return 0;}
+ IOReturn awdlTryTransmit(mbuf_t *m,unsigned c){auto result=awdlTransmit(*m,c);*m=nullptr;return result;}
  void give(uint8_t token,uint8_t c,uint32_t ms){grant.request(token,c,clockUS);
   assert(grant.grant(token,c,ms,clockUS));}
 };
@@ -52,13 +54,14 @@ struct AirportMtkAwdlInterface{
  Hal radio;Hal*hal=&radio;Timer t;Timer*timer=&t;
  bool enabled=true,stopping=false,trafficActive=false,trafficPeerInstalled=false;
  uint8_t trafficPeer[6]{},installedTrafficPeer[6]{};
+ uint8_t discoveryTxPeers[3][6]{};
  mtkawdl::DataPeers dataPeers;mtkawdl::State state;mtkawdl::Timeline awTimeline;mtkawdl::Window requestedWindow{};
  apple80211_awdl_sync_state syncState{};
  struct NativePeerSample{mtkawdl::Advertisement advertisement;uint8_t peer[6];uint64_t received;bool valid;};
  NativePeerSample nativePeerSamples[16]{};uint64_t advertisersRequests=0;
  uint8_t requestedChannel=0,grantedChannel=0;uint64_t requestDeadline=0;
  unsigned reserveDuration=0;IOReturn reserveStatus=0,actionStatus=0,miStatus=0;
- uint64_t dataTxSubmitted=0,dataTxFailed=0,dataTxExpired=0;IOReturn dataTxStatus=0;
+ uint64_t dataTxSubmitted=0,dataTxFailed=0,dataTxExpired=0,dataTxDeferred=0;IOReturn dataTxStatus=0;
  uint64_t serviceTicks=0,reserveAttempts=0,grantObservations=0,awStartNotifications=0,
  nextAction=0,actionSubmitted=0,actionFailed=0,miStart=0,miSubmitted=0,miFailed=0;
  struct{unsigned mode=3;}afMode;struct{unsigned synchronization_frame_period=440;}syncParams;
@@ -304,6 +307,44 @@ int main(){
  assert(partial.radio.reserves==1&&!partial.radio.grant.pending&&partial.events.empty());
  clockUS=partial.requestedWindow.end-mtkawdl::rocLeadUs;partial.serviceInGate();
  assert(partial.radio.reserves==2&&partial.radio.grant.pending&&partial.events.empty());
+ // Discovery station waits can release the gate and expire membership. A
+ // stale add must be removed and cannot authorize an AW from the old edge.
+ AirportMtkAwdlInterface station;init(station);station.dataPeers.observe(peer,clockUS);
+ uint8_t unicastFrame[24]{};memcpy(unicastFrame+4,peer,6);
+ station.queue[0]=station.makeFrame(unicastFrame,sizeof(unicastFrame));
+ station.queueTime[0]=clockUS;station.queueCount=1;
+ unsigned adds=0,deletes=0;
+ station.radio.onPeer=[&](bool add){if(add){++adds;clockUS+=20000;station.dataPeers.reset();}else ++deletes;};
+ station.serviceInGate();assert(adds==1&&deletes==1&&station.events.empty());
+ for(auto &slot:station.discoveryTxPeers)assert(!slot[0]);
+ mbuf_freem(station.queue[station.queueHead]);station.queueCount=0;
+ // A cache/traffic callback reviving a peer during discovery cleanup must
+ // restore its station after the delete, without losing the new owner.
+ AirportMtkAwdlInterface revived;init(revived);memcpy(revived.discoveryTxPeers[0],peer,6);
+ adds=deletes=0;
+ revived.radio.onPeer=[&](bool add){if(add)++adds;else {++deletes;assert(revived.dataPeers.setTraffic(peer,true,clockUS));}};
+ revived.serviceInGate();assert(adds==1&&deletes==1&&revived.dataPeers.find(peer,clockUS)>=0);
+ assert(!memcmp(revived.discoveryTxPeers[0],peer,6));
+ revived.radio.onPeer=[&](bool add){if(add)++adds;else ++deletes;};
+ assert(revived.dataPeers.setTraffic(peer,false,clockUS));revived.serviceInGate();
+ assert(adds==1&&deletes==2&&!mtkawdl::unicast(revived.discoveryTxPeers[0]));
+ // Discovery advertisements can revive membership too, without native ownership.
+ AirportMtkAwdlInterface observed;init(observed);memcpy(observed.discoveryTxPeers[0],peer,6);
+ observed.radio.onPeer=[&](bool add){if(!add)observed.dataPeers.observe(peer,clockUS);};
+ observed.serviceInGate();assert(!memcmp(observed.discoveryTxPeers[0],peer,6));
+ observed.radio.onPeer=nullptr;clockUS+=mtkawdl::peerLifetimeUs+1;observed.serviceInGate();
+ assert(!mtkawdl::unicast(observed.discoveryTxPeers[0]));
+ // A stale add whose cleanup failed remains tracked for the next cleanup tick.
+ AirportMtkAwdlInterface failedCleanup;init(failedCleanup);failedCleanup.dataPeers.observe(peer,clockUS);
+ failedCleanup.queue[0]=failedCleanup.makeFrame(unicastFrame,sizeof(unicastFrame));
+ failedCleanup.queueTime[0]=clockUS;failedCleanup.queueCount=1;
+ failedCleanup.radio.peerDeleteResult=kIOReturnNotReady;
+ failedCleanup.radio.onPeer=[&](bool add){if(add)failedCleanup.dataPeers.reset();};
+ failedCleanup.serviceInGate();bool tracked=false;
+ for(auto &slot:failedCleanup.discoveryTxPeers)tracked|=!memcmp(slot,peer,6);assert(tracked);
+ failedCleanup.radio.peerDeleteResult=0;failedCleanup.radio.onPeer=nullptr;failedCleanup.serviceInGate();
+ for(auto &slot:failedCleanup.discoveryTxPeers)assert(!mtkawdl::unicast(slot));
+ mbuf_freem(failedCleanup.queue[failedCleanup.queueHead]);failedCleanup.queueCount=0;
  // Sync disable in the early-end callback must not submit another ROC.
  AirportMtkAwdlInterface stopped;init(stopped);stopped.state.sequence.channels[1]=stopped.state.ownSequence.channels[1]=44;
  stopped.serviceInGate();stopped.onEnd=[&]{stopped.enabled=false;};

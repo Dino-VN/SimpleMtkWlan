@@ -306,7 +306,7 @@ bool AirportMtkAwdlInterface::initWithController(AirportMtkWlan *controller,ethe
     bzero(queue,sizeof(queue));
     bzero(trafficPeer,sizeof(trafficPeer)); trafficActive=false;
     bzero(installedTrafficPeer,sizeof(installedTrafficPeer)); trafficPeerInstalled=false;
-    dataPeers.reset();
+    dataPeers.reset(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers));
     state.init((const uint8_t *)mac,awdlNow());
     state.nativeElectionManaged=true;
     XYLog("AWDL native interface init\n");
@@ -414,7 +414,7 @@ void AirportMtkAwdlInterface::shutdownInGate()
         hal->awdlEnable(NULL,false);
     }
     enabled=false;
-    dataPeers.reset(); trafficActive=false;
+    dataPeers.reset(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); trafficActive=false;
     trafficPeerInstalled=false; bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
     while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%64; --queueCount; }
     if(timerAdded) { owner->getWorkLoop()->removeEventSource(timer); timerAdded=false; }
@@ -447,7 +447,7 @@ IOReturn AirportMtkAwdlInterface::setMacAddress(ether_addr &mac)
     state.nativeElectionManaged=true;
     awTimeline.reset();
     bzero(nativePeerSamples,sizeof(nativePeerSamples));
-    dataPeers.reset(); trafficActive=false;
+    dataPeers.reset(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); trafficActive=false;
     state.sequence=state.ownSequence=sequence;
     memcpy(syncState.master,&mac,6);
     if(bsd) ifnet_set_lladdr(bsd,state.mac,6);
@@ -516,7 +516,7 @@ IOReturn AirportMtkAwdlInterface::setSyncInGate(bool value)
     if(stopping) status=kIOReturnNotReady;
     if(status==kIOReturnSuccess) enabled=value;
     if(!enabled) {
-        dataPeers.reset(); trafficActive=false; trafficPeerInstalled=false;
+        dataPeers.reset(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); trafficActive=false; trafficPeerInstalled=false;
         bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
         // Firmware commandSleep releases the gate. Submission can queue drop
         // completions during that wait, so drain again before canceling tick.
@@ -639,6 +639,7 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     hal->awdlPublishDiagnostics();
     setProperty("MTKAWDLDataTxSubmitted",dataTxSubmitted,64);
     setProperty("MTKAWDLDataTxFailed",dataTxFailed,64);
+    setProperty("MTKAWDLDataTxDeferred",dataTxDeferred,64);
     setProperty("MTKAWDLDataTxExpired",dataTxExpired,64);
     setProperty("MTKAWDLDataTxStatus",static_cast<uint64_t>(dataTxStatus),32);
     setProperty("MTKAWDLDataTxPending",static_cast<uint64_t>(queueCount),32);
@@ -693,7 +694,7 @@ void AirportMtkAwdlInterface::serviceInGate()
     ++serviceTicks;
     if(!hal->awdlIsEnabled()) {
         // Transport reset invalidates the secondary BSS and all grants.
-        enabled=false; dataPeers.reset(); trafficActive=false;
+        enabled=false; dataPeers.reset(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); trafficActive=false;
         trafficPeerInstalled=false; bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
         setProperty("MTKAWDLSyncEnabled",false);
         setProperty("MTKAWDLSyncEnableStatus",static_cast<uint64_t>(kIOReturnNotReady),32);
@@ -745,13 +746,67 @@ void AirportMtkAwdlInterface::serviceInGate()
         }
     }
     state.elect(now); publishScheduler(now);
+    // Service discovery sends unicast (e.g. resolver replies) before native
+    // traffic/cache registration. Install only destinations observed in valid
+    // AWDL advertisements; the bounded membership lifetime also owns cleanup.
+    for(unsigned i=0;i<3;++i) {
+        if(mtkawdl::unicast(discoveryTxPeers[i]) && dataPeers.find(discoveryTxPeers[i],now)<0) {
+            uint8_t address[6]; memcpy(address,discoveryTxPeers[i],6);
+            IOReturn status=hal->awdlPeer(address,false);
+            if(stopping || !enabled) return;
+            // Membership can revive while the delete waits for firmware.
+            // Keep tracking a restored station so its eventual expiry still
+            // releases the WCID; a failed restore can be retried from the queue.
+            bool clear=status==kIOReturnSuccess;
+            if(clear && dataPeers.find(address,awdlNow())>=0)
+                clear=hal->awdlPeer(address,true)!=kIOReturnSuccess;
+            if(stopping || !enabled) return;
+            if(clear && !memcmp(discoveryTxPeers[i],address,6))
+                bzero(discoveryTxPeers[i],6);
+            now=awdlNow();
+        }
+    }
+    for(unsigned i=0;i<queueCount;++i) {
+        const uint8_t *frame=(const uint8_t *)mbuf_data(queue[(queueHead+i)%64]);
+        if(frame[4]&1) continue;
+        uint8_t address[6]; memcpy(address,frame+4,6);
+        int member=dataPeers.find(address,now);
+        if(member<0 || dataPeers.entries[member].cached || dataPeers.entries[member].traffic) continue;
+        int empty=-1; bool installed=false;
+        for(unsigned j=0;j<3;++j) {
+            if(!memcmp(discoveryTxPeers[j],address,6)) installed=true;
+            if(!mtkawdl::unicast(discoveryTxPeers[j])) empty=j;
+        }
+        if(installed || empty<0) continue;
+        IOReturn status=hal->awdlPeer(address,true);
+        if(stopping || !enabled) return;
+        if(status==kIOReturnSuccess) {
+            memcpy(discoveryTxPeers[empty],address,6);
+            if(dataPeers.find(address,awdlNow())<0) {
+                bool clear=hal->awdlPeer(address,false)==kIOReturnSuccess;
+                if(stopping || !enabled) return;
+                if(clear && dataPeers.find(address,awdlNow())>=0)
+                    clear=hal->awdlPeer(address,true)!=kIOReturnSuccess;
+                if(stopping || !enabled) return;
+                if(clear && !memcmp(discoveryTxPeers[empty],address,6))
+                    bzero(discoveryTxPeers[empty],6);
+            }
+            if(stopping || !enabled) return;
+        }
+        // Firmware waits may release the gate. Recompute the RF window below,
+        // and bound discovery station programming to one transaction per tick.
+        break;
+    }
     if(trafficPeerInstalled) {
         int peer=dataPeers.find(installedTrafficPeer,now);
         if(!trafficActive || peer<0 || memcmp(installedTrafficPeer,trafficPeer,6)) {
             // A native cache entry can still own this firmware station after
             // the single active traffic registration moves to another peer.
             bool cached=peer>=0 && dataPeers.entries[peer].cached;
-            if(cached || hal->awdlPeer(installedTrafficPeer,false)==kIOReturnSuccess) {
+            bool discovery=false;
+            for(unsigned i=0;i<3;++i)
+                if(!memcmp(discoveryTxPeers[i],installedTrafficPeer,6)) discovery=true;
+            if(cached || discovery || hal->awdlPeer(installedTrafficPeer,false)==kIOReturnSuccess) {
                 trafficPeerInstalled=false;
                 bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
             }
@@ -927,7 +982,22 @@ void AirportMtkAwdlInterface::serviceInGate()
         }
         if(now-time>=1000000) { ++dataTxExpired; mbuf_freem(m); }
         else {
-            dataTxStatus=hal->awdlTransmit(m,channel);
+            dataTxStatus=hal->awdlTryTransmit(&m,channel);
+            if(m) {
+                // No firmware ownership on a transient failure. Keep the
+                // original payload/sequence and its bounded queue lifetime.
+                if(dataTxStatus==kIOReturnNotFound) {
+                    // One missing station must not block multicast/other peers.
+                    unsigned tail=(queueHead+queueCount)%64;
+                    queue[tail]=m; queueTime[tail]=time; ++queueCount;
+                    ++dataTxDeferred; continue;
+                }
+                queueHead=(queueHead+63)%64;
+                queue[queueHead]=m; queueTime[queueHead]=time; ++queueCount;
+                ++dataTxDeferred;
+                // Busy/grant/ring pressure applies to the rest of this batch.
+                break;
+            }
             if(dataTxStatus==kIOReturnSuccess) ++dataTxSubmitted; else ++dataTxFailed;
         }
     }
@@ -1337,6 +1407,11 @@ IOReturn AirportMtkAwdlInterface::setPEER_CACHE_CONTROL(apple80211_peer_cache_co
         // the bounded cache before this one returned. Never acknowledge a
         // native cache add that the receive path cannot authorize.
         hal->awdlPeer(address,false); release(); return kIOReturnNoResources;
+    }
+    if(operation==2 && !trafficOwns) {
+        // Firmware station removal invalidates discovery's local tracking too.
+        for(unsigned i=0;i<3;++i)
+            if(!memcmp(discoveryTxPeers[i],address,6)) bzero(discoveryTxPeers[i],6);
     }
     mtkawdl::put32(completion+4,operation==2 ? 3 : 1); memcpy(completion+8,address,6);
     awdlControllerMessage(owner,this,0x33,completion,sizeof(completion),true);

@@ -417,6 +417,10 @@ struct mwx_softc {
     uint64_t sc_awdl_roc_events, sc_awdl_roc_grants, sc_awdl_roc_rejected;
     uint64_t sc_awdl_roc_submitted, sc_awdl_roc_send_failed;
     uint64_t sc_awdl_roc_scan_blocked, sc_awdl_roc_busy_blocked;
+    uint64_t sc_awdl_tx_submitted, sc_awdl_tx_bad_frame, sc_awdl_tx_no_grant;
+    uint64_t sc_awdl_tx_busy, sc_awdl_tx_no_peer, sc_awdl_tx_backpressure;
+    uint64_t sc_awdl_tx_copy_failed, sc_awdl_tx_dma_failed;
+    int sc_awdl_tx_errno;
     void *sc_awdl_context;
     MtkMwx::AwdlReceive sc_awdl_receive;
     uint8_t sc_awdl_address[6];
@@ -6648,7 +6652,9 @@ mt7921_mac_write_txwi_80211(struct mwx_softc *sc, struct mbuf *m,
 	 */
 	if (multicast ||
 	    type != (IEEE80211_FC0_TYPE_DATA >> IEEE80211_FC0_TYPE_SHIFT) ||
-	    (sc->sc_knobs & MWX_KNOB_DATA_RA) == 0) {
+	    (sc->sc_knobs & MWX_KNOB_DATA_RA) == 0 ||
+        ni == &sc->sc_awdl_vif.vif_mn.ni || ni == &sc->sc_awdl_peers[0].ni ||
+        ni == &sc->sc_awdl_peers[1].ni || ni == &sc->sc_awdl_peers[2].ni) {
 		/* Fixed rata is available just for 802.11 txd */
 		uint32_t rate, val6;
 
@@ -6834,11 +6840,8 @@ mt7921_mac_write_txwi(struct mwx_softc *sc, struct mbuf *m,
     if (awdl) {
         // AWDL starts with legacy OFDM at 6 Mbps on either band. Keep the
         // supplied sequence number and never use the infrastructure key/RA.
-        const uint32_t hw=mt76_rates[4].hw_value;
-        const uint32_t rate=(hw & 0xff) | ((hw>>8)<<MT_TX_RATE_MODE_SHIFT);
-        txp->txwi[2] |= htole32(MT_TXD2_FIX_RATE);
-        txp->txwi[6] = htole32(MT_TXD6_FIXED_BW |
-            ((rate<<MT_TXD6_TX_RATE_SHIFT)&MT_TXD6_TX_RATE_MASK));
+        // The common 802.11 builder applies the complete fixed-rate setup
+        // even when infrastructure RA is enabled (as in the MT76 rate fix).
         txp->txwi[3] |= htole32(MT_TXD3_BA_DISABLE | MT_TXD3_SN_VALID |
             (((mtkawdl::le16((uint8_t *)wh+22)>>4)<<16)&MT_TXD3_SEQ));
         if (IEEE80211_IS_MULTICAST(wh->i_addr1)) txp->txwi[3] |= htole32(MT_TXD3_NO_ACK);
@@ -8995,20 +8998,43 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKAWDLROCSendFailed",com->sc_awdl_roc_send_failed,64);
     mwxController()->setProperty("MTKAWDLROCScanBlocked",com->sc_awdl_roc_scan_blocked,64);
     mwxController()->setProperty("MTKAWDLROCBusyBlocked",com->sc_awdl_roc_busy_blocked,64);
+    mwxController()->setProperty("MTKAWDLTXSubmitted",com->sc_awdl_tx_submitted,64);
+    mwxController()->setProperty("MTKAWDLTXBadFrame",com->sc_awdl_tx_bad_frame,64);
+    mwxController()->setProperty("MTKAWDLTXNoGrant",com->sc_awdl_tx_no_grant,64);
+    mwxController()->setProperty("MTKAWDLTXBusy",com->sc_awdl_tx_busy,64);
+    mwxController()->setProperty("MTKAWDLTXNoPeer",com->sc_awdl_tx_no_peer,64);
+    mwxController()->setProperty("MTKAWDLTXBackpressure",com->sc_awdl_tx_backpressure,64);
+    mwxController()->setProperty("MTKAWDLTXCopyFailed",com->sc_awdl_tx_copy_failed,64);
+    mwxController()->setProperty("MTKAWDLTXDMAFailed",com->sc_awdl_tx_dma_failed,64);
+    mwxController()->setProperty("MTKAWDLTXLastErrno",static_cast<uint64_t>(com->sc_awdl_tx_errno),32);
 }
 
 IOReturn MtkMwx::awdlTransmit(mbuf_t frame,uint8_t channel)
 {
-    if(!frame) return kIOReturnBadArgument;
+    IOReturn status=awdlTryTransmit(&frame,channel);
+    // Management API retains its always-consumed contract. Data uses the
+    // queue API below so resource pressure does not discard the original.
+    if(frame) mbuf_freem(frame);
+    return status;
+}
+
+IOReturn MtkMwx::awdlTryTransmit(mbuf_t *packet,uint8_t channel)
+{
+    if(!packet || !*packet) return kIOReturnBadArgument;
+    mbuf_t frame=*packet;
     MwxAwdlCall call(com);
-    if(!call.valid()) { mbuf_freem(frame); return kIOReturnNotReady; }
-    MwxAwdlOperation operation(com);
-    if(!operation.valid()) { mbuf_freem(frame); return kIOReturnNotReady; }
-    if(!awdlCanTransmit(channel) || mbuf_len(frame)<24 ||
-       mbuf_len(frame)!=mbuf_pkthdr_len(frame) ||
+    if(!call.valid()) return kIOReturnNotReady;
+    // Frame shape/identity is a permanent rejection, independently of ROC.
+    if(mbuf_len(frame)<24 || mbuf_len(frame)!=mbuf_pkthdr_len(frame) ||
        memcmp((uint8_t *)mbuf_data(frame)+16,mtkawdl::bssid,6) ||
        memcmp((uint8_t *)mbuf_data(frame)+10,com->sc_awdl_address,6)) {
-        mbuf_freem(frame); return kIOReturnNotReady;
+        ++com->sc_awdl_tx_bad_frame;
+        mbuf_freem(frame); *packet=NULL; return kIOReturnBadArgument;
+    }
+    MwxAwdlOperation operation(com);
+    if(!operation.valid()) { ++com->sc_awdl_tx_busy; return kIOReturnNotReady; }
+    if(!awdlCanTransmit(channel)) {
+        ++com->sc_awdl_tx_no_grant; return kIOReturnNotReady;
     }
     ieee80211_node *node=&com->sc_awdl_vif.vif_mn.ni;
     const uint8_t *destination=(uint8_t *)mbuf_data(frame)+4;
@@ -9018,11 +9044,23 @@ IOReturn MtkMwx::awdlTransmit(mbuf_t frame,uint8_t channel)
             !memcmp(com->sc_awdl_peers[i].ni.ni_macaddr,destination,6)) {
             node=&com->sc_awdl_peers[i].ni; break;
         }
-        if(!node) { mbuf_freem(frame); return kIOReturnNotReady; }
+        if(!node) { ++com->sc_awdl_tx_no_peer; return kIOReturnNotFound; }
+    }
+    // Infrastructure and AWDL share TXWIs/the DMA ring. Check capacity before
+    // calling the consuming primitive, just as infrastructure mwx_start does.
+    if(mwx_tx_full(com)) { ++com->sc_awdl_tx_backpressure; return kIOReturnNoResources; }
+    mbuf_t attempt=NULL;
+    if(mbuf_dup(frame,MBUF_DONTWAIT,&attempt)) {
+        ++com->sc_awdl_tx_copy_failed; return kIOReturnNoMemory;
     }
     node->ni_chan=&com->sc_ic.ic_channels[channel];
-    int rv=mwx_tx(com,frame,node);
-    return rv ? kIOReturnNoResources : kIOReturnSuccess;
+    // mwx_tx consumes attempt on every return, including mapping/ring failure.
+    // Preserve the queued frame's bytes, sequence and timestamp until success.
+    int rv=mwx_tx(com,attempt,node);
+    com->sc_awdl_tx_errno=rv;
+    if(rv) { ++com->sc_awdl_tx_dma_failed; return kIOReturnNoResources; }
+    ++com->sc_awdl_tx_submitted;
+    mbuf_freem(frame); *packet=NULL; return kIOReturnSuccess;
 }
 
 IOReturn MtkMwx::awdlPeer(const uint8_t *address,bool add)

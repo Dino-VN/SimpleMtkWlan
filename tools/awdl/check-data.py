@@ -30,13 +30,16 @@ def snapshot():
         raise RuntimeError('Expected one AirportMtkAwdlInterface')
     native = {k: v for k, v in interfaces[0].items() if k.startswith('MTKAWDL')
               and isinstance(v, (int, bool, str))}
+    transport = plistlib.loads(run(['ioreg', '-a', '-r', '-c', 'AirportMtkWlan']))
+    hal = {k: v for row in transport for k, v in row.items()
+           if k.startswith('MTKAWDLTX') and isinstance(v, (int, bool, str))}
     table = run(['netstat', '-ibn', '-I', 'awdl0']).decode(errors='replace')
     row = next((line.split() for line in table.splitlines() if '<Link#' in line), None)
     if not row or len(row) < 11:
         raise RuntimeError('Missing awdl0 BSD link counters')
     bsd = dict(zip(('rx_packets', 'rx_errors', 'rx_bytes', 'tx_packets', 'tx_errors', 'tx_bytes'),
                    map(int, row[4:10])))
-    return {'native': native, 'bsd': bsd}
+    return {'native': native, 'bsd': bsd, 'hal': hal}
 
 def check():
     loaded = run(['kmutil', 'showloaded', '--list-only']).decode(errors='replace')
@@ -62,12 +65,14 @@ def check():
     delta = {key: after['native'].get(key, 0) - before['native'].get(key, 0) for key in keys}
     bsd_delta = {key: after['bsd'][key] - before['bsd'][key] for key in before['bsd']}
     result.update(native_delta=delta, bsd_delta=bsd_delta, missing_counters=missing)
-    stages = ('MTKAWDLDataTxSubmitted', 'MTKAWDLDataTxFailed', 'MTKAWDLDataTxExpired',
+    stages = ('MTKAWDLDataTxSubmitted', 'MTKAWDLDataTxFailed', 'MTKAWDLDataTxExpired', 'MTKAWDLDataTxDeferred',
               'MTKAWDLDataRxFrames', 'MTKAWDLDataRxInvalid', 'MTKAWDLDataRxUnknownPeer',
               'MTKAWDLDataRxWrongDestination', 'MTKAWDLDataRxReplay', 'MTKAWDLDataRxDecoded')
     transport_delta = {key: after['native'][key] - before['native'][key] for key in stages
                        if key in before['native'] and key in after['native']}
     result['transport_delta'] = transport_delta
+    result['hal_delta'] = {key: after['hal'][key] - before['hal'][key]
+                           for key in after['hal'] if key in before['hal'] and key != 'MTKAWDLTXLastErrno'}
     result['interface'] = run(['ifconfig', 'awdl0']).decode(errors='replace')
     result['transport_findings'] = []
     if any(value < 0 for value in transport_delta.values()):
@@ -81,6 +86,18 @@ def check():
             ('MTKAWDLDataRxWrongDestination', 'Raw AWDL data addressed another interface.'),
             ('MTKAWDLDataRxReplay', 'Duplicate/old AWDL data was rejected by the replay window.')):
             if transport_delta.get(key, 0) > 0:
+                result['transport_findings'].append(finding)
+        if transport_delta.get('MTKAWDLDataTxDeferred', 0) > 0:
+            result['transport_findings'].append('Data TX was deferred with its original packet retained; inspect HAL blocker counters.')
+        for key, finding in (
+            ('MTKAWDLTXNoGrant', 'TX waited for a matching live radio grant.'),
+            ('MTKAWDLTXBusy', 'TX waited for firmware configuration or transport readiness.'),
+            ('MTKAWDLTXNoPeer', 'Unicast TX waited for a firmware station.'),
+            ('MTKAWDLTXBackpressure', 'Shared TXWI/DMA ring had no capacity.'),
+            ('MTKAWDLTXCopyFailed', 'TX attempt allocation failed; original data was retained.'),
+            ('MTKAWDLTXDMAFailed', 'TX DMA submission failed; inspect MTKAWDLTXLastErrno.'),
+            ('MTKAWDLTXBadFrame', 'HAL permanently rejected a malformed frame or wrong local identity.')):
+            if result['hal_delta'].get(key, 0) > 0:
                 result['transport_findings'].append(finding)
         if transport_delta.get('MTKAWDLDataRxFrames') == 0:
             result['transport_findings'].append('No raw AWDL data reached the receiver during this interval.')
