@@ -107,6 +107,33 @@ static void roleTests()
     n=buildAction(tx,f,sizeof(f),5000000);
     assert(rx.receiveAction(f,n,5000000)>=0 && !rx.synchronized);
 }
+static void nativeClockTests()
+{
+    for(int drift:{-3000,3000}) for(uint16_t initial:{uint16_t(12),uint16_t(65532)}) {
+        State s;s.init(local,1000000);s.nativeElectionManaged=s.nativeParentSelected=true;
+        memcpy(s.nativeParent,remote,6);
+        auto &p=s.peers[0];p.used=true;p.seen=p.epoch=1000000;p.baseCounter=initial;
+        memcpy(p.mac,remote,6);memcpy(p.advertisement.master,remote,6);
+        memcpy(p.advertisement.sync,remote,6);p.advertisement.presence=4;
+        p.advertisement.sequence=s.sequence;
+        s.elect(1000000);assert(s.synchronized&&s.baseCounter==initial);
+        uint64_t now=1100000;
+        p.seen=now;p.epoch=uint64_t(int64_t(p.epoch)-drift);
+        uint32_t before=s.untilNext(now);s.elect(now);
+        int32_t change=int32_t(before)-int32_t(s.untilNext(now));
+        assert(change==(drift>0?512:-512)&&s.clockCorrections==1);
+        uint64_t epoch=s.epoch;uint16_t base=s.baseCounter;
+        for(unsigned i=0;i<100;++i)s.elect(now+i);
+        assert(s.epoch==epoch&&s.baseCounter==base&&s.clockCorrections==1);
+        // A valid but discontinuous counter sample cannot jump this selected
+        // native clock. Another fresh observation counts one rejection.
+        p.seen=now+1000;p.baseCounter+=64;
+        s.elect(p.seen);assert(s.clockRejected==1&&s.epoch==epoch&&s.baseCounter==base);
+        s.elect(p.seen+1);assert(s.clockRejected==1);
+        p.seen=now-1;s.elect(now+2000);
+        assert(s.clockRejected==1&&s.epoch==epoch&&s.baseCounter==base);
+    }
+}
 static void templateTests()
 {
     State tx; tx.init(remote,1000000); uint8_t f[512]; Advertisement a={};
@@ -265,7 +292,7 @@ static void applePaddingElectionTests()
 }
 int main()
 {
-    aggregateTests(); capturedIphoneTests(); scheduleTests(); roleTests(); templateTests(); nativeTemplateTests(); nativePeriodTests(); applePaddingElectionTests();
+    aggregateTests(); capturedIphoneTests(); scheduleTests(); roleTests(); nativeClockTests(); templateTests(); nativeTemplateTests(); nativePeriodTests(); applePaddingElectionTests();
     State tx,rx; tx.init(remote,1000000); rx.init(local,1000000); tx.metric=10;
     for(unsigned i=0;i<16;++i) tx.sequence.channels[i]=i%2 ? 44 : 6;
     tx.ownSequence=tx.sequence; tx.elect(1024000);

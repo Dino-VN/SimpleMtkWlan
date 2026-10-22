@@ -121,6 +121,24 @@ int main(){
  // Regaining RF in the same counter after a tiny RX epoch correction cannot duplicate AW.
  shortD.state.epoch+=500;clockUS=1001000;shortD.radio.give(4,6,70);
  shortD.serviceInGate();assert(shortD.events.size()==2);
+
+ // RX phase corrections do not revoke the matching firmware grant. Keep the
+ // announced AW pinned even if the corrected schedule points into idle/next.
+ AirportMtkAwdlInterface phase;init(phase);
+ phase.state.sequence.channels[1]=phase.state.ownSequence.channels[1]=0;
+ phase.serviceInGate();uint64_t pinnedEnd=phase.awTimeline.radioEnd;
+ clockUS+=12000;phase.state.epoch-=60000;phase.serviceInGate();
+ assert(phase.awTimeline.open&&phase.events.size()==1&&phase.radio.aborts==0);
+ clockUS=pinnedEnd;phase.serviceInGate();
+ assert(phase.events.size()==2&&mtkawdl::be32(phase.events[1].bytes.data()+4)==pinnedEnd);
+ // Sequence replacement is administrative: pinning must not hide it, even
+ // when the current channel and presence happen to be unchanged.
+ AirportMtkAwdlInterface sequenceChange;init(sequenceChange);sequenceChange.serviceInGate();
+ clockUS+=12000;sequenceChange.state.sequence.channels[5]=44;sequenceChange.serviceInGate();
+ assert(sequenceChange.events.size()==2&&!sequenceChange.awTimeline.open&&sequenceChange.radio.aborts==1);
+ AirportMtkAwdlInterface sequenceCallback;init(sequenceCallback);sequenceCallback.afMode.mode=0;
+ sequenceCallback.onStart=[&]{sequenceCallback.state.sequence.channels[5]=44;};
+ sequenceCallback.serviceInGate();assert(sequenceCallback.events.size()==2&&sequenceCallback.radio.transmits==0);
  // Revoke an open grant: pair end; never emit a second start for that EAW.
  AirportMtkAwdlInterface revoked;init(revoked);revoked.serviceInGate();
  revoked.radio.grant.cancel();clockUS+=2000;revoked.serviceInGate();
@@ -133,11 +151,11 @@ int main(){
  // Reentrant end must not dispatch duplicate ends.
  callback.onEnd=[&]{callback.notifyAvailabilityWindowEnd(clockUS);};
  callback.notifyAvailabilityWindowEnd(clockUS);assert(callback.events.size()==2);
- // Channel changes use ROC directly; no synchronous RLM wait at the edge.
+ // Scheduler submits one reservation; HAL owns its BSS/ROC transaction.
  AirportMtkAwdlInterface prepare;init(prepare);prepare.radio.grant.cancel();
  prepare.state.sequence.channels[1]=prepare.state.ownSequence.channels[1]=44;
  prepare.radio.onPrepare=[&]{clockUS+=20000;};
- clockUS+=20000;prepare.serviceInGate();assert(prepare.radio.reserves==0&&prepare.radio.prepares==0);
+ clockUS+=10000;prepare.serviceInGate();assert(prepare.radio.reserves==0&&prepare.radio.prepares==0);
  prepare.radio.onPrepare=nullptr;
  clockUS=1000000+4*mtkawdl::awUs-7000;prepare.serviceInGate();
  assert(prepare.radio.reserves==1&&prepare.radio.requested==44&&prepare.radio.duration>70);
@@ -215,6 +233,26 @@ int main(){
   lead.serviceInGate();clockUS+=1000;
  }
  assert(lead.awTimeline.starts==4&&lead.awTimeline.ends==3&&lead.radio.reserves==4);
+
+ // The sparse native schedule needs enough lead for off-channel arbitration.
+ // Model 45ms grants: requests issued 25ms before an edge miss every active
+ // off-channel start while immediate home-channel grants conceal the problem.
+ AirportMtkAwdlInterface sparse;init(sparse);sparse.radio.grant.cancel();
+ const uint8_t sparseChannels[16]={6,0,44,0,0,0,0,0,6,0,44,0,0,0,0,0};
+ memcpy(sparse.state.sequence.channels,sparseChannels,16);
+ sparse.state.ownSequence=sparse.state.sequence;
+ uint8_t sparseToken=1;uint64_t sparseDue=0;
+ sparse.radio.onReserve=[&]{sparse.radio.grant.request(++sparseToken,sparse.radio.requested,clockUS);sparseDue=clockUS+(sparse.radio.requested==44?45000:3000);};
+ clockUS+=70000;uint64_t sparseEnd=clockUS+2*16*4*mtkawdl::awUs;
+ while(clockUS<sparseEnd){
+  if(sparse.radio.grant.pending&&clockUS>=sparseDue)
+   assert(sparse.radio.grant.grant(sparseToken,sparse.radio.requested,sparse.radio.duration,clockUS));
+  sparse.serviceInGate();clockUS+=sparse.t.us+250;
+ }
+ unsigned sparseOffChannel=0;
+ for(const auto&e:sparse.events)if(e.id==41&&mtkawdl::le32(e.bytes.data()+28)==44)++sparseOffChannel;
+ fprintf(stderr,"sparse offchannel=%u starts=%llu reserves=%u\n",sparseOffChannel,(unsigned long long)sparse.awTimeline.starts,sparse.radio.reserves);
+ assert(sparseOffChannel==4);
  // A delayed grant response outlives the target EAW. Respect its actual
  // pending-response timeout rather than aborting it once every EAW.
  AirportMtkAwdlInterface slow;init(slow);slow.radio.grant.cancel();
@@ -295,6 +333,8 @@ int main(){
  AirportMtkAwdlInterface partial;init(partial);partial.radio.grant.cancel();
  partial.state.sequence.channels[0]=partial.state.ownSequence.channels[0]=0;
  partial.state.sequence.channels[1]=partial.state.ownSequence.channels[1]=44;
+ partial.state.sequence.channels[2]=partial.state.ownSequence.channels[2]=0;
+ partial.state.sequence.channels[3]=partial.state.ownSequence.channels[3]=44;
  partial.radio.onReserve=[&]{partial.radio.grant.request(8,partial.radio.requested,clockUS);};
  clockUS=1000000+4*mtkawdl::awUs-24000;partial.serviceInGate();
  clockUS+=1000;assert(partial.radio.grant.grant(8,44,50,clockUS));
@@ -305,7 +345,7 @@ int main(){
  assert(partial.events.empty()&&partial.radio.reserves==1&&partial.radio.transmits==1&&!partial.queueCount);
  clockUS=partial.radio.grant.deadline;partial.serviceInGate();
  assert(partial.radio.reserves==1&&!partial.radio.grant.pending&&partial.events.empty());
- clockUS=partial.requestedWindow.end-mtkawdl::rocLeadUs;partial.serviceInGate();
+ clockUS=1000000+12*mtkawdl::awUs-mtkawdl::rocLeadUs;partial.serviceInGate();
  assert(partial.radio.reserves==2&&partial.radio.grant.pending&&partial.events.empty());
  // Discovery station waits can release the gate and expire membership. A
  // stale add must be removed and cannot authorize an AW from the old edge.
@@ -397,6 +437,15 @@ int main(){
  selected.radio.grant.request(9,6,clockUS);aborts=selected.radio.aborts;
  assert(selected.setAWDL_AWDL_ADVERTISERS(&advert)==0);
  assert(selected.radio.aborts==aborts&&selected.radio.grant.pending);
+ // A fresh same-parent advertisement with a discontinuous clock must not
+ // terminate the already notified grant or replace the host counter.
+ selected.radio.give(10,6,70);selected.serviceInGate();assert(selected.awTimeline.open);
+ clockUS+=12000;sample.received=clockUS;cached.seen=clockUS;ad.counter=64;
+ mtkawdl::put16(advert.bytes,64);mtkawdl::putBE32(advert.bytes+20,uint32_t(clockUS));
+ uint16_t hostCounter=selected.state.counter(clockUS);aborts=selected.radio.aborts;
+ assert(selected.setAWDL_AWDL_ADVERTISERS(&advert)==0);
+ assert(selected.awTimeline.open&&selected.radio.aborts==aborts&&selected.state.counter(clockUS)==hostCounter);
+ assert(selected.state.clockRejected==1);
  // MCU sleep replaces schedule while preserving the target channel: abort stale request.
  AirportMtkAwdlInterface changed;init(changed);changed.radio.grant.cancel();
  changed.radio.onReserve=[&]{changed.state.sequence.channels[4]=44;};changed.serviceInGate();

@@ -8907,9 +8907,14 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
     if(!operation.valid()) { ++com->sc_awdl_roc_busy_blocked; return kIOReturnNotReady; }
     mwx_awdl_abort(com);
     if(!operation.valid()) return kIOReturnAborted;
-    // The unified ROC acquire TLV already contains channel, bandwidth, band
-    // and center channels, as in mt7921_mcu_set_roc. A synchronous BSS RLM
-    // update here delays every switch and invalidates short native AW edges.
+    // ROC describes the temporary radio grant, not the secondary BSS's RLM.
+    // Keep both contexts on the requested channel. Schedule this operation
+    // during the preceding idle slot, rather than waiting at the AW edge.
+    if(com->sc_awdl_channel!=channel) {
+        int rv=mwx_awdl_set_channel(com,channel,operation.epoch);
+        if(!operation.valid()) return kIOReturnAborted;
+        if(rv) return kIOReturnIOError;
+    }
     uint8_t token=com->sc_awdl_roc.token+1;
     if(!token) token=1;
     // Firmware returns only an 8-bit token. Do not reuse one inside the

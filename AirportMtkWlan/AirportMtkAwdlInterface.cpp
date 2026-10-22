@@ -652,6 +652,8 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLNativeDroppedPackets",nativeDrops,64);
     setProperty("MTKAWDLServiceTicks",serviceTicks,64);
     setProperty("MTKAWDLReserveAttempts",reserveAttempts,64);
+    setProperty("MTKAWDLClockCorrections",state.clockCorrections,64);
+    setProperty("MTKAWDLClockRejected",state.clockRejected,64);
     setProperty("MTKAWDLReserveStatus",static_cast<uint64_t>(reserveStatus),32);
     setProperty("MTKAWDLReserveDurationMS",static_cast<uint64_t>(reserveDuration),32);
     setProperty("MTKAWDLGrantObservations",grantObservations,64);
@@ -715,7 +717,7 @@ void AirportMtkAwdlInterface::serviceInGate()
         // cover several consecutive windows on the same channel.
         now=awdlNow();
     }
-    if(awTimeline.open && now<awTimeline.active.end) {
+    if(awTimeline.open && awTimeline.matchesSchedule(state) && now<awTimeline.active.end) {
         mtkawdl::Window next={}; mtkawdl::Reservation live={};
         bool snapshot=hal->awdlGrantSnapshot(live);
         bool nextValid=mtkawdl::currentWindow(state,awTimeline.active.end,next);
@@ -828,6 +830,11 @@ void AirportMtkAwdlInterface::serviceInGate()
     }
     mtkawdl::Window window={};
     if(!mtkawdl::currentWindow(state,now,window)) { timer->setTimeoutMS(2); return; }
+    // The notification describes the already granted radio interval. RX
+    // clock corrections can move the computed slot without revoking it.
+    // Keep that interval pinned; explicit setters and actual grant changes
+    // still terminate it, rather than manufacturing a short AW-end.
+    if(awTimeline.open && awTimeline.matchesSchedule(state)) window=awTimeline.active;
     uint8_t channel=window.channel;
     if(!channel || !hal->awdlChannelAllowed(channel)) {
         if(awTimeline.open) notifyAvailabilityWindowEnd(now);
@@ -841,9 +848,7 @@ void AirportMtkAwdlInterface::serviceInGate()
             }
         }
     }
-    if(awTimeline.open && (awTimeline.active.channel!=channel ||
-       awTimeline.active.counter!=window.counter || awTimeline.active.presence!=window.presence ||
-       memcmp(awTimeline.sync,state.sync,6) || memcmp(awTimeline.root,state.master,6))) {
+    if(awTimeline.open && !awTimeline.matchesSchedule(state)) {
         notifyAvailabilityWindowEnd(now);
         if(stopping || !enabled) return;
         hal->awdlAbort(); requestedChannel=grantedChannel=0;
@@ -921,7 +926,7 @@ void AirportMtkAwdlInterface::serviceInGate()
     if(!channel || !hal->awdlChannelAllowed(channel)) { timer->setTimeoutMS(1); return; }
     if(grantedChannel!=channel) ++grantObservations;
     uint8_t nativeRole=state.syncRole;
-    if(!awTimeline.open && awTimeline.begin(window,grant,now,state.sync,state.master,nativeRole)) {
+    if(!awTimeline.open && awTimeline.begin(window,grant,now,state.sync,state.master,nativeRole,&state.sequence)) {
         // Set lifecycle state before dispatch: native may synchronously call
         // back into sync/advertisers setters while receiving this event.
         notifyAvailabilityWindowStart(channel,now);
@@ -930,8 +935,7 @@ void AirportMtkAwdlInterface::serviceInGate()
         mtkawdl::Reservation observed={};
         now=awdlNow();
         if(!mtkawdl::currentWindow(state,now,after) ||
-           after.counter!=window.counter || after.presence!=window.presence || after.channel!=channel ||
-           memcmp(awTimeline.sync,state.sync,6) || memcmp(awTimeline.root,state.master,6) ||
+           !awTimeline.matchesSchedule(state) ||
            !hal->awdlGrantSnapshot(observed) || observed.token!=grant.token ||
            observed.grantObservedAt!=grant.grantObservedAt || !observed.canTransmit(channel,now)) {
             if(awTimeline.open) notifyAvailabilityWindowEnd(now<awTimeline.radioEnd ? now : awTimeline.radioEnd);
@@ -1198,10 +1202,11 @@ IOReturn AirportMtkAwdlInterface::setAWDL_AWDL_ADVERTISERS(awdl_peer_advert_add 
                 if(peer>=0) {
                     uint64_t epoch=sample.received-elapsed;
                     uint16_t base=counter-counter%a.presence;
-                    uint16_t expected=base+uint16_t((now-epoch)/mtkawdl::awUs);
                     bool changed=!state.nativeParentSelected || memcmp(state.nativeParent,sample.peer,6) ||
                         memcmp(state.master,a.master,6) || state.presence!=state.ownPresence ||
-                        memcmp(&state.sequence,&state.ownSequence,sizeof(state.sequence)) || state.counter(now)!=expected;
+                        memcmp(&state.sequence,&state.ownSequence,sizeof(state.sequence));
+                    // A refreshed PSF from the same selected parent does not
+                    // revoke the radio grant when its clock estimate changes.
                     if(changed && awTimeline.open) notifyAvailabilityWindowEnd(now);
                     if(stopping) return kIOReturnNotReady;
                     auto &p=state.peers[peer]; p.advertisement=a; p.epoch=epoch; p.baseCounter=base;

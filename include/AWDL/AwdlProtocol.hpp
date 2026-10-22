@@ -223,6 +223,7 @@ struct State {
     uint8_t presence, ownPresence, syncRole, minExtension[4];
     bool nativeElectionManaged, nativeParentSelected;
     uint8_t nativeParent[6];
+    uint64_t clockSampleAt, clockCorrections, clockRejected;
     void init(const uint8_t *address, uint64_t now) {
         memset(this,0,sizeof(*this)); memcpy(mac,address,6);
         memcpy(master,address,6); memcpy(sync,address,6);
@@ -312,8 +313,11 @@ struct State {
             synchronized=false; masterMetric=metric; masterCounter=selfCounter; distance=0;
             memcpy(master,mac,6); memcpy(sync,mac,6); return;
         }
+        const Peer &p=peers[best];
+        bool sameClock=synchronized && !memcmp(sync,p.mac,6) &&
+            !memcmp(master,p.advertisement.master,6);
         synchronized=true;
-        const Peer &p=peers[best]; memcpy(master,p.advertisement.master,6);
+        memcpy(master,p.advertisement.master,6);
         memcpy(sync,p.mac,6);
         // Native programs our radio sequence independently of its selected
         // synchronization parent. A peer supplies the clock, not an implicit
@@ -322,7 +326,32 @@ struct State {
         presence=nativeElectionManaged ? ownPresence : p.advertisement.presence;
         masterMetric=p.advertisement.metric; masterCounter=p.advertisement.masterCounter;
         distance=p.advertisement.distance+1;
-        epoch=p.epoch; baseCounter=p.baseCounter;
+        if(!nativeElectionManaged || !sameClock) {
+            // Initial native parent selection may adopt its counter. Repeated
+            // advertisements from that parent are clock observations, not a
+            // request to replace the timeline on every RX/timer tick.
+            epoch=p.epoch; baseCounter=p.baseCounter; clockSampleAt=p.seen;
+        } else if(p.seen>clockSampleAt) {
+            clockSampleAt=p.seen;
+            uint64_t local=now>=epoch ? now-epoch : 0;
+            uint64_t remote=now>=p.epoch ? now-p.epoch : 0;
+            int32_t delta=int16_t(uint16_t(p.baseCounter+remote/awUs)-counter(now))*int32_t(awUs)+
+                int32_t(remote%awUs)-int32_t(local%awUs);
+            // Native permits 5 TU between consecutive matching starts. Slew
+            // at most half a TU per fresh PSF; a discontinuous peer clock
+            // needs a new selection instead of silently skipping real AWs.
+            if(delta>5*1024 || delta<-5*1024) { ++clockRejected; return; }
+            int32_t correction=delta>512 ? 512 : delta<-512 ? -512 : delta;
+            if(correction) {
+                uint16_t base=counter(now);
+                int32_t phase=int32_t(local%awUs)+correction;
+                if(phase<0) { --base; phase+=awUs; }
+                else if(phase>=int32_t(awUs)) { ++base; phase-=awUs; }
+                if(now>=uint32_t(phase)) {
+                    epoch=now-uint32_t(phase); baseCounter=base; ++clockCorrections;
+                }
+            }
+        }
     }
     int receiveAction(const uint8_t *f,size_t n,uint64_t now) {
         Advertisement a;

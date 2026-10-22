@@ -18,9 +18,12 @@ inline bool currentWindow(const State &s,uint64_t now,Window &out) {
          uint16_t(s.counter(now)-s.counter(now)%s.presence),s.channel(now),s.presence};
     return true;
 }
-constexpr uint32_t rocLeadUs=25000;
-// ROC carries its channel configuration. Plan ahead without waiting for a
-// BSS/RLM command at each edge, and keep one grant for adjacent equal channels.
+// Idle slots leave time for the secondary BSS RLM response and off-channel
+// arbitration before the next EAW. A live EAW is still closed only within
+// native's duration tolerance; this lead never fabricates an early AW-start.
+constexpr uint32_t rocLeadUs=55000;
+// Prepare the BSS and ROC before the edge, and keep one grant for adjacent
+// equal channels. A grant alone never changes the announced schedule.
 struct RadioPlan { Window window; uint64_t requestAt; uint32_t durationMs; };
 inline bool planRadio(const State &s,uint64_t now,RadioPlan &out) {
     Window target={};
@@ -62,11 +65,19 @@ struct Timeline {
     uint8_t sync[6]={}, root[6]={};
     uint8_t lastSync[6]={}, lastRoot[6]={};
     uint8_t lastPresence=0;
+    Sequence schedule={};
+    bool scheduleRecorded=false;
+    bool matchesSchedule(const State &s) const {
+        return active.presence==s.presence && role==s.syncRole &&
+            !memcmp(sync,s.sync,6) && !memcmp(root,s.master,6) &&
+            (!scheduleRecorded || !memcmp(&schedule,&s.sequence,sizeof(schedule)));
+    }
     // Report an actual grant near the EAW edge. A firmware grant may be
     // shorter than the requested dwell: track its real end instead of hiding
     // the whole AW or promising radio availability until the scheduled end.
     bool begin(const Window &w,const Reservation &grant,uint64_t now,
-               const uint8_t *parent,const uint8_t *master,uint8_t nativeRole=1) {
+               const uint8_t *parent,const uint8_t *master,uint8_t nativeRole=1,
+               const Sequence *radioSchedule=nullptr) {
         if(open || !w.channel || now<w.start || now>=w.end || now-w.start>8000 ||
            !grant.canTransmit(w.channel,now) || !grant.grantObservedAt ||
            grant.grantObservedAt>now) { ++late; return false; }
@@ -84,6 +95,8 @@ struct Timeline {
         active=w; open=true; emitted=true; lastWindowStart=w.start;
         radioEnd=end;
         role=nativeRole; token=grant.token; grantObservedAt=grant.grantObservedAt;
+        scheduleRecorded=radioSchedule!=nullptr;
+        if(radioSchedule) schedule=*radioSchedule;
         lastStart=now; lastCounter=w.counter; lastPresence=w.presence; ++starts;
         memcpy(sync,parent,6); memcpy(root,master,6);
         memcpy(lastSync,parent,6); memcpy(lastRoot,master,6); return true;

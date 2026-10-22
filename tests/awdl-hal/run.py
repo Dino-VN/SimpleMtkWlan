@@ -167,11 +167,13 @@ int main(){
  reset();sc=make();
  assert(!hal.awdlChannelAllowed(0)&&!hal.awdlChannelAllowed(166)&&hal.awdlChannelAllowed(6));
  sc.sc_ic.ic_chan_active[0]=0;assert(!hal.awdlChannelAllowed(6));sc=make();sc.sc_ic.ic_chan_avail[0]=0;assert(!hal.awdlChannelAllowed(6));sc=make();sc.sc_ic.ic_channels[6].ic_flags|=IEEE80211_CHAN_PASSIVE;assert(!hal.awdlChannelAllowed(6));sc=make();
- // Golden ROC packet alone; no synchronous RLM command or wait on switch.
+ // RLM must configure the secondary BSS before the exact ROC acquire packet.
  for(int ch:{6,44,149}){
   reset();sc=make();assert(hal.awdlReserve(ch,300)==0);
-  assert(commands.size()==1&&commands[0]==0x00020027);
-  const auto&roc=wire[0];
+  assert(commands.size()==2&&commands[0]==MCU_UNI_CMD_BSS_INFO_UPDATE&&commands[1]==0x00020027);
+  const auto&rlm=wire[0];assert(rlm.size()==20&&rlm[0]==1&&rlm[8]==ch&&rlm[9]==ch&&rlm[17]==(ch<=14?0:1));
+  assert(sc.sc_awdl_channel==ch);
+  const auto&roc=wire[1];
   assert(roc.size()==28&&roc[8]==1&&roc[10]==ch&&roc[12]==(ch<=14?1:2));
   assert(roc[14]==ch&&roc[17]==ch&&roc[19]==1&&mtkawdl::le32(roc.data()+20)==300);
   assert(!hal.awdlCanTransmit(ch));
@@ -179,6 +181,22 @@ int main(){
   assert(sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,ch,300,clock_us));
   assert(hal.awdlCanTransmit(ch));clock_us+=300001;assert(!hal.awdlCanTransmit(ch));
  }
+ // Cached RLM needs no redundant update; switching aborts old grant,
+ // configures the new BSS channel, then submits the new acquire.
+ reset();sc=make();sc.sc_awdl_channel=6;
+ assert(hal.awdlReserve(6,70)==0&&commands.size()==1&&commands[0]==0x20027);
+ assert(sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,6,70,clock_us));
+ commands.clear();wire.clear();assert(hal.awdlReserve(44,70)==0);
+ assert(commands.size()==3&&commands[0]==0x20027&&wire[0].size()==16);
+ assert(commands[1]==MCU_UNI_CMD_BSS_INFO_UPDATE&&commands[2]==0x20027&&wire[2].size()==28);
+ // Failed/stale RLM must not request ROC or publish a configured channel.
+ reset();sc=make();fw_status=7;
+ assert(hal.awdlReserve(44,70)==kIOReturnIOError&&commands.size()==1&&!sc.sc_awdl_channel&&!sc.sc_awdl_roc.pending);
+ reset();sc=make();on_wait=[](mwx_softc*s){clock_us+=45000;++s->sc_awdl_epoch;s->sc_awdl_stopping=true;};
+ assert(hal.awdlReserve(44,70)==kIOReturnAborted&&commands.size()==1&&!sc.sc_awdl_channel&&!sc.sc_awdl_roc.pending);
+ // The request timeout starts after the synchronous RLM response.
+ reset();sc=make();on_wait=[](mwx_softc*){if(commands.back()==MCU_UNI_CMD_BSS_INFO_UPDATE)clock_us+=45000;};
+ assert(hal.awdlReserve(44,70)==0&&sc.sc_awdl_roc.deadline==245000);
  reset();sc=make();assert(hal.awdlReserve(6,mtkawdl::maxRocMs)==0);
  assert(mtkawdl::le32(wire.back().data()+20)==1100);
  assert(!sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,6,1101,clock_us));
