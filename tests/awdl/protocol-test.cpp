@@ -129,9 +129,16 @@ static void nativeClockTests()
         // native clock. Another fresh observation counts one rejection.
         p.seen=now+1000;p.baseCounter+=64;
         s.elect(p.seen);assert(s.clockRejected==1&&s.epoch==epoch&&s.baseCounter==base);
+        assert(!s.synchronized&&s.nativeClockValidated&&s.nativeClockHoldover);
         s.elect(p.seen+1);assert(s.clockRejected==1);
+        assert(!s.synchronized&&s.nativeClockHoldover&&s.nativeHoldoverTransitions==1);
         p.seen=now-1;s.elect(now+2000);
         assert(s.clockRejected==1&&s.epoch==epoch&&s.baseCounter==base);
+        assert(!s.synchronized&&s.nativeClockHoldover);
+        // A later aligned observation resumes discipline without another
+        // acquisition or a jump to the rejected counter namespace.
+        p.baseCounter=base;p.epoch=epoch;p.seen=now+3000;s.elect(p.seen);
+        assert(s.synchronized&&!s.nativeClockHoldover&&s.nativeClockAcquisitions==1);
     }
     // Replace deferred observations instead of accumulating half-TU slews.
     // The hold has an absolute bound even if no grant arrives.
@@ -190,8 +197,16 @@ static void nativeClockTests()
         warm.selectNativeParent(remote,remote);warm.elect(p.seen+1);
         assert(warm.nativeClockAcquisitions==1&&warm.clockRejected==1);
         uint8_t newRoot[6]={2,9,8,7,6,4};memcpy(p.advertisement.master,newRoot,6);
+        // RX can change the peer's root before native selects it. Rejecting
+        // that observation must retain the committed clock identity, so the
+        // later native selection still authorizes its real acquisition.
+        warm.elect(p.seen+2);
+        assert(!memcmp(warm.clockRoot,remote,6)&&!memcmp(warm.master,remote,6));
+        assert(warm.nativeClockValidated&&warm.nativeClockAcquisitions==1);
+        assert(!warm.synchronized&&warm.nativeClockHoldover);
         warm.selectNativeParent(remote,newRoot);warm.elect(p.seen+2);
         assert(warm.nativeClockAcquisitions==2&&warm.nativeClockValidated);
+        assert(warm.synchronized&&!warm.nativeClockHoldover);
         // A different root arriving during deferred acquisition is not the
         // clock selected by native. Wait for its selected tree, or cancellation.
         uint8_t thirdRoot[6]={2,9,8,7,6,3};

@@ -631,6 +631,78 @@ int main(){
  mode.radio.grant.request(7,6,clockUS);unsigned aborts=mode.radio.aborts;
  control.flags=65532;assert(mode.setAWDL_SYNC_STATE(&control)==0);
  assert(mode.radio.aborts==aborts&&mode.radio.grant.pending&&mode.syncState.flags==65532);
+ assert(mode.state.nativeParentSelected&&mode.state.nativeClockAcquisitionPending);
+ assert(!mode.state.nativeClockValidated&&mode.state.nativeClockAcquisitions==0);
+ // The native 0x20 branch omits advertisers. A real PSF from its immediate
+ // parent must acquire the clock, while repeating opmode cannot readopt it.
+ auto &warmPeer=mode.state.peers[0];warmPeer.used=true;warmPeer.seen=warmPeer.epoch=clockUS;
+ warmPeer.baseCounter=18080;memcpy(warmPeer.mac,peer,6);
+ memcpy(warmPeer.advertisement.master,peer,6);memcpy(warmPeer.advertisement.sync,peer,6);
+ mode.state.elect(clockUS);
+ assert(mode.state.nativeClockValidated&&mode.state.nativeClockAcquisitions==1);
+ assert(mode.state.counter(clockUS)==18080);
+ warmPeer.baseCounter+=64;warmPeer.seen=++clockUS;
+ assert(!mode.setAWDL_SYNC_STATE(&control));mode.state.elect(clockUS);
+ assert(mode.radio.aborts==aborts&&mode.state.nativeClockAcquisitions==1);
+ assert(mode.state.clockRejected==1&&!mode.state.synchronized);
+ // Starting warmup on an unchanged role is still an explicit clock request.
+ // Clear the old unannounced ROC's future hold, but require actual cached RX.
+ AirportMtkAwdlInterface warmMode;init(warmMode);warmMode.state.nativeElectionManaged=true;
+ control.mode_flags=0;assert(!warmMode.setAWDL_SYNC_STATE(&control));
+ warmMode.state.peers[0]=warmPeer;
+ warmMode.state.peers[0].seen=warmMode.state.peers[0].epoch=clockUS;
+ warmMode.state.holdClock(clockUS+500000);
+ warmMode.radio.grant.request(8,6,clockUS);aborts=warmMode.radio.aborts;
+ control.mode_flags=0x20;assert(!warmMode.setAWDL_SYNC_STATE(&control));
+ assert(warmMode.radio.aborts==aborts+1&&!warmMode.state.clockHoldUntil);
+ assert(warmMode.state.nativeClockValidated&&warmMode.state.nativeClockAcquisitions==1);
+ assert(warmMode.state.counter(clockUS)==18144);
+ // An advertiser with an explicit root remains the bound on a pending
+ // acquisition even when native refreshes the identical warmup opmode.
+ uint8_t boundedRoot[6]={2,9,8,7,6,3};
+ warmMode.state.holdClock(clockUS+100000);
+ warmMode.state.selectNativeParent(peer,boundedRoot);
+ assert(!warmMode.setAWDL_SYNC_STATE(&control));
+ assert(warmMode.state.acquisitionRootKnown&&!memcmp(warmMode.state.acquisitionRoot,boundedRoot,6));
+ assert(warmMode.state.nativeClockAcquisitionPending&&warmMode.state.nativeClockAcquisitions==1);
+ control.mode_flags=0;assert(!warmMode.setAWDL_SYNC_STATE(&control));
+ control.mode_flags=0x20;assert(!warmMode.setAWDL_SYNC_STATE(&control));
+ assert(warmMode.state.acquisitionRootKnown&&!memcmp(warmMode.state.acquisitionRoot,boundedRoot,6));
+ // A warmup request in an AW-start callback must wait for the promised
+ // physical window to end before changing its counter or its parent.
+ AirportMtkAwdlInterface warmHeld;init(warmHeld);warmHeld.state.nativeElectionManaged=true;
+ warmHeld.state.peers[0]=warmPeer;warmHeld.state.peers[0].baseCounter=224;
+ warmHeld.state.peers[0].seen=warmHeld.state.peers[0].epoch=clockUS;
+ warmHeld.onStart=[&]{assert(!warmHeld.setAWDL_SYNC_STATE(&control));};
+ warmHeld.serviceInGate();assert(warmHeld.awTimeline.open);
+ uint64_t warmEnd=warmHeld.awTimeline.radioEnd;assert(warmHeld.state.counter(clockUS)==0);
+ assert(warmHeld.state.nativeClockAcquisitionPending&&!warmHeld.state.nativeClockValidated);
+ clockUS=warmEnd;warmHeld.onStart=nullptr;warmHeld.serviceInGate();
+ assert(warmHeld.events.size()>=2&&warmHeld.events[1].id==43);
+ assert(warmHeld.state.nativeClockValidated&&warmHeld.state.nativeClockAcquisitions==1);
+ // Explicit local-master opmode cancels a remote acquisition at the safe
+ // edge. A PSF-period configuration update is a different native request.
+ for(bool open:{false,true}) {
+  AirportMtkAwdlInterface promote;init(promote);promote.state.nativeElectionManaged=true;
+  promote.state.peers[0]=warmPeer;promote.state.peers[0].seen=promote.state.peers[0].epoch=clockUS;
+  assert(!promote.setAWDL_SYNC_STATE(&control));
+  assert(promote.state.nativeClockValidated&&promote.state.nativeParentSelected);
+  promote.state.selectNativeParent(peer,boundedRoot);
+  if(open) { promote.radio.give(20,6,70);promote.serviceInGate();assert(promote.awTimeline.open); }
+  auto keptClock=promote.state;
+  apple80211_awdl_sync_state selfMode=control;memcpy(selfMode.master,local,6);selfMode.mode_flags=0;
+  assert(!promote.setAWDL_SYNC_STATE(&selfMode));
+  assert(!promote.state.nativeClockAcquisitionPending);
+  if(open) {
+   assert(promote.awTimeline.open&&!promote.state.pendingControls.parentSelected);
+   clockUS=promote.awTimeline.radioEnd;promote.serviceInGate();
+  }
+  assert(!promote.state.nativeParentSelected&&!promote.state.nativeClockSelected);
+  assert(!memcmp(promote.state.master,local,6)&&!memcmp(promote.state.sync,local,6));
+  assert(promote.state.counter(clockUS)==keptClock.counter(clockUS));
+  assert(promote.state.untilNext(clockUS)==keptClock.untilNext(clockUS));
+  promote.state.elect(clockUS+1);assert(!promote.state.synchronized);
+ }
  // Native opmode reprogramming at 0/10/20TU must take effect after the
  // recorded AW-end, including a synchronous setter in the start callback.
  for(unsigned offset:{0U,10U*1024,20U*1024}) {
@@ -774,6 +846,54 @@ int main(){
  unsigned offChannel=0;for(const auto&e:latency.events)if(e.id==41&&mtkawdl::le32(e.bytes.data()+28)==44)++offChannel;
  fprintf(stderr,"adaptive offchannel=%u lead=%u reserves=%u starts=%llu\n",offChannel,latency.reserveLeadUS,latency.radio.reserves,(unsigned long long)latency.awTimeline.starts);
  assert(offChannel==4&&latency.reserveLeadUS>=105000&&latency.reserveLeadUS<=125000);
+ // One-second lookahead crosses more than one 16-slot cycle at presence 1.
+ // A real early/short grant may expire before that target; it cannot make
+ // the future window available or generate a timestamp before radio receipt.
+ mtkawdl::State shortPlan;shortPlan.init(local,clockUS);shortPlan.setPresence(1,clockUS);
+ mtkawdl::RadioPlan distant{};
+ assert(mtkawdl::planRadio(shortPlan,clockUS,distant,1000000));
+ assert(distant.window.counter>16&&distant.window.start+8000>=clockUS+1000000);
+ assert(distant.durationMs<=mtkawdl::maxRocMs);
+ mtkawdl::Reservation earlyGrant;earlyGrant.request(1,6,clockUS);
+ assert(earlyGrant.grant(1,6,100,clockUS+3000));
+ assert(!mtkawdl::grantCoversWindow(distant.window,earlyGrant,distant.window.start));
+ mtkawdl::Timeline futureEvents;
+ assert(!futureEvents.begin(distant.window,earlyGrant,clockUS+3000,local,local));
+ assert(!futureEvents.starts&&!futureEvents.ends);
+ memset(shortPlan.sequence.channels,0,16);
+ assert(!mtkawdl::planRadio(shortPlan,clockUS,distant,1000000));
+ // Once a long response is measured, a nearest dense AW is already lost
+ // before its grant arrives. Reserve a reachable future nonzero window, but
+ // report starts only on an actual matching grant at an actual current edge.
+ AirportMtkAwdlInterface dense;init(dense);dense.radio.grant.cancel();
+ for(unsigned i=0;i<16;++i) dense.state.sequence.channels[i]=(i%2?44:6);
+ dense.state.ownSequence=dense.state.sequence;dense.reserveLeadUS=508000;
+ mtkawdl::RadioPlan reachable{};auto denseClock=dense.state;
+ assert(mtkawdl::planRadio(dense.state,clockUS+9000,reachable,dense.reserveLeadUS));
+ assert(reachable.window.start+8000>=clockUS+9000+dense.reserveLeadUS);
+ assert(reachable.window.start<clockUS+9000+dense.reserveLeadUS+4*mtkawdl::awUs);
+ assert(!memcmp(&denseClock,&dense.state,sizeof(denseClock)));
+ uint64_t denseDue=0,denseStop=clockUS+6000000;uint8_t denseToken=1;
+ dense.radio.onReserve=[&]{dense.radio.grant.request(++denseToken,dense.radio.requested,clockUS);denseDue=clockUS+500000;};
+ while(clockUS<denseStop) {
+  if(dense.radio.grant.pending&&clockUS>=denseDue)
+   assert(dense.radio.grant.grant(denseToken,dense.radio.requested,dense.radio.duration,clockUS));
+  dense.serviceInGate();assert(dense.t.us);clockUS+=dense.t.us+250;
+ }
+ unsigned denseStarts=0,denseEnds=0;uint32_t denseStart=0;
+ for(const auto&e:dense.events) {
+  if(e.id==41) {
+   assert(denseStarts==denseEnds);++denseStarts;denseStart=mtkawdl::be32(e.bytes.data()+20);
+   uint16_t counter=mtkawdl::le32(e.bytes.data());
+   assert(mtkawdl::le32(e.bytes.data()+28)==dense.state.sequence.channels[(counter/4)%16]);
+  } else {
+   assert(denseStarts==denseEnds+1);++denseEnds;
+   uint32_t duration=mtkawdl::be32(e.bytes.data()+4)-denseStart;
+   assert(duration/1024>=54&&duration/1024<=74);
+  }
+ }
+ fprintf(stderr,"dense 500ms starts=%u ends=%u reserves=%u\n",denseStarts,denseEnds,dense.radio.reserves);
+ assert(denseStarts>=6&&denseEnds>=5);
  // Repeating native advertisers must not compare the peer's different radio
  // sequence against ours and repeatedly tear down an otherwise valid grant.
  AirportMtkAwdlInterface selected;init(selected);selected.state.nativeElectionManaged=true;
@@ -819,6 +939,27 @@ int main(){
  assert(newest.seen==clockUS&&newest.epoch==newestEpoch&&newest.baseCounter==18080);
  assert(replay.state.nativeClockValidated&&replay.state.counter(clockUS)==18081);
  assert(!replay.state.clockHoldUntil&&!replay.state.nativeClockAcquisitionPending);
+ // RX from the same immediate peer can switch root before native commits
+ // its next advertisers request. Preserve the previous identity on rejection;
+ // otherwise this real selection becomes a duplicate and never reacquires.
+ const uint8_t newRoot[6]={2,9,8,7,6,4};clockUS+=10000;
+ replaySample.received=clockUS;replaySample.advertisement.counter=64;
+ memcpy(replaySample.advertisement.master,newRoot,6);
+ newest.advertisement=replaySample.advertisement;newest.seen=newest.epoch=clockUS;
+ newest.baseCounter=64;uint64_t committedEpoch=replay.state.epoch;
+ replay.state.elect(clockUS);
+ assert(!memcmp(replay.state.clockRoot,peer,6)&&!memcmp(replay.state.master,peer,6));
+ assert(replay.state.epoch==committedEpoch&&replay.state.nativeClockAcquisitions==1);
+ assert(!replay.state.synchronized&&replay.state.nativeClockHoldover);
+ replay.state.elect(clockUS+1);assert(!replay.state.synchronized);
+ mtkawdl::put16(replayAdvert.bytes,64);
+ mtkawdl::putBE32(replayAdvert.bytes+20,uint32_t(clockUS));
+ memcpy(replayAdvert.bytes+32,newRoot,6);aborts=replay.radio.aborts;
+ assert(!replay.setAWDL_AWDL_ADVERTISERS(&replayAdvert));
+ assert(!memcmp(replay.state.clockRoot,newRoot,6)&&replay.state.counter(clockUS)==64);
+ assert(replay.state.nativeClockAcquisitions==2&&replay.state.nativeClockValidated);
+ assert(replay.state.synchronized&&!replay.state.nativeClockHoldover);
+ assert(replay.radio.aborts==aborts+1);
  // A fresh selected-parent PSF can arrive while the synchronous RLM wait
  // releases the gate, then again while ROC is pending and during the AW.
  // Keep the radio clock AND outgoing synchronization TLV on one timeline.

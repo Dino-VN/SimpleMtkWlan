@@ -1392,18 +1392,36 @@ IOReturn AirportMtkAwdlInterface::setAWDL_SYNC_STATE(apple80211_awdl_sync_state 
         if(status==kIOReturnSuccess) syncState=*d;
         return status;
     }
-    // Tahoe supplies private control bits in flags/mode_flags during the
-    // native enable/disable transition. They are consumed by IO80211Family;
-    // rejecting them prevents even the initial AWDL disable from completing.
-    bool same=state.syncRole==d->state && !memcmp(state.forcedSync,d->master,6);
+    // Native's warmup path can send opmode without an advertiser record.
+    // BCM forwards mode bit 0x20 to firmware to permit immediate-master
+    // synchronization and AW counter adoption. Authorize one real RX clock
+    // acquisition when entering that mode or selecting another parent.
+    const uint8_t *requestedMaster=state.controlsHeld ? state.pendingControls.forced : state.forcedSync;
+    bool same=state.requestedRole()==d->state && !memcmp(requestedMaster,d->master,6);
     if(!state.setSyncRole(d->state,d->master)) return kIOReturnBadArgument;
+    bool warmup=(d->mode_flags&0x20) && memcmp(d->master,state.mac,6);
+    bool enterWarmup=warmup && (!(syncState.mode_flags&0x20) ||
+        memcmp(syncState.master,d->master,6));
+    bool select=warmup && (enterWarmup || !state.requestedParentIs(d->master));
+    if(select) state.selectNativeParent(d->master,nullptr,enterWarmup);
+    bool local=!memcmp(d->master,state.mac,6);
+    bool clear=local && (state.controlsHeld ? state.pendingControls.parentSelected : state.nativeParentSelected);
+    if(clear) state.clearNativeParent();
+    setProperty("MTKAWDLSyncModeFlags",static_cast<uint64_t>(d->mode_flags),32);
+    setProperty("MTKAWDLSyncFlags",static_cast<uint64_t>(d->flags),32);
     // Native regularly refreshes opmode/flags. A duplicate must not cancel
     // a live or pending ROC, or close an otherwise valid AW.
-    if(same) { syncState=*d; return kIOReturnSuccess; }
+    if(same && !select && !clear) { syncState=*d; return kIOReturnSuccess; }
     if(stopping) return kIOReturnNotReady;
     syncState=*d; state.elect(awdlNow());
     setProperty("MTKAWDLSyncRole",d->state,32);
-    if(enabled && !state.controlsHeld) { hal->awdlAbort(); requestedChannel=grantedChannel=0; nextAction=0; timer->setTimeoutMS(1); }
+    if(enabled && !state.controlsHeld) {
+        hal->awdlAbort(); requestedChannel=grantedChannel=0;
+        // No announced AW remains after abort. Its pending reservation must
+        // not keep the explicitly authorized warmup clock held in the future.
+        state.holdClock(0); state.elect(awdlNow());
+        nextAction=0; timer->setTimeoutMS(1);
+    }
     return kIOReturnSuccess;
 }
 IOReturn AirportMtkAwdlInterface::setAWDL_PRESENCE_MODE(apple80211_awdl_presence_mode *d) {

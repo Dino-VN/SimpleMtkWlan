@@ -237,6 +237,7 @@ struct State {
     // Effective radio controls are a transaction applied between AW events.
     bool nativeClockSelected, nativeTimelineStarted, controlsHeld, controlsDirty;
     bool nativeClockHoldover, nativeClockValidated, nativeClockAcquisitionPending;
+    bool clockSampleRejected;
     uint64_t nativeHoldoverTransitions, nativeClockAcquisitions;
     uint8_t clockParent[6], clockRoot[6];
     uint8_t acquisitionParent[6], acquisitionRoot[6];
@@ -257,14 +258,24 @@ struct State {
     }
     void discardControls() { controlsHeld=controlsDirty=false; }
     uint8_t requestedRole() const { return controlsHeld ? pendingControls.role : syncRole; }
-    void selectNativeParent(const uint8_t *address,const uint8_t *root=nullptr) {
+    bool requestedParentIs(const uint8_t *address) const {
+        return controlsHeld ? pendingControls.parentSelected &&
+            !memcmp(pendingControls.parent,address,6) : nativeParentSelected &&
+            !memcmp(nativeParent,address,6);
+    }
+    void selectNativeParent(const uint8_t *address,const uint8_t *root=nullptr,
+                            bool acquire=false) {
         nativeElectionManaged=true;
         // Only an explicit native selection authorizes acquiring another AW
         // namespace. Ordinary RX from an already selected peer remains a
         // bounded drift observation, even if it carries a discontinuous clock.
-        nativeClockAcquisitionPending=!nativeClockSelected || memcmp(clockParent,address,6) ||
+        bool keepRoot=!root && nativeClockAcquisitionPending &&
+            !memcmp(acquisitionParent,address,6);
+        nativeClockAcquisitionPending=acquire || !nativeClockSelected || memcmp(clockParent,address,6) ||
             (root && memcmp(clockRoot,root,6));
-        memcpy(acquisitionParent,address,6); acquisitionRootKnown=root!=nullptr;
+        if(keepRoot) nativeClockAcquisitionPending=true;
+        memcpy(acquisitionParent,address,6);
+        if(!keepRoot) acquisitionRootKnown=root!=nullptr;
         if(root) memcpy(acquisitionRoot,root,6);
         if(controlsHeld) {
             if(!pendingControls.parentSelected || memcmp(pendingControls.parent,address,6)) {
@@ -276,6 +287,22 @@ struct State {
             memcpy(nativeParent,address,6); nativeParentSelected=true;
         }
     }
+    void clearNativeParent() {
+        nativeClockAcquisitionPending=false; acquisitionRootKnown=false;
+        if(controlsHeld) {
+            if(pendingControls.parentSelected) {
+                pendingControls.parentSelected=false; controlsDirty=true; ++controlsDeferred;
+            }
+            return;
+        }
+        nativeParentSelected=nativeClockSelected=nativeClockValidated=false;
+        nativeClockHoldover=clockSampleRejected=synchronized=false;
+        memset(nativeParent,0,6); memset(clockParent,0,6); memset(clockRoot,0,6);
+        memcpy(master,mac,6); memcpy(sync,mac,6);
+        sequence=ownSequence; presence=ownPresence;
+        masterMetric=metric; masterCounter=selfCounter; distance=0;
+        // Keep the physical AW counter/phase through local-master promotion.
+    }
     bool releaseControls(uint64_t now) {
         if(!controlsHeld) return false;
         bool changed=controlsDirty; controlsHeld=controlsDirty=false;
@@ -284,6 +311,7 @@ struct State {
             setSequence(pendingControls.sequence,now);
             memcpy(nativeParent,pendingControls.parent,6);
             nativeParentSelected=pendingControls.parentSelected;
+            if(nativeElectionManaged && !nativeParentSelected) clearNativeParent();
         }
         elect(now); return changed;
     }
@@ -442,11 +470,24 @@ struct State {
             (acquisitionRootKnown && memcmp(acquisitionRoot,p.advertisement.master,6)))) return;
         bool adopt=!nativeElectionManaged || nativeClockAcquisitionPending ||
             (!nativeClockSelected && !nativeTimelineStarted);
+        if(nativeElectionManaged && !sameClock && !adopt) {
+            // This RX belongs to another clock tree; native has not selected
+            // it. Do not overwrite the committed identity before rejecting it,
+            // or a subsequent explicit selection looks like a duplicate and
+            // leaves validation permanently false.
+            if(p.seen>clockSampleAt) { clockSampleAt=p.seen; ++clockRejected; }
+            clockSampleRejected=true; synchronized=false;
+            if(!nativeClockHoldover) ++nativeHoldoverTransitions;
+            nativeClockHoldover=true;
+            return;
+        }
         if(adopt && nativeElectionManaged && now<clockHoldUntil) {
             if(p.seen>clockDeferredAt) { clockDeferredAt=p.seen; ++clockDeferred; }
             return;
         }
-        nativeClockHoldover=false; synchronized=true;
+        // A timer rechecking a rejected observation is not a new aligned RX.
+        // Retain the acquired clock as holdover until a fresh accepted sample.
+        nativeClockHoldover=clockSampleRejected; synchronized=!clockSampleRejected;
         memcpy(master,p.advertisement.master,6);
         memcpy(sync,p.mac,6);
         // Native programs our radio sequence independently of its selected
@@ -468,6 +509,7 @@ struct State {
             epoch=p.epoch; baseCounter=p.baseCounter; clockSampleAt=p.seen;
             if(nativeElectionManaged) {
                 nativeClockValidated=true; nativeClockAcquisitionPending=false;
+                clockSampleRejected=false; nativeClockHoldover=false; synchronized=true;
                 ++nativeClockAcquisitions;
             }
         } else if(!sameClock || p.seen>clockSampleAt) {
@@ -479,9 +521,15 @@ struct State {
             // at most half a TU per fresh PSF; a discontinuous peer clock
             // needs a new selection instead of silently skipping real AWs.
             if(delta>5*1024 || delta<-5*1024) {
-                clockSampleAt=p.seen; ++clockRejected; return;
+                clockSampleAt=p.seen; ++clockRejected; clockSampleRejected=true;
+                synchronized=false;
+                if(!nativeClockHoldover) ++nativeHoldoverTransitions;
+                nativeClockHoldover=true; return;
             }
-            if(nativeElectionManaged) nativeClockValidated=true;
+            if(nativeElectionManaged) {
+                nativeClockValidated=true; clockSampleRejected=false;
+                nativeClockHoldover=false; synchronized=true;
+            }
             if(now<clockHoldUntil) {
                 if(p.seen>clockDeferredAt) { clockDeferredAt=p.seen; ++clockDeferred; }
                 // Do not consume the sample. At the safe edge elect() uses

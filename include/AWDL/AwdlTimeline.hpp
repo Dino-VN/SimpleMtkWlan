@@ -36,6 +36,23 @@ inline bool planRadio(const State &s,uint64_t now,RadioPlan &out,uint32_t leadUs
         }
     }
     if(!target.channel) return false;
+    // A measured response longer than an EAW cannot serve the nearest dense
+    // slot. Choose a reachable future edge in the same real clock instead of
+    // repeatedly receiving grants after their first target has already ended.
+    // Initial/default lead retains the fast-response startup behavior.
+    uint64_t ready=now+leadUs;
+    // The measured lead includes an 8ms preparation margin. A timer arriving
+    // within that margin must retain its already reachable sparse target.
+    if(leadUs>rocLeadUs && leadUs>unsigned(s.presence)*awUs+8000 && target.start+8000<ready) {
+        if(!currentWindow(s,ready,target)) return false;
+        if(target.start+8000<ready || !target.channel) {
+            for(unsigned i=0;i<s.sequence.count;++i) {
+                if(!currentWindow(s,target.end,target)) return false;
+                if(target.channel) break;
+            }
+        }
+        if(!target.channel) return false;
+    }
     uint64_t at=target.start>leadUs ? target.start-leadUs : 0;
     if(at<now) at=now;
     uint64_t end=target.end;
