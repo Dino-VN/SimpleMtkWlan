@@ -72,6 +72,21 @@ inline bool grantCoversWindow(const Window &w,const Reservation &grant,uint64_t 
     return w.channel && grant.canTransmit(w.channel,at) && end>at &&
         end-at+10*1024>=unsigned(w.presence)*awUs;
 }
+// Keep the original future reservation when an early grant arrives. Replanning
+// with now + lead would otherwise move the target beyond this valid grant.
+// Revalidate the actual schedule: an expired/short grant or a changed window
+// must not pin RF ownership or produce an event for stale coordinates.
+inline bool grantCoversReservedWindow(const State &s,const Window &reserved,
+                                     uint8_t requestedChannel,const Reservation &grant,
+                                     uint64_t now) {
+    if(!requestedChannel || requestedChannel!=reserved.channel || now>=reserved.start ||
+       !grant.grantObservedAt || grant.grantObservedAt>now ||
+       !grantCoversWindow(reserved,grant,reserved.start)) return false;
+    Window actual={};
+    return currentWindow(s,reserved.start,actual) && actual.start==reserved.start &&
+        actual.end==reserved.end && actual.channel==reserved.channel &&
+        actual.counter==reserved.counter && actual.presence==reserved.presence;
+}
 struct Timeline {
     Window active={};
     bool open=false, emitted=false;

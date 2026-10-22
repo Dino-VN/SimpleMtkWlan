@@ -894,6 +894,91 @@ int main(){
  }
  fprintf(stderr,"dense 500ms starts=%u ends=%u reserves=%u\n",denseStarts,denseEnds,dense.radio.reserves);
  assert(denseStarts>=6&&denseEnds>=5);
+ // Replay the hardware's early grant: its original channel-6 AW is fully
+ // covered, but a rolling one-second lookahead selects a different channel
+ // and replaces the grant 475692us before the original AW. Remap channel 36
+ // to 44 and base channel 149 to 6 for this HAL; keep the observed times.
+ auto prepareEarlyGrant=[](AirportMtkAwdlInterface &run,unsigned duration) {
+  init(run);run.radio.grant.cancel();clockUS=543910283;
+  run.state.init(local,543337395);
+  const uint8_t channels[16]={44,0,6,0,0,0,0,0,6,0,6,0,0,0,0,0};
+  memcpy(run.state.sequence.channels,channels,16);run.state.ownSequence=run.state.sequence;
+  run.reserveLeadUS=1000000;
+  run.radio.onReserve=[&run]{run.radio.grant.request(run.radio.grant.token+1,run.radio.requested,clockUS);};
+  run.serviceInGate();assert(run.radio.reserves==1&&run.radio.requested==6);
+  assert(run.requestedWindow.start==544910259&&run.requestedWindow.end==544975795);
+  clockUS=544368338;
+  assert(run.radio.grant.grant(run.radio.grant.token,6,duration,clockUS));
+  run.serviceInGate();assert(run.events.empty());
+ };
+ AirportMtkAwdlInterface earlyReservation;prepareEarlyGrant(earlyReservation,1070);
+ clockUS=544434567;earlyReservation.serviceInGate();
+ assert(earlyReservation.radio.reserves==1&&earlyReservation.radio.grant.granted);
+ assert(earlyReservation.events.empty());
+ clockUS=544910259;earlyReservation.serviceInGate();
+ assert(earlyReservation.events.size()==1&&earlyReservation.events[0].id==41);
+ assert(mtkawdl::be32(earlyReservation.events[0].bytes.data()+20)==clockUS);
+ clockUS=544975795;earlyReservation.serviceInGate();
+ assert(earlyReservation.events.size()==2&&earlyReservation.events[1].id==43);
+ assert(mtkawdl::be32(earlyReservation.events[1].bytes.data()+4)==clockUS);
+ // A useful intermediate AW on the already granted channel does not spend
+ // the future reservation. Its early-switch path must also keep that grant.
+ AirportMtkAwdlInterface intermediate;prepareEarlyGrant(intermediate,1070);
+ intermediate.state.sequence.channels[3]=intermediate.state.ownSequence.channels[3]=44;
+ uint64_t intermediateStart=intermediate.requestedWindow.start-6*4*mtkawdl::awUs;
+ uint64_t intermediateEnd=intermediateStart+4*mtkawdl::awUs;
+ clockUS=intermediateStart;intermediate.serviceInGate();
+ assert(intermediate.events.size()==1&&intermediate.awTimeline.open);
+ clockUS=intermediateEnd-7000;intermediate.serviceInGate();
+ assert(intermediate.awTimeline.open&&intermediate.radio.aborts==0&&intermediate.radio.reserves==1);
+ clockUS=intermediateEnd;intermediate.serviceInGate();
+ assert(intermediate.events.size()==2&&!intermediate.awTimeline.open);
+ clockUS=544910259;intermediate.serviceInGate();
+ assert(intermediate.events.size()==3&&intermediate.awTimeline.open&&intermediate.radio.reserves==1);
+ clockUS=544975795;intermediate.serviceInGate();assert(intermediate.events.size()==4);
+ // A grant that expires before its original target must allow replanning.
+ AirportMtkAwdlInterface expiresEarly;prepareEarlyGrant(expiresEarly,100);
+ clockUS=544434567;expiresEarly.serviceInGate();
+ assert(expiresEarly.radio.reserves==2&&expiresEarly.events.empty());
+ // Do not retain a reservation whose original channel/counter coordinates
+ // no longer belong to the current schedule, even if RF coverage is long.
+ AirportMtkAwdlInterface changedTarget;prepareEarlyGrant(changedTarget,1070);
+ changedTarget.state.sequence.channels[8]=changedTarget.state.ownSequence.channels[8]=44;
+ clockUS=544434567;changedTarget.serviceInGate();
+ assert(changedTarget.radio.reserves==2&&changedTarget.events.empty());
+ AirportMtkAwdlInterface changedCounter;prepareEarlyGrant(changedCounter,1070);
+ changedCounter.state.baseCounter+=64; // Same channel index, different AW identity.
+ clockUS=544434567;changedCounter.serviceInGate();
+ assert(changedCounter.radio.reserves==2&&changedCounter.events.empty());
+ // Sustained sparse scheduling with the measured one-second preparation
+ // lead and changing response delays. Every start must have live RF coverage;
+ // never turn the genuinely skipped different-channel slots into events.
+ AirportMtkAwdlInterface mixed;init(mixed);mixed.radio.grant.cancel();
+ const uint8_t mixedChannels[16]={6,0,44,0,0,0,0,0,6,0,44,0,0,0,0,0};
+ memcpy(mixed.state.sequence.channels,mixedChannels,16);mixed.state.ownSequence=mixed.state.sequence;
+ mixed.reserveLeadUS=1000000;
+ const unsigned delays[]={458055,3000,97000,980000};
+ uint64_t mixedDue=0,mixedStop=clockUS+8000000;uint8_t mixedToken=1;
+ mixed.radio.onReserve=[&]{mixed.radio.grant.request(++mixedToken,mixed.radio.requested,clockUS);
+  mixedDue=clockUS+delays[(mixed.radio.reserves-1)%4];};
+ mixed.onStart=[&]{assert(mixed.radio.grant.canTransmit(mixed.awTimeline.active.channel,clockUS));};
+ while(clockUS<mixedStop) {
+  if(mixed.radio.grant.pending&&clockUS>=mixedDue)
+   assert(mixed.radio.grant.grant(mixedToken,mixed.radio.requested,mixed.radio.duration,clockUS));
+  mixed.serviceInGate();assert(mixed.t.us);clockUS+=mixed.t.us+250;
+ }
+ unsigned mixedStarts=0,mixedEnds=0;uint32_t mixedStart=0;
+ for(const auto &event:mixed.events) {
+  if(event.id==41) {assert(mixedStarts==mixedEnds);++mixedStarts;
+   mixedStart=mtkawdl::be32(event.bytes.data()+20);
+  } else {assert(mixedStarts==mixedEnds+1);++mixedEnds;
+   unsigned duration=(mtkawdl::be32(event.bytes.data()+4)-mixedStart)/1024;
+   assert(duration>=54&&duration<=74);
+  }
+ }
+ fprintf(stderr,"sparse mixed 3-980ms lead=%u starts=%u ends=%u reserves=%u\n",
+  mixed.reserveLeadUS,mixedStarts,mixedEnds,mixed.radio.reserves);
+ assert(mixedStarts>=6&&mixedEnds>=6&&mixed.radio.reserves<=9);
  // Repeating native advertisers must not compare the peer's different radio
  // sequence against ours and repeatedly tear down an otherwise valid grant.
  AirportMtkAwdlInterface selected;init(selected);selected.state.nativeElectionManaged=true;

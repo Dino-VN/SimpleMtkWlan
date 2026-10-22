@@ -819,6 +819,7 @@ void AirportMtkAwdlInterface::serviceInGate()
         uint64_t early=awTimeline.switchLeadUS();
         if(snapshot && nextValid && next.channel && hal->awdlChannelAllowed(next.channel) &&
            !mtkawdl::grantCoversWindow(next,live,next.start) &&
+           !mtkawdl::grantCoversReservedWindow(state,requestedWindow,requestedChannel,live,now) &&
            early && awTimeline.active.end-now<=early) {
             // Give the next ROC a bounded head start. Native permits +/-10TU
             // in actual AW duration, including lateness of this window's start.
@@ -974,6 +975,12 @@ void AirportMtkAwdlInterface::serviceInGate()
            !mtkawdl::grantCoversWindow(window,grant,now)) ++awTimeline.shortGrants;
         bool pending=grant.pending && now<grant.deadline;
         if(!pending) {
+            if(mtkawdl::grantCoversReservedWindow(state,requestedWindow,requestedChannel,grant,now)) {
+                // An accepted ROC already covers the original future AW.
+                // Keep it through idle/different-channel slots instead of
+                // moving the lookahead horizon and replacing its token.
+                timer->setTimeoutMS(1); return;
+            }
             mtkawdl::RadioPlan plan={};
             // Once an EAW ended early, reserve its successor even when a
             // short presence still leaves us inside the start tolerance.
