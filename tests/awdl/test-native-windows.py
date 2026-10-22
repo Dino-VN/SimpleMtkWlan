@@ -2,10 +2,11 @@
 """Run production AW events/scheduler against real-grant and callback scenarios."""
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
 root = Path(__file__).resolve().parents[2]
-source = (root / 'AirportMtkWlan/AirportMtkAwdlInterface.cpp').read_text()
+source = (Path(sys.argv[1]) if len(sys.argv)>1 else root / 'AirportMtkWlan/AirportMtkAwdlInterface.cpp').read_text()
 ioctl = (root / 'include/Airport/apple80211_ioctl.h').read_text()
 def function(signature):
     start = source.index(signature)
@@ -74,7 +75,7 @@ struct AirportMtkAwdlInterface{
  apple80211_awdl_election_params electionId{};unsigned secondaryMasterChannel=0;
  uint8_t syncTemplate[2048]{},miTemplate[2048]{};size_t templateLength=0,miTemplateLength=0;
  uint16_t miCounter=0;bool miCounterValid=false;
- mbuf_t queue[64]{};uint64_t queueTime[64]{};unsigned queueCount=0,queueHead=0;
+ mbuf_t queue[64]{};uint64_t queueTime[64]{},queueDeadline[64]{};unsigned queueCount=0,queueHead=0;
  std::vector<Event> events;std::function<void()> onStart,onEnd;
  void setProperty(const char*,uint64_t,unsigned){}void setProperty(const char*,bool){}
  void setProperty(const char*,const void*,unsigned){}void setProperty(const char*,const char*){}
@@ -395,7 +396,7 @@ int main(){
  assert(mtkawdl::parseAction(holdFrame,holdSize,holdWire)&&holdWire.counter==holdover.state.counter(clockUS));
  uint8_t holdData[24]{};holdData[4]=1;
  holdover.queue[0]=holdover.makeFrame(holdData,sizeof(holdData));
- holdover.queueHead=0;holdover.queueTime[0]=clockUS;holdover.queueCount=1;
+ holdover.queueHead=0;holdover.queueTime[0]=clockUS;holdover.queueDeadline[0]=clockUS+mtkawdl::dataQueueLifetimeUs(holdover.state,(const uint8_t*)mbuf_data(holdover.queue[0])+4);holdover.queueCount=1;
  assert(holdover.radio.awdlCanTransmit(6));holdover.serviceInGate();
  assert(!holdover.queueCount&&holdover.dataTxSubmitted==1&&!lost.used);
  // The selected source returns with a small phase offset. Resume bounded
@@ -552,7 +553,7 @@ int main(){
  clockUS=partial.requestedWindow.start+9000;
  uint8_t multicast[24]{};multicast[4]=1;
  partial.queue[0]=partial.makeFrame(multicast,sizeof(multicast));
- partial.queueTime[0]=clockUS;partial.queueCount=1;partial.serviceInGate();
+ partial.queueTime[0]=clockUS;partial.queueDeadline[0]=clockUS+mtkawdl::dataQueueLifetimeUs(partial.state,(const uint8_t*)mbuf_data(partial.queue[0])+4);partial.queueCount=1;partial.serviceInGate();
  assert(partial.events.empty()&&partial.radio.reserves==1&&partial.radio.transmits==1&&!partial.queueCount);
  clockUS=partial.radio.grant.deadline;partial.serviceInGate();
  assert(partial.radio.reserves==1&&!partial.radio.grant.pending&&partial.events.empty());
@@ -563,7 +564,7 @@ int main(){
  AirportMtkAwdlInterface station;init(station);station.dataPeers.observe(peer,clockUS);
  uint8_t unicastFrame[24]{};memcpy(unicastFrame+4,peer,6);
  station.queue[0]=station.makeFrame(unicastFrame,sizeof(unicastFrame));
- station.queueTime[0]=clockUS;station.queueCount=1;
+ station.queueTime[0]=clockUS;station.queueDeadline[0]=clockUS+mtkawdl::dataQueueLifetimeUs(station.state,(const uint8_t*)mbuf_data(station.queue[0])+4);station.queueCount=1;
  unsigned adds=0,deletes=0;
  station.radio.onPeer=[&](bool add){if(add){++adds;clockUS+=20000;station.dataPeers.reset();}else ++deletes;};
  station.serviceInGate();assert(adds==1&&deletes==1&&station.events.empty());
@@ -588,7 +589,7 @@ int main(){
  // A stale add whose cleanup failed remains tracked for the next cleanup tick.
  AirportMtkAwdlInterface failedCleanup;init(failedCleanup);failedCleanup.dataPeers.observe(peer,clockUS);
  failedCleanup.queue[0]=failedCleanup.makeFrame(unicastFrame,sizeof(unicastFrame));
- failedCleanup.queueTime[0]=clockUS;failedCleanup.queueCount=1;
+ failedCleanup.queueTime[0]=clockUS;failedCleanup.queueDeadline[0]=clockUS+mtkawdl::dataQueueLifetimeUs(failedCleanup.state,(const uint8_t*)mbuf_data(failedCleanup.queue[0])+4);failedCleanup.queueCount=1;
  failedCleanup.radio.peerDeleteResult=kIOReturnNotReady;
  failedCleanup.radio.onPeer=[&](bool add){if(add)failedCleanup.dataPeers.reset();};
  failedCleanup.serviceInGate();bool tracked=false;
@@ -950,6 +951,41 @@ int main(){
  changedCounter.state.baseCounter+=64; // Same channel index, different AW identity.
  clockUS=544434567;changedCounter.serviceInGate();
  assert(changedCounter.radio.reserves==2&&changedCounter.events.empty());
+ // Data waits for an actually usable AW: a 980ms firmware response in
+ // a schedule with one active EAW per 1048.576ms cycle. No grant or event
+ // is invented at the original packet's former one-second expiration.
+ AirportMtkAwdlInterface dataWait;init(dataWait);dataWait.radio.grant.cancel();
+ memset(dataWait.state.sequence.channels,0,16);dataWait.state.sequence.channels[0]=6;
+ dataWait.state.ownSequence=dataWait.state.sequence;dataWait.reserveLeadUS=1000000;
+ uint8_t waitedData[64]={8};waitedData[4]=1;memcpy(waitedData+10,local,6);
+ dataWait.queue[0]=dataWait.makeFrame(waitedData,sizeof(waitedData));
+ uint64_t dataQueuedAt=clockUS,dataSentAt=0;
+ dataWait.queueTime[0]=clockUS;
+ dataWait.queueDeadline[0]=clockUS+mtkawdl::dataQueueLifetimeUs(dataWait.state,waitedData+4);
+ dataWait.queueCount=1;
+ mtkawdl::State dataRemote;dataRemote.init(peer,clockUS);
+ dataRemote.sequence=dataRemote.ownSequence=dataWait.state.sequence;
+ uint8_t dataAdvertisement[512];size_t dataAdvertisementLength=mtkawdl::buildAction(dataRemote,dataAdvertisement,sizeof(dataAdvertisement),clockUS);
+ assert(dataWait.state.receiveAction(dataAdvertisement,dataAdvertisementLength,clockUS)>=0);
+ assert(dataWait.dataPeers.observe(peer,clockUS)>=0);
+ memcpy(waitedData+4,peer,6);
+ dataWait.queue[1]=dataWait.makeFrame(waitedData,sizeof(waitedData));
+ dataWait.queueTime[1]=clockUS;
+ dataWait.queueDeadline[1]=clockUS+mtkawdl::dataQueueLifetimeUs(dataWait.state,peer);
+ dataWait.queueCount=2;uint64_t dataGrantDue=0;uint8_t dataToken=1;
+ dataWait.radio.onReserve=[&]{dataWait.radio.grant.request(++dataToken,6,clockUS);dataGrantDue=clockUS+980000;};
+ while(clockUS<dataQueuedAt+2000000) {
+  if(dataWait.radio.grant.pending&&clockUS>=dataGrantDue)
+   assert(dataWait.radio.grant.grant(dataToken,6,dataWait.radio.duration,clockUS));
+  dataWait.serviceInGate();
+  if(dataWait.dataTxSubmitted&&!dataSentAt)dataSentAt=clockUS;
+  assert(dataWait.t.us);clockUS+=dataWait.t.us+250;
+ }
+ fprintf(stderr,"sparse data submitted=%llu expired=%llu wait=%llu us\n",
+  (unsigned long long)dataWait.dataTxSubmitted,(unsigned long long)dataWait.dataTxExpired,
+  (unsigned long long)(dataSentAt ? dataSentAt-dataQueuedAt : 0));
+ assert(dataWait.dataTxSubmitted==2&&dataWait.dataTxExpired==0&&!dataWait.queueCount);
+ assert(dataSentAt>=dataQueuedAt+1000000);
  // Sustained sparse scheduling with the measured one-second preparation
  // lead and changing response delays. Every start must have live RF coverage;
  // never turn the genuinely skipped different-channel slots into events.
@@ -979,6 +1015,7 @@ int main(){
  fprintf(stderr,"sparse mixed 3-980ms lead=%u starts=%u ends=%u reserves=%u\n",
   mixed.reserveLeadUS,mixedStarts,mixedEnds,mixed.radio.reserves);
  assert(mixedStarts>=6&&mixedEnds>=6&&mixed.radio.reserves<=9);
+
  // Repeating native advertisers must not compare the peer's different radio
  // sequence against ours and repeatedly tear down an otherwise valid grant.
  AirportMtkAwdlInterface selected;init(selected);selected.state.nativeElectionManaged=true;

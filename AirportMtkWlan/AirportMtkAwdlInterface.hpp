@@ -189,7 +189,7 @@ private:
     mtkawdl::DataPeers dataPeers;
     uint8_t requestedChannel = 0, grantedChannel = 0; uint64_t nextAction = 0, requestDeadline = 0;
     uint8_t syncTemplate[2048]; size_t templateLength = 0;
-    mbuf_t queue[64] = {}; uint64_t queueTime[64]; unsigned queueHead = 0, queueCount = 0;
+    mbuf_t queue[64] = {}; uint64_t queueTime[64], queueDeadline[64]; unsigned queueHead = 0, queueCount = 0;
     apple80211_awdl_sync_params syncParams;
     apple80211_awdl_extension_state_machine_parameter extension;
     apple80211_awdl_election_id electionId;

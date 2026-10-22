@@ -18,6 +18,28 @@ inline bool currentWindow(const State &s,uint64_t now,Window &out) {
          uint16_t(s.counter(now)-s.counter(now)%s.presence),s.channel(now),s.presence};
     return true;
 }
+// One MCU queue admission can wait 30*100ms, then ROC has a one-second
+// response budget. Add one complete local/known-destination channel cycle
+// and the scheduler's 8ms edge margin. Snapshot this budget on enqueue:
+// changing schedules and resource retries must not extend a packet's life.
+inline uint32_t dataQueueLifetimeUs(const State &s,const uint8_t *destination) {
+    uint32_t cycle=slots*4*awUs;
+    const Sequence *sequences[2]={&s.sequence,&s.ownSequence};
+    for(const Sequence *sequence : sequences) {
+        if(validSequence(*sequence)) {
+            uint32_t length=unsigned(sequence->count)*(unsigned(sequence->step)+1)*awUs;
+            if(length>cycle) cycle=length;
+        }
+    }
+    int peer=s.find(destination);
+    if(peer>=0 && validSequence(s.peers[peer].advertisement.sequence)) {
+        const Sequence &sequence=s.peers[peer].advertisement.sequence;
+        uint32_t length=unsigned(sequence.count)*(unsigned(sequence.step)+1)*awUs;
+        if(length>cycle) cycle=length;
+    }
+    // Valid sequences cap this at 20,785,216us even without any radio grant.
+    return 4*rocResponseTimeoutUs+cycle+8000;
+}
 // Idle slots leave time for the secondary BSS RLM response and off-channel
 // arbitration before the next EAW. A live EAW is still closed only within
 // native's duration tolerance; this lead never fabricates an early AW-start.

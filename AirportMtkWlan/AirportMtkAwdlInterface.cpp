@@ -620,7 +620,9 @@ UInt32 AirportMtkAwdlInterface::output(mbuf_t m)
     m=makeFrame(frame,size);
     if(!m) return kIOReturnOutputDropped;
     unsigned pos=(queueHead+queueCount)%64;
-    queue[pos]=m; queueTime[pos]=awdlNow(); ++queueCount;
+    uint64_t now=awdlNow();
+    queue[pos]=m; queueTime[pos]=now;
+    queueDeadline[pos]=now+mtkawdl::dataQueueLifetimeUs(state,frame+4); ++queueCount;
     timer->setTimeoutMS(1);
     return kIOReturnOutputSuccess;
 }
@@ -708,6 +710,15 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLDataTxExpired",dataTxExpired,64);
     setProperty("MTKAWDLDataTxStatus",static_cast<uint64_t>(dataTxStatus),32);
     setProperty("MTKAWDLDataTxPending",static_cast<uint64_t>(queueCount),32);
+    uint64_t oldestAge=0, nextExpiry=0;
+    for(unsigned i=0;i<queueCount;++i) {
+        unsigned index=(queueHead+i)%64;
+        uint64_t age=now>=queueTime[index] ? now-queueTime[index] : 0;
+        if(age>oldestAge) oldestAge=age;
+        if(!nextExpiry || queueDeadline[index]<nextExpiry) nextExpiry=queueDeadline[index];
+    }
+    setProperty("MTKAWDLDataTxOldestAgeUS",oldestAge,64);
+    setProperty("MTKAWDLDataTxNextExpiryUS",nextExpiry,64);
     setProperty("MTKAWDLDataRxFrames",dataRxFrames,64);
     setProperty("MTKAWDLDataRxInvalid",dataRxInvalid,64);
     setProperty("MTKAWDLDataRxUnknownPeer",dataRxUnknownPeer,64);
@@ -833,12 +844,12 @@ void AirportMtkAwdlInterface::serviceInGate()
     // Expire queued data even while ROC requests fail or the slot is idle.
     // A full queue must not remain wedged waiting for a radio grant.
     for(unsigned pending=queueCount;pending--;) {
-        mbuf_t m=queue[queueHead]; uint64_t time=queueTime[queueHead];
+        mbuf_t m=queue[queueHead]; uint64_t time=queueTime[queueHead], expiry=queueDeadline[queueHead];
         queueHead=(queueHead+1)%64; --queueCount;
-        if(now-time>=1000000) { ++dataTxExpired; mbuf_freem(m); }
+        if(now>=expiry) { ++dataTxExpired; mbuf_freem(m); }
         else {
             unsigned tail=(queueHead+queueCount)%64;
-            queue[tail]=m; queueTime[tail]=time; ++queueCount;
+            queue[tail]=m; queueTime[tail]=time; queueDeadline[tail]=expiry; ++queueCount;
         }
     }
     state.elect(now); publishScheduler(now);
@@ -1115,7 +1126,7 @@ void AirportMtkAwdlInterface::serviceInGate()
     }
     unsigned pending=queueCount;
     while(pending-- && queueCount && hal->awdlCanTransmit(channel)) {
-        mbuf_t m=queue[queueHead]; uint64_t time=queueTime[queueHead];
+        mbuf_t m=queue[queueHead]; uint64_t time=queueTime[queueHead], expiry=queueDeadline[queueHead];
         const uint8_t *f=(const uint8_t *)mbuf_data(m);
         int peer=state.find(f+4);
         bool ready=f[4]&1;
@@ -1124,11 +1135,11 @@ void AirportMtkAwdlInterface::serviceInGate()
             ready=p.channel(now)==channel;
         }
         queueHead=(queueHead+1)%64; --queueCount;
-        if(now-time<1000000 && !ready) {
-            unsigned tail=(queueHead+queueCount)%64; queue[tail]=m; queueTime[tail]=time; ++queueCount;
+        if(now<expiry && !ready) {
+            unsigned tail=(queueHead+queueCount)%64; queue[tail]=m; queueTime[tail]=time; queueDeadline[tail]=expiry; ++queueCount;
             continue;
         }
-        if(now-time>=1000000) { ++dataTxExpired; mbuf_freem(m); }
+        if(now>=expiry) { ++dataTxExpired; mbuf_freem(m); }
         else {
             dataTxStatus=hal->awdlTryTransmit(&m,channel);
             if(m) {
@@ -1137,11 +1148,11 @@ void AirportMtkAwdlInterface::serviceInGate()
                 if(dataTxStatus==kIOReturnNotFound) {
                     // One missing station must not block multicast/other peers.
                     unsigned tail=(queueHead+queueCount)%64;
-                    queue[tail]=m; queueTime[tail]=time; ++queueCount;
+                    queue[tail]=m; queueTime[tail]=time; queueDeadline[tail]=expiry; ++queueCount;
                     ++dataTxDeferred; continue;
                 }
                 queueHead=(queueHead+63)%64;
-                queue[queueHead]=m; queueTime[queueHead]=time; ++queueCount;
+                queue[queueHead]=m; queueTime[queueHead]=time; queueDeadline[queueHead]=expiry; ++queueCount;
                 ++dataTxDeferred;
                 // Busy/grant/ring pressure applies to the rest of this batch.
                 break;
