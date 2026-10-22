@@ -64,6 +64,7 @@ struct AirportMtkAwdlInterface{
  uint64_t dataTxSubmitted=0,dataTxFailed=0,dataTxExpired=0,dataTxDeferred=0;IOReturn dataTxStatus=0;
  uint64_t serviceTicks=0,reserveAttempts=0,grantObservations=0,awStartNotifications=0,
  nextAction=0,actionSubmitted=0,actionFailed=0,miStart=0,miSubmitted=0,miFailed=0;
+ uint64_t reserveWaitUS=0,reserveMaxWaitUS=0,reserveInvalidations=0;uint32_t reserveInvalidReason=0;
  struct{unsigned mode=3;}afMode;struct{unsigned synchronization_frame_period=440;}syncParams;
  uint8_t syncTemplate[2048]{},miTemplate[2048]{};size_t templateLength=0,miTemplateLength=0;
  uint16_t miCounter=0;bool miCounterValid=false;
@@ -446,10 +447,133 @@ int main(){
  assert(selected.setAWDL_AWDL_ADVERTISERS(&advert)==0);
  assert(selected.awTimeline.open&&selected.radio.aborts==aborts&&selected.state.counter(clockUS)==hostCounter);
  assert(selected.state.clockRejected==1);
+ // A fresh selected-parent PSF can arrive while the synchronous RLM wait
+ // releases the gate, then again while ROC is pending and during the AW.
+ // Keep the radio clock AND outgoing synchronization TLV on one timeline.
+ for(int drift:{-3000,3000}) {
+  AirportMtkAwdlInterface held;init(held);held.radio.grant.cancel();
+  for(unsigned i=0;i<16;++i) held.state.sequence.channels[i]=(i%2?44:0);
+  held.state.ownSequence=held.state.sequence;
+  held.state.nativeElectionManaged=held.state.nativeParentSelected=true;
+  memcpy(held.state.nativeParent,peer,6);
+  auto &p=held.state.peers[0];p.used=true;p.seen=p.epoch=clockUS;
+  memcpy(p.mac,peer,6);memcpy(p.advertisement.master,peer,6);
+  memcpy(p.advertisement.sync,peer,6);p.advertisement.presence=4;
+  p.advertisement.sequence=held.state.sequence;held.state.elect(clockUS);
+  clockUS=1000000+4*mtkawdl::awUs-24000;
+  uint64_t epoch=held.state.epoch;uint16_t base=held.state.baseCounter;
+  auto sampleClock=[&]{p.seen=clockUS;p.epoch=uint64_t(int64_t(epoch)-drift);held.state.elect(clockUS);};
+  held.radio.onReserve=[&]{clockUS+=10000;sampleClock();held.radio.grant.request(11,44,clockUS);};
+  held.serviceInGate();
+  assert(held.radio.reserves==1&&held.radio.aborts==0&&held.radio.grant.pending);
+  assert(held.state.epoch==epoch&&held.state.baseCounter==base&&held.events.empty());
+  clockUS+=1000;sampleClock();held.serviceInGate();
+  assert(held.state.epoch==epoch&&held.radio.reserves==1&&held.events.empty());
+  held.radio.give(11,44,100);clockUS=held.requestedWindow.start;held.serviceInGate();
+  assert(held.awTimeline.open&&held.events.size()==1);
+  uint64_t end=held.awTimeline.radioEnd;
+  clockUS+=20000;sampleClock();held.serviceInGate();
+  uint8_t frame[512];mtkawdl::Advertisement wire{};
+  size_t n=mtkawdl::buildAction(held.state,frame,sizeof(frame),clockUS);
+  assert(mtkawdl::parseAction(frame,n,wire));
+  assert(wire.counter==held.state.counter(clockUS)&&wire.sequence.channels[1]==44);
+  assert(held.state.epoch==epoch&&held.awTimeline.radioEnd==end&&held.events.size()==1);
+  mtkawdl::State beforeRelease=held.state;
+  clockUS=end;held.serviceInGate();
+  assert(!held.awTimeline.open&&held.events.size()==2&&held.state.clockCorrections==1);
+  int32_t adjustment=int16_t(held.state.counter(end)-beforeRelease.counter(end))*int32_t(mtkawdl::awUs)+
+   int32_t((end-held.state.epoch)%mtkawdl::awUs)-int32_t((end-beforeRelease.epoch)%mtkawdl::awUs);
+  assert(adjustment==(drift>0?512:-512));
+  assert((mtkawdl::be32(held.events[1].bytes.data()+4)-
+          mtkawdl::be32(held.events[0].bytes.data()+20))/1024==64);
+ }
+ // Sparse grants plus repeated clock observations across counter rollover.
+ // Every announced counter must be the next real nonzero sequence slot.
+ for(int drift:{-3000,3000}) {
+  AirportMtkAwdlInterface run;init(run);run.radio.grant.cancel();
+  memcpy(run.state.sequence.channels,sparseChannels,16);run.state.ownSequence=run.state.sequence;
+  run.state.baseCounter=65504;
+  run.state.nativeElectionManaged=run.state.nativeParentSelected=true;
+  memcpy(run.state.nativeParent,peer,6);auto &p=run.state.peers[0];
+  p.used=true;p.seen=p.epoch=clockUS;p.baseCounter=65504;
+  memcpy(p.mac,peer,6);memcpy(p.advertisement.master,peer,6);run.state.elect(clockUS);
+  uint64_t origin=clockUS,due=0,nextSample=clockUS+70000,stop=clockUS+4000000;
+  uint8_t token=1;
+  run.radio.onReserve=[&]{clockUS+=10000;p.seen=clockUS;run.state.elect(clockUS);
+   run.radio.grant.request(++token,run.radio.requested,clockUS);
+   due=clockUS+(run.radio.requested==44?35000:3000);};
+  clockUS+=70000;
+  while(clockUS<stop) {
+   if(clockUS>=nextSample) {
+    // Model one peer clock with an offset, then its observations settle.
+    p.epoch=uint64_t(int64_t(origin)-drift);p.seen=clockUS;
+    run.state.elect(clockUS);nextSample=clockUS+70000;
+   }
+   if(run.radio.grant.pending&&clockUS>=due)
+    assert(run.radio.grant.grant(token,run.radio.requested,run.radio.duration,clockUS));
+   run.serviceInGate();assert(run.t.us);clockUS+=run.t.us+250;
+  }
+  assert(run.reserveInvalidations==0&&run.state.clockDeferred>0&&run.state.clockCorrections>0);
+  unsigned starts=0,ends=0;uint16_t previous=65504;uint32_t start=0,previousStart=0;
+  for(const auto &event:run.events) {
+   if(event.id==41) {
+    assert(starts==ends);uint16_t expected=previous;
+    do {expected=uint16_t(expected+4);} while(!sparseChannels[(expected/4)%16]);
+    uint16_t counter=mtkawdl::le32(event.bytes.data());assert(counter==expected);
+    uint32_t timestamp=mtkawdl::be32(event.bytes.data()+20);
+    if(starts) {
+     int64_t gap=int64_t(uint32_t(timestamp-previousStart))-uint16_t(counter-previous)*int64_t(mtkawdl::awUs);
+     assert(gap>=-5*1024&&gap<=5*1024);
+    }
+    previous=counter;start=previousStart=timestamp;++starts;
+   } else {
+    assert(starts==ends+1);++ends;
+    uint32_t duration=mtkawdl::be32(event.bytes.data()+4)-start;
+    assert(duration/1024>=54&&duration/1024<=74);
+   }
+  }
+  assert(starts>=14&&ends>=13);
+ }
+ // Consecutive same-channel EAWs have no idle slot to hide a correction.
+ // Include a fresh PSF delivered synchronously by the native start callback.
+ for(int drift:{-3000,3000}) {
+  AirportMtkAwdlInterface run;init(run);run.state.baseCounter=65532;
+  run.state.nativeElectionManaged=run.state.nativeParentSelected=true;
+  memcpy(run.state.nativeParent,peer,6);auto &p=run.state.peers[0];
+  p.used=true;p.seen=p.epoch=clockUS;p.baseCounter=65532;
+  memcpy(p.mac,peer,6);memcpy(p.advertisement.master,peer,6);run.state.elect(clockUS);
+  uint64_t origin=clockUS,due=0,nextSample=clockUS+10000,stop=clockUS+2700000;
+  uint8_t token=1;
+  auto fresh=[&]{p.epoch=uint64_t(int64_t(origin)-drift);p.seen=clockUS;run.state.elect(clockUS);};
+  run.onStart=fresh;
+  run.radio.onReserve=[&]{clockUS+=1000;fresh();
+   run.radio.grant.request(++token,6,clockUS);due=clockUS+3000;};
+  while(clockUS<stop) {
+   if(clockUS>=nextSample) {fresh();nextSample=clockUS+10000;}
+   if(run.radio.grant.pending&&clockUS>=due)
+    assert(run.radio.grant.grant(token,6,run.radio.duration,clockUS));
+   run.serviceInGate();assert(run.t.us);clockUS+=run.t.us+250;
+  }
+  assert(run.reserveInvalidations==0&&run.awTimeline.starts==42&&run.awTimeline.ends==41);
+  unsigned starts=0,ends=0;uint16_t previous=65528;uint32_t start=0,previousStart=0;
+  for(const auto &e:run.events) {
+   if(e.id==41) {
+    assert(starts==ends);uint16_t counter=mtkawdl::le32(e.bytes.data());
+    assert(counter==uint16_t(previous+4));previous=counter;
+    uint32_t timestamp=mtkawdl::be32(e.bytes.data()+20);
+    if(starts) {int64_t gap=int64_t(uint32_t(timestamp-previousStart))-4*int64_t(mtkawdl::awUs);
+     assert(gap>=-5*1024&&gap<=5*1024);}
+    start=previousStart=timestamp;++starts;
+   } else {assert(starts==ends+1);++ends;
+    uint32_t duration=mtkawdl::be32(e.bytes.data()+4)-start;
+    assert(duration/1024>=54&&duration/1024<=74);}
+  }
+ }
  // MCU sleep replaces schedule while preserving the target channel: abort stale request.
  AirportMtkAwdlInterface changed;init(changed);changed.radio.grant.cancel();
  changed.radio.onReserve=[&]{changed.state.sequence.channels[4]=44;};changed.serviceInGate();
  assert(changed.radio.aborts==1&&changed.requestedChannel==0&&changed.events.empty());
+ assert(changed.reserveInvalidations==1&&(changed.reserveInvalidReason&1)&&!changed.state.clockHoldUntil);
  // No event from a pending/unmatched grant or a late boundary observation.
  AirportMtkAwdlInterface pending;init(pending);pending.radio.grant.request(3,6,clockUS);
  pending.serviceInGate();assert(pending.events.empty());

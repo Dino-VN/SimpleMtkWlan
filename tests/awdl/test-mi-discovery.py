@@ -70,6 +70,7 @@ struct AirportMtkAwdlInterface{
  uint64_t serviceTicks=0,reserveAttempts=0,grantObservations=0,actionSubmitted=0,actionFailed=0,
  actionReceived=0,actionHostAccepted=0,actionHostRejected=0,actionRSSIRejected=0,
  actionNativeDelivered=0,actionInvalid=0,actionNoBuffer=0,nextAction=0,requestDeadline=0;
+ uint64_t reserveWaitUS=0,reserveMaxWaitUS=0,reserveInvalidations=0;uint32_t reserveInvalidReason=0;
  int32_t lastActionRSSI=0;unsigned reserveDuration=0,requestedChannel=0,grantedChannel=0;
  IOReturn reserveStatus=0,actionStatus=0,miStatus=0;mbuf_t queue[64]{};
  uint64_t dataTxSubmitted=0,dataTxFailed=0,dataTxExpired=0,dataTxDeferred=0;IOReturn dataTxStatus=0;

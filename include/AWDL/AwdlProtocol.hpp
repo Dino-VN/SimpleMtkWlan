@@ -224,6 +224,11 @@ struct State {
     bool nativeElectionManaged, nativeParentSelected;
     uint8_t nativeParent[6];
     uint64_t clockSampleAt, clockCorrections, clockRejected;
+    // Software equivalent of a firmware AW clock: peer observations remain
+    // fresh, but phase discipline waits until the promised radio AW ends.
+    // Both event production and synchronization TLVs use epoch/baseCounter.
+    uint64_t clockHoldUntil, clockDeferredAt, clockDeferred;
+    void holdClock(uint64_t until) { clockHoldUntil=until; }
     void init(const uint8_t *address, uint64_t now) {
         memset(this,0,sizeof(*this)); memcpy(mac,address,6);
         memcpy(master,address,6); memcpy(sync,address,6);
@@ -251,6 +256,7 @@ struct State {
             (role==2 ? !memcmp(address,mac,6) :
              role==3 ? memcmp(address,mac,6) : (!nativeElectionManaged && memcmp(address,mac,6)))) return false;
         if (syncRole==role && !memcmp(forcedSync,address,6)) return true;
+        holdClock(0);
         syncRole=role; memcpy(forcedSync,address,6);
         synchronized=false; sequence=ownSequence; presence=ownPresence;
         memcpy(master,mac,6); memcpy(sync,mac,6); masterMetric=metric;
@@ -309,7 +315,7 @@ struct State {
         if(best<0) {
             // Preserve the current AW clock when an elected master expires,
             // but restore our own advertised channel sequence.
-            if(synchronized) { sequence=ownSequence; presence=ownPresence; }
+            if(synchronized) { sequence=ownSequence; presence=ownPresence; holdClock(0); }
             synchronized=false; masterMetric=metric; masterCounter=selfCounter; distance=0;
             memcpy(master,mac,6); memcpy(sync,mac,6); return;
         }
@@ -327,12 +333,12 @@ struct State {
         masterMetric=p.advertisement.metric; masterCounter=p.advertisement.masterCounter;
         distance=p.advertisement.distance+1;
         if(!nativeElectionManaged || !sameClock) {
+            holdClock(0);
             // Initial native parent selection may adopt its counter. Repeated
             // advertisements from that parent are clock observations, not a
             // request to replace the timeline on every RX/timer tick.
             epoch=p.epoch; baseCounter=p.baseCounter; clockSampleAt=p.seen;
         } else if(p.seen>clockSampleAt) {
-            clockSampleAt=p.seen;
             uint64_t local=now>=epoch ? now-epoch : 0;
             uint64_t remote=now>=p.epoch ? now-p.epoch : 0;
             int32_t delta=int16_t(uint16_t(p.baseCounter+remote/awUs)-counter(now))*int32_t(awUs)+
@@ -340,7 +346,16 @@ struct State {
             // Native permits 5 TU between consecutive matching starts. Slew
             // at most half a TU per fresh PSF; a discontinuous peer clock
             // needs a new selection instead of silently skipping real AWs.
-            if(delta>5*1024 || delta<-5*1024) { ++clockRejected; return; }
+            if(delta>5*1024 || delta<-5*1024) {
+                clockSampleAt=p.seen; ++clockRejected; return;
+            }
+            if(now<clockHoldUntil) {
+                if(p.seen>clockDeferredAt) { clockDeferredAt=p.seen; ++clockDeferred; }
+                // Do not consume the sample. At the safe edge elect() uses
+                // the newest peer observation, never a sum of old slews.
+                return;
+            }
+            clockSampleAt=p.seen;
             int32_t correction=delta>512 ? 512 : delta<-512 ? -512 : delta;
             if(correction) {
                 uint16_t base=counter(now);

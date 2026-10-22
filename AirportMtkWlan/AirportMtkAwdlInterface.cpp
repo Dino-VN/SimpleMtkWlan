@@ -537,6 +537,7 @@ IOReturn AirportMtkAwdlInterface::setSyncInGate(bool value)
     setProperty("MTKAWDLSyncTransition",value ? "enabling" : "disabling");
     if(!value) {
         enabled=false;
+        state.holdClock(0);
         if(awTimeline.open) notifyAvailabilityWindowEnd(awdlNow());
         awTimeline.reset(); drainCompletions();
     }
@@ -656,6 +657,7 @@ void AirportMtkAwdlInterface::notifyAvailabilityWindowEnd(uint64_t now)
     payload.endUsBE=__builtin_bswap32(static_cast<uint32_t>(now));
     setProperty("MTKAWDLLastAWEndUS",now,64);
     awTimeline.close();
+    state.holdClock(0);
     setProperty("MTKAWDLAWEndNotifications",awTimeline.ends,64);
     setProperty("MTKAWDLAWWindowOpen",false);
     postMessage(APPLE80211_M_AWDL_AVAILABILITY_WINDOW_EXTENSIONS_END,&payload,sizeof(payload),true);
@@ -683,6 +685,16 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLReserveAttempts",reserveAttempts,64);
     setProperty("MTKAWDLClockCorrections",state.clockCorrections,64);
     setProperty("MTKAWDLClockRejected",state.clockRejected,64);
+    setProperty("MTKAWDLClockDeferred",state.clockDeferred,64);
+    setProperty("MTKAWDLClockHoldUntilUS",state.clockHoldUntil,64);
+    setProperty("MTKAWDLReserveWaitUS",reserveWaitUS,64);
+    setProperty("MTKAWDLReserveMaxWaitUS",reserveMaxWaitUS,64);
+    setProperty("MTKAWDLReserveInvalidations",reserveInvalidations,64);
+    setProperty("MTKAWDLReserveInvalidReason",static_cast<uint64_t>(reserveInvalidReason),32);
+    setProperty("MTKAWDLRequestedAWChannel",static_cast<uint64_t>(requestedWindow.channel),32);
+    setProperty("MTKAWDLRequestedAWCounter",static_cast<uint64_t>(requestedWindow.counter),32);
+    setProperty("MTKAWDLRequestedAWStartUS",requestedWindow.start,64);
+    setProperty("MTKAWDLRequestedAWEndUS",requestedWindow.end,64);
     setProperty("MTKAWDLReserveStatus",static_cast<uint64_t>(reserveStatus),32);
     setProperty("MTKAWDLReserveDurationMS",static_cast<uint64_t>(reserveDuration),32);
     setProperty("MTKAWDLGrantObservations",grantObservations,64);
@@ -725,6 +737,7 @@ void AirportMtkAwdlInterface::serviceInGate()
     ++serviceTicks;
     if(!hal->awdlIsEnabled()) {
         // Transport reset invalidates the secondary BSS and all grants.
+        state.holdClock(0);
         enabled=false; dataPeers.reset(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); trafficActive=false;
         trafficPeerInstalled=false; bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
         setProperty("MTKAWDLSyncEnabled",false);
@@ -747,6 +760,7 @@ void AirportMtkAwdlInterface::serviceInGate()
         now=awdlNow();
     }
     if(awTimeline.open && awTimeline.matchesSchedule(state) && now<awTimeline.active.end) {
+        state.holdClock(awTimeline.active.end);
         mtkawdl::Window next={}; mtkawdl::Reservation live={};
         bool snapshot=hal->awdlGrantSnapshot(live);
         bool nextValid=mtkawdl::currentWindow(state,awTimeline.active.end,next);
@@ -873,6 +887,7 @@ void AirportMtkAwdlInterface::serviceInGate()
         if(requestedChannel && requestedWindow.end<=now) {
             mtkawdl::Reservation pending={};
             if(!hal->awdlGrantSnapshot(pending) || !pending.pending || now>=pending.deadline) {
+                state.holdClock(0);
                 hal->awdlAbort(); requestedChannel=grantedChannel=0;
             }
         }
@@ -925,28 +940,42 @@ void AirportMtkAwdlInterface::serviceInGate()
             uint8_t parent[6],root[6];
             memcpy(parent,state.sync,6); memcpy(root,state.master,6);
             mtkawdl::Sequence sequence=state.sequence;
+            uint8_t plannedRole=state.syncRole;
             // Include lead time and adjacent equal-channel EAWs in the dwell.
             // Firmware receipt still defines the only usable RF interval.
             uint32_t duration=plan.durationMs;
             reserveDuration=duration; ++reserveAttempts;
             requestedWindow=target;
+            // RLM commandSleep releases the gate: RX may call elect() while
+            // firmware prepares this channel. Freeze the shared event/wire
+            // clock through the first requested EAW, before entering HAL.
+            state.holdClock(target.end);
+            uint64_t requestAt=now;
             IOReturn status=hal->awdlReserve(target.channel,duration);
             reserveStatus=status;
             if(stopping || !enabled) return;
             now=awdlNow();
+            reserveWaitUS=now-requestAt;
+            if(reserveWaitUS>reserveMaxWaitUS) reserveMaxWaitUS=reserveWaitUS;
             mtkawdl::Window after={};
             uint64_t checkTime=now<target.start ? target.start : now;
+            reserveInvalidReason=0;
+            if(plannedRole!=state.syncRole || memcmp(parent,state.sync,6) ||
+               memcmp(root,state.master,6) || memcmp(&sequence,&state.sequence,sizeof(sequence)))
+                reserveInvalidReason|=1;
             if(!mtkawdl::currentWindow(state,checkTime,after) ||
                after.start!=target.start || after.channel!=target.channel ||
-               after.counter!=target.counter || after.presence!=target.presence ||
-               memcmp(parent,state.sync,6) || memcmp(root,state.master,6) ||
-               memcmp(&sequence,&state.sequence,sizeof(sequence))) {
+               after.counter!=target.counter || after.presence!=target.presence)
+                reserveInvalidReason|=2;
+            if(now>=target.end) reserveInvalidReason|=4;
+            if(reserveInvalidReason) {
+                ++reserveInvalidations; state.holdClock(0);
                 hal->awdlAbort(); requestedChannel=grantedChannel=0;
                 timer->setTimeoutMS(1); return;
             }
             if(status==kIOReturnSuccess) {
                 requestedChannel=target.channel; requestDeadline=now+100000;
-            } else requestedChannel=0;
+            } else { requestedChannel=0; state.holdClock(0); }
         }
         timer->setTimeoutMS(1); return;
     }
@@ -956,6 +985,7 @@ void AirportMtkAwdlInterface::serviceInGate()
     if(grantedChannel!=channel) ++grantObservations;
     uint8_t nativeRole=state.syncRole;
     if(!awTimeline.open && awTimeline.begin(window,grant,now,state.sync,state.master,nativeRole,&state.sequence)) {
+        state.holdClock(window.end);
         // Set lifecycle state before dispatch: native may synchronously call
         // back into sync/advertisers setters while receiving this event.
         notifyAvailabilityWindowStart(channel,now);

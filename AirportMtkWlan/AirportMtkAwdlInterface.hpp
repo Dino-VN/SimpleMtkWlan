@@ -155,6 +155,8 @@ private:
     uint64_t dataRxWrongDestination = 0, dataRxReplay = 0, dataRxDecoded = 0;
     IOReturn dataTxStatus = kIOReturnNotReady;
     uint64_t serviceTicks = 0, reserveAttempts = 0, grantObservations = 0, awStartNotifications = 0;
+    uint64_t reserveWaitUS = 0, reserveMaxWaitUS = 0, reserveInvalidations = 0;
+    uint32_t reserveInvalidReason = 0;
     uint64_t actionSubmitted = 0, actionFailed = 0, actionReceived = 0, lastDiagnostic = 0;
     uint64_t actionHostAccepted = 0, actionHostRejected = 0, actionRSSIRejected = 0;
     uint64_t actionNativeDelivered = 0, actionInvalid = 0, actionNoBuffer = 0;

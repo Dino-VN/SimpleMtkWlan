@@ -415,6 +415,7 @@ struct mwx_softc {
     bool sc_awdl_station_pending[4];
     mtkawdl::Reservation sc_awdl_roc;
     uint64_t sc_awdl_roc_events, sc_awdl_roc_grants, sc_awdl_roc_rejected;
+    uint64_t sc_awdl_roc_grant_delay_us, sc_awdl_roc_max_grant_delay_us;
     uint64_t sc_awdl_roc_submitted, sc_awdl_roc_send_failed;
     uint64_t sc_awdl_roc_scan_blocked, sc_awdl_roc_busy_blocked;
     uint64_t sc_awdl_tx_submitted, sc_awdl_tx_bad_frame, sc_awdl_tx_no_grant;
@@ -3769,12 +3770,19 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
             uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
             IOLockLock(sc->sc_awdl_lock);
             ++sc->sc_awdl_roc_events;
+            uint64_t requestedAt=sc->sc_awdl_roc.pending && sc->sc_awdl_roc.deadline>=100000 ?
+                sc->sc_awdl_roc.deadline-100000 : ns/1000;
             // Linux v6.17 mt7921_roc_grant_tlv: 20-byte TLV; ROC reqtype=1.
             bool accepted=mbuf_len(m)>=24 && mtkawdl::le16(p+4)==0 &&
                 mtkawdl::le16(p+6)==20 && p[8]==sc->sc_awdl_vif.idx && p[10]==0 && p[17]==1 &&
                 sc->sc_awdl_enabled && !sc->sc_awdl_stopping && !sc->sc_resetting && !sc->sc_detaching &&
                 sc->sc_awdl_roc.grant(p[9],p[11],mtkawdl::le32(p+20),ns/1000);
-            if(accepted) ++sc->sc_awdl_roc_grants; else ++sc->sc_awdl_roc_rejected;
+            if(accepted) {
+                ++sc->sc_awdl_roc_grants;
+                sc->sc_awdl_roc_grant_delay_us=ns/1000-requestedAt;
+                if(sc->sc_awdl_roc_grant_delay_us>sc->sc_awdl_roc_max_grant_delay_us)
+                    sc->sc_awdl_roc_max_grant_delay_us=sc->sc_awdl_roc_grant_delay_us;
+            } else ++sc->sc_awdl_roc_rejected;
             IOLockUnlock(sc->sc_awdl_lock);
         }
         m_freem(m); return;
@@ -8993,12 +9001,21 @@ void MtkMwx::awdlPublishDiagnostics()
     uint64_t events=com->sc_awdl_roc_events, grants=com->sc_awdl_roc_grants,
              rejected=com->sc_awdl_roc_rejected;
     bool pending=com->sc_awdl_roc.pending;
+    mtkawdl::Reservation radio=com->sc_awdl_roc;
+    uint64_t delay=com->sc_awdl_roc_grant_delay_us, maxDelay=com->sc_awdl_roc_max_grant_delay_us;
     IOLockUnlock(com->sc_awdl_lock);
     // Publish outside the receive lock; called at most once per second.
     mwxController()->setProperty("MTKAWDLROCEvents",events,64);
     mwxController()->setProperty("MTKAWDLROCGrants",grants,64);
     mwxController()->setProperty("MTKAWDLROCRejected",rejected,64);
     mwxController()->setProperty("MTKAWDLROCPending",pending);
+    mwxController()->setProperty("MTKAWDLROCGranted",radio.granted);
+    mwxController()->setProperty("MTKAWDLROCChannel",static_cast<uint64_t>(radio.channel),32);
+    mwxController()->setProperty("MTKAWDLROCToken",static_cast<uint64_t>(radio.token),32);
+    mwxController()->setProperty("MTKAWDLROCObservedAtUS",radio.grantObservedAt,64);
+    mwxController()->setProperty("MTKAWDLROCDeadlineUS",radio.deadline,64);
+    mwxController()->setProperty("MTKAWDLROCGrantDelayUS",delay,64);
+    mwxController()->setProperty("MTKAWDLROCMaxGrantDelayUS",maxDelay,64);
     mwxController()->setProperty("MTKAWDLROCSubmitted",com->sc_awdl_roc_submitted,64);
     mwxController()->setProperty("MTKAWDLROCSendFailed",com->sc_awdl_roc_send_failed,64);
     mwxController()->setProperty("MTKAWDLROCScanBlocked",com->sc_awdl_roc_scan_blocked,64);

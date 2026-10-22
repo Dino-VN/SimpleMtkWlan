@@ -133,6 +133,22 @@ static void nativeClockTests()
         p.seen=now-1;s.elect(now+2000);
         assert(s.clockRejected==1&&s.epoch==epoch&&s.baseCounter==base);
     }
+    // Replace deferred observations instead of accumulating half-TU slews.
+    // The hold has an absolute bound even if no grant arrives.
+    State s;s.init(local,1000000);s.nativeElectionManaged=s.nativeParentSelected=true;
+    memcpy(s.nativeParent,remote,6);
+    auto &p=s.peers[0];p.used=true;p.seen=p.epoch=1000000;
+    memcpy(p.mac,remote,6);memcpy(p.advertisement.master,remote,6);
+    s.elect(1000000);s.holdClock(1200000);
+    for(unsigned i=1;i<=20;++i) {
+        p.seen=1000000+i*5000;p.epoch=1000000-(i<20?3000:100);
+        s.elect(p.seen);s.elect(p.seen+1);
+    }
+    assert(s.epoch==1000000&&s.clockDeferred==20&&s.clockCorrections==0);
+    s.elect(1200000);assert(s.clockCorrections==1&&s.clockSampleAt==1100000);
+    auto epoch=s.epoch;auto base=s.baseCounter;
+    s.elect(1200001);assert(s.epoch==epoch&&s.baseCounter==base);
+    s.holdClock(1500000);assert(s.setSyncRole(3,local)&&!s.clockHoldUntil);
 }
 static void templateTests()
 {
