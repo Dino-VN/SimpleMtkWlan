@@ -34,7 +34,7 @@ struct AirportMtkWlan:OSObject {
     Hal hal; Hal *fHalService=&hal;
     Gate gate{this}; Gate *_fCommandGate=&gate;
     bool inactive=false, awdlExperimental=true, awdlCreating=false, awdlStopping=false;
-    bool created=false, fail=false; void *awdlInterface=nullptr;
+    bool created=false, fail=false, ready=true; void *awdlInterface=nullptr;
     unsigned creations=0, retains=0, releases=0;
     IOReturn awdlCreateStatus=kIOReturnNotReady;
     bool isInactive() const { return inactive; }
@@ -45,6 +45,7 @@ struct AirportMtkWlan:OSObject {
     bool createAwdlInterface() {
         assert(gate.inside); // Allocation must occur under the controller gate.
         if(created) return true;
+        if(!fHalService || !ready) { awdlCreateStatus=kIOReturnNotReady; return false; }
         ++creations;
         if(fail) { awdlCreateStatus=initializationFailure; return false; }
         awdlInterface=this; return created=true;
@@ -71,24 +72,24 @@ int main() {
     c.awdlStopping=false; c.fHalService=nullptr;
     assert(c.requestAwdlCreation()==kIOReturnNotReady);
     c.fHalService=&c.hal;
-    for(int state=0;state<IEEE80211_S_RUN;++state) {
+    c.ready=false;
+    assert(c.requestAwdlCreation()==kIOReturnNotReady && c.creations==0);
+    c.ready=true; c.fail=true;
+    for(int state=0;state<=IEEE80211_S_RUN;++state) {
         c.hal.ic.ic_state=state;
-        assert(c.requestAwdlCreation()==kIOReturnNotReady);
-        assert(c.hal.ic.ic_state==state); // A rejected request cannot reconnect/reset Wi-Fi.
+        assert(c.requestAwdlCreation()==initializationFailure);
+        assert(c.hal.ic.ic_state==state); // Dispatch must not reconnect/reset Wi-Fi.
     }
-    assert(c.creations==0);
-    c.hal.ic.ic_state=IEEE80211_S_RUN; c.fail=true;
-    assert(c.requestAwdlCreation()==initializationFailure);
-    assert(c.creations==1 && !c.created);
+    assert(c.creations==5 && !c.created);
     c.fail=false;
     assert(c.requestAwdlCreation()==kIOReturnSuccess);
     assert(c.requestAwdlCreation()==kIOReturnSuccess);
     c.hal.ic.ic_state=0; assert(c.requestAwdlCreation()==kIOReturnSuccess);
-    assert(c.creations==2); // Success can be requested again without a duplicate allocation.
+    assert(c.creations==6); // Success can be requested again without a duplicate allocation.
     assert(c.retains==c.releases && !c.gate.inside);
     OSObject other;
     assert(AirportMtkWlan::createAwdlGated(&other,nullptr,nullptr,nullptr,nullptr)==kIOReturnNotReady);
-    puts("PASS manual AWDL: gated dispatch, disabled/busy/offline rejection, failure propagation, retry/idempotency, balanced lifetime.");
+    puts("PASS manual AWDL: gated dispatch in every association state, disabled/busy/not-ready rejection, failure propagation, retry/idempotency, balanced lifetime.");
 }
 '''
 with tempfile.TemporaryDirectory(prefix="mtk-awdl-command-") as temp:

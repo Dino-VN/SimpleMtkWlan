@@ -1446,11 +1446,6 @@ IOReturn AirportMtkWlan::createAwdlGated(OSObject *target,void*,void*,void*,void
     // Do not replace a successfully registered interface's diagnostic stage
     // with a creation failure solely because en0 disconnected afterwards.
     if(self->awdlInterface) return kIOReturnSuccess;
-    auto ic=self->fHalService ? self->fHalService->get80211Controller() : NULL;
-    if(!ic || ic->ic_state!=IEEE80211_S_RUN) {
-        self->recordAwdlCreation("infrastructure-not-connected",kIOReturnNotReady);
-        return kIOReturnNotReady;
-    }
     return self->createAwdlInterface() ? kIOReturnSuccess : self->awdlCreateStatus;
 }
 IO80211VirtualInterface *AirportMtkWlan::createVirtualInterface(ether_addr *address,unsigned int role)
@@ -1508,11 +1503,13 @@ bool AirportMtkWlan::createAwdlInterface(ether_addr *address)
     if(!hal || !fNetIf || !bsdInterface) {
         recordAwdlCreation("infrastructure-not-ready",kIOReturnNotReady); return false;
     }
-    // wifip2pd can request AWDL during early boot, before HAL channel setup.
-    // Return a retryable status before allocating any native interface.
+    // wifip2pd automatically requests role 6 after Wi-Fi becomes available.
+    // AWDL is independent of association: INIT/SCAN/AUTH/ASSOC are valid
+    // once firmware is running. Reject early boot/power/reset before any
+    // native allocation, and keep creation on the native caller's thread.
     auto ic=hal->get80211Controller();
-    if(!ic || ic->ic_state!=IEEE80211_S_RUN) {
-        recordAwdlCreation("infrastructure-not-connected",kIOReturnNotReady); return false;
+    if(!ic || !hal->awdlInterfaceReady()) {
+        recordAwdlCreation("firmware-not-ready",kIOReturnNotReady); return false;
     }
     if(!hal->awdlChannelAllowed(6) && !hal->awdlChannelAllowed(44) && !hal->awdlChannelAllowed(149)) {
         recordAwdlCreation("no-social-channel",kIOReturnNotReady); return false;

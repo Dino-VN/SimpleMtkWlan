@@ -68,6 +68,9 @@ public:
     bool awdlCanTransmit(uint8_t channel);
     bool awdlGrantSnapshot(mtkawdl::Reservation &grant);
     bool awdlIsEnabled();
+    // Native interface registration requires running firmware, not an AP
+    // association or a configured/enabled secondary AWDL BSS.
+    bool awdlInterfaceReady();
     void awdlPublishDiagnostics();
     void awdlAbort();
     IOReturn awdlTransmit(mbuf_t frame, uint8_t channel);

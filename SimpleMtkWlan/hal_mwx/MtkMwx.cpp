@@ -8671,6 +8671,17 @@ void MtkMwx::awdlSetReceiver(void *context, AwdlReceive receiver)
     com->sc_awdl_receive=receiver;
 }
 
+bool MtkMwx::awdlInterfaceReady()
+{
+    if (!com || !com->sc_awdl_lock) return false;
+    IOLockLock(com->sc_awdl_lock);
+    bool ready=!com->sc_detaching && !com->sc_resetting &&
+        !com->sc_awdl_stopping && !com->sc_ic.ic_wcl_mac_reconfig &&
+        (com->sc_ic.ic_if.if_flags & IFF_RUNNING);
+    IOLockUnlock(com->sc_awdl_lock);
+    return ready;
+}
+
 bool MtkMwx::awdlChannelAllowed(uint8_t channel)
 {
     if (!com || !channel || channel>165) return false;

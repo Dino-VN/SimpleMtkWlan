@@ -38,6 +38,8 @@ functions='\n'.join(fn(source,s) for s in [
  'ether_addr AirportMtkAwdlInterface::getSelfMacAddr('])
 functions+='\n'+fn(controller,'bool AirportMtkWlan::createAwdlInterface(ether_addr *address)')
 functions+='\n'+fn(controller,'void AirportMtkWlan::stopAwdlInterface()')
+functions+='\n'+fn(controller,'IOReturn AirportMtkWlan::createAwdlInterfaceRequest(')
+functions+='\n'+fn(controller,'IO80211VirtualInterface *AirportMtkWlan::createVirtualInterface(')
 stubs=r'''
 #include <cassert>
 #include <cstdint>
@@ -50,6 +52,8 @@ stubs=r'''
 #include <map>
 #include <string>
 #define XYLog(...) ((void)0)
+#define IOLog(...) ((void)0)
+#define APPLE80211_VERSION 1
 using IOReturn=unsigned;
 using UInt=unsigned;
 using ifnet_t=void*;
@@ -88,10 +92,13 @@ struct IOService:OSObject {
 #define OSSafeReleaseNULL(x) do { if(x) {(x)->release();(x)=nullptr;} } while(0)
 #define OSDynamicCast(type, value) static_cast<type *>(value)
 struct ether_addr {uint8_t bytes[6];};
+struct apple80211_virt_if_create_data {unsigned version=1,role=6;uint8_t mac[6]={2,1,2,3,4,6};char bsd_name[16]{};};
+size_t strlcpy(char *to,const char *from,size_t n){size_t length=strlen(from);if(n){size_t copy=std::min(n-1,length);memcpy(to,from,copy);to[copy]=0;}return length;}
 namespace mtkawdl { struct DataPeers{void reset(){}}; bool unicast(const uint8_t *p) {return p[0] && !(p[0]&1);} }
 #define IEEE80211_S_RUN 4
 struct IC {uint8_t ic_myaddr[6]={2,1,2,3,4,5};int ic_state=IEEE80211_S_RUN;};
-struct MtkMwx:IOService {IC ic; bool channels=true; std::function<void()> wait;
+struct MtkMwx:IOService {IC ic; bool channels=true,ready=true; std::function<void()> wait;
+ bool awdlInterfaceReady(){return ready;}
  IC *get80211Controller(){return &ic;}bool awdlChannelAllowed(unsigned){return channels;}
  IOReturn awdlEnable(const uint8_t*,bool){if(wait)wait();return 0;}};
 struct IOSkywalkPacketQueue;
@@ -198,6 +205,7 @@ struct AirportMtkAwdlInterface:NativeProtocol {
  bool initWithController(AirportMtkWlan*c,ether_addr*,MtkMwx*h){owner=c;hal=h;return true;}
  bool attach(IOService*){return true;}void detach(IOService*){}void setInterfaceRole(unsigned){}void setInterfaceId(unsigned){}
  const char *getBSDNamePrefix(){return "awdl";}
+ const char *getBSDName(){return "awdl0";}
  std::map<std::string,uint64_t> properties;
  void setProperty(const char*,bool){}void setProperty(const char*,const char*){}void setProperty(const char*,const void*,unsigned){}void setProperty(const char*k,uint64_t v,unsigned){properties[k]=v;}
  bool initRegistrationInfo(IOSkywalkEthernetInterface::RegistrationInfo*,unsigned,unsigned){return !infoFail;}
@@ -214,6 +222,7 @@ struct AirportMtkAwdlInterface:NativeProtocol {
  unsigned output(mbuf_t m){lastFrame=*m;delete m;++queueCount;return 0;}
  static unsigned submitNative(OSObject*,IOSkywalkTxSubmissionQueue*,IOSkywalkPacket *const*,unsigned,void*);
 };
+using IO80211VirtualInterface=AirportMtkAwdlInterface;
 struct AirportMtkWlan:IOService {
  bool awdlExperimental=true,awdlCreating=false,awdlStopping=false,awdlStarted=false,awdlAttached=false,creatingAwdl=false;
  AirportMtkAwdlInterface *awdlInterface=nullptr;void *awdlBSD=nullptr;
@@ -222,7 +231,10 @@ struct AirportMtkWlan:IOService {
  WorkLoop *getWorkLoop(){return &loop;}
  void recordAwdlCreation(const char*s,IOReturn r){stage=s;awdlCreateStatus=r;}
  void setProperty(const char*,uint64_t,unsigned){}void setProperty(const char*,bool){}void removeProperty(const char*){}
+ void setProperty(const char*,const char*){}
  bool createAwdlInterface(ether_addr *address=nullptr);void stopAwdlInterface();
+ IOReturn createAwdlInterfaceRequest(apple80211_virt_if_create_data*);
+ IO80211VirtualInterface *createVirtualInterface(ether_addr*,unsigned);
 };
 #define super NativeProtocol
 '''
@@ -330,12 +342,39 @@ int main(){
  c.hal.wait=nullptr;
  c.stopAwdlInterface();c.stopAwdlInterface();assert(live==0&&outstanding==0);
  reset();c.awdlExperimental=false;assert(!c.createAwdlInterface()&&factory==0);
- c.awdlExperimental=true;c.hal.ic.ic_state=0;assert(!c.createAwdlInterface()&&!c.awdlInterface&&factory==0);
- assert(!strcmp(c.stage,"infrastructure-not-connected"));
+ c.awdlExperimental=true;c.hal.ready=false;c.hal.ic.ic_state=0;
+ assert(!c.createAwdlInterface()&&!c.awdlInterface&&factory==0);
+ assert(!strcmp(c.stage,"firmware-not-ready"));c.hal.ready=true;
  c.hal.ic.ic_state=IEEE80211_S_RUN;c.hal.channels=false;
  assert(!c.createAwdlInterface()&&!c.awdlInterface&&factory==0&&!strcmp(c.stage,"no-social-channel"));
  c.hal.channels=true;
  c.awdlExperimental=true;c.fNetIf=nullptr;assert(!c.createAwdlInterface()&&factory==0);
+ // Automatic native role-6 requests must work before any AP association.
+ for(int state=0;state<=IEEE80211_S_RUN;++state){
+  reset();AirportMtkWlan automatic;automatic.hal.ic.ic_state=state;
+  apple80211_virt_if_create_data request;request.role=5;
+  assert(automatic.createAwdlInterfaceRequest(&request)==kIOReturnUnsupported&&factory==0);
+  request.role=6;request.version=2;
+  assert(automatic.createAwdlInterfaceRequest(&request)==kIOReturnBadArgument&&factory==0);
+  request.version=1;request.mac[0]=1;
+  assert(automatic.createAwdlInterfaceRequest(&request)==kIOReturnBadArgument&&factory==0);
+  request.mac[0]=2;automatic.hal.ready=false;
+  assert(automatic.createAwdlInterfaceRequest(&request)==kIOReturnNotReady&&factory==0);
+  automatic.hal.ready=true;
+  assert(automatic.createAwdlInterfaceRequest(&request)==0);
+  auto iface=automatic.awdlInterface;
+  assert(iface&&publications==1&&!strcmp(request.bsd_name,"awdl0"));
+  assert(automatic.hal.ic.ic_state==state); // No reset/association as a side effect.
+  automatic.hal.ic.ic_state=0;automatic.hal.ready=false;
+  assert(automatic.createAwdlInterfaceRequest(&request)==EEXIST);
+  assert(automatic.createAwdlInterface()&&automatic.awdlInterface==iface&&publications==1);
+  assert(!automatic.createVirtualInterface(nullptr,5));
+  assert(automatic.createVirtualInterface(nullptr,6)==iface&&publications==1);
+  automatic.stopAwdlInterface();assert(live==0);
+ }
+ reset();AirportMtkWlan legacy;legacy.hal.ic.ic_state=1;
+ assert(legacy.createVirtualInterface(nullptr,6)==legacy.awdlInterface&&publications==1);
+ legacy.stopAwdlInterface();assert(live==0);
  puts("PASS native backend: allocation/add/start/MAC/registration failures; Wi-Fi subfamily/media; nonrecursive MAC agent callback and startup identity; deferred BSD publication; BSD enable/disable/re-enable queue activation and failure guards; TX data offset, deferred completion, full buffer, drop/disable/fallback; RX ownership transfer and error cleanup.");
 }
 '''

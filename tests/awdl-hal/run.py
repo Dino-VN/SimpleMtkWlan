@@ -73,7 +73,7 @@ struct ieee80211_node {uint8_t ni_macaddr[6];ieee80211_channel*ni_chan;};
 struct mwx_node {ieee80211_node ni;uint16_t wcid,flags;};
 struct mwx_vif {mwx_node vif_mn;uint8_t idx,omac_idx,band_idx,wmm_idx,scan_seq_num;};
 struct mwx_softc {
- struct {struct {int if_flags;}ic_if;int ic_state,ic_flags;ieee80211_channel ic_channels[256];uint8_t ic_chan_active[32],ic_chan_avail[32];}sc_ic;
+ struct {struct {int if_flags;}ic_if;int ic_state,ic_flags;bool ic_wcl_mac_reconfig;ieee80211_channel ic_channels[256];uint8_t ic_chan_active[32],ic_chan_avail[32];}sc_ic;
  mwx_vif sc_awdl_vif; mwx_node sc_awdl_peers[3];bool sc_awdl_peer_used[3],sc_awdl_station_pending[4];
  mtkawdl::Reservation sc_awdl_roc;uint8_t sc_awdl_address[6];
  uint64_t sc_awdl_roc_submitted=0,sc_awdl_roc_send_failed=0,sc_awdl_roc_scan_blocked=0,sc_awdl_roc_busy_blocked=0;
@@ -143,15 +143,32 @@ int mwx_mcu_wait_resp_int(mwx_softc*sc,int,int,uint32_t*status){assert(!sc->sc_a
 int scan_cancel_status=0,scan_cancels=0,scan_tasks=0,systq=0;
 int mt7921_mcu_hw_scan_cancel(mwx_softc*){++scan_cancels;return scan_cancel_status;}
 void task_add(int,int*){++scan_tasks;}
-class MtkMwx {public:mwx_softc *com;MtkMwx *mwxController(){return this;}void setProperty(const char*,const char*){}void setProperty(const char*,uint64_t,unsigned){}bool awdlChannelAllowed(uint8_t);void awdlAbort();IOReturn awdlPrepareChannel(uint8_t);IOReturn awdlEnable(const uint8_t*,bool);IOReturn awdlReserve(uint8_t,uint32_t);bool awdlCanTransmit(uint8_t);IOReturn awdlPeer(const uint8_t*,bool);IOReturn awdlTransmit(mbuf_t,uint8_t);IOReturn awdlTryTransmit(mbuf_t*,uint8_t);};
+class MtkMwx {public:mwx_softc *com;MtkMwx *mwxController(){return this;}void setProperty(const char*,const char*){}void setProperty(const char*,uint64_t,unsigned){}bool awdlInterfaceReady();bool awdlChannelAllowed(uint8_t);void awdlAbort();IOReturn awdlPrepareChannel(uint8_t);IOReturn awdlEnable(const uint8_t*,bool);IOReturn awdlReserve(uint8_t,uint32_t);bool awdlCanTransmit(uint8_t);IOReturn awdlPeer(const uint8_t*,bool);IOReturn awdlTransmit(mbuf_t,uint8_t);IOReturn awdlTryTransmit(mbuf_t*,uint8_t);};
 '''+structs+r'''
 mbuf*mwx_fill_sta_req_hdr(mbuf*m,mwx_vif*v,uint8_t omac,uint16_t wcid,uint16_t count){auto*p=(sta_req_hdr*)m->bytes;p->bss_idx=v->idx;p->wlan_idx_lo=wcid;p->wlan_idx_hi=wcid>>8;p->tlv_num=count;p->is_tlv_append=1;p->muar_idx=omac;return m;}
-'''+helpers+'\n'+function('static void mwx_awdl_roc_event(')+'\n'+function('static void mwx_awdl_strip_deaggregate(')+'\n'+function('bool MtkMwx::awdlChannelAllowed(')+'\n'+function('static void mwx_awdl_abort(')+'\n'+function('void MtkMwx::awdlAbort(')+'\n'+function('static int mwx_awdl_remove_station(')+'\n'+function('static int mwx_awdl_remove_context(mwx_softc')+'\n'+function('IOReturn MtkMwx::awdlEnable(')+'\n'+function('IOReturn MtkMwx::awdlPrepareChannel(')+'\n'+function('IOReturn MtkMwx::awdlReserve(')+'\n'+function('bool MtkMwx::awdlCanTransmit(')+'\n'+function('IOReturn MtkMwx::awdlPeer(')+'\n'+function('IOReturn MtkMwx::awdlTransmit(')+'\n'+function('IOReturn MtkMwx::awdlTryTransmit(')+r'''
+'''+helpers+'\n'+function('static void mwx_awdl_roc_event(')+'\n'+function('static void mwx_awdl_strip_deaggregate(')+'\n'+function('bool MtkMwx::awdlInterfaceReady(')+'\n'+function('bool MtkMwx::awdlChannelAllowed(')+'\n'+function('static void mwx_awdl_abort(')+'\n'+function('void MtkMwx::awdlAbort(')+'\n'+function('static int mwx_awdl_remove_station(')+'\n'+function('static int mwx_awdl_remove_context(mwx_softc')+'\n'+function('IOReturn MtkMwx::awdlEnable(')+'\n'+function('IOReturn MtkMwx::awdlPrepareChannel(')+'\n'+function('IOReturn MtkMwx::awdlReserve(')+'\n'+function('bool MtkMwx::awdlCanTransmit(')+'\n'+function('IOReturn MtkMwx::awdlPeer(')+'\n'+function('IOReturn MtkMwx::awdlTransmit(')+'\n'+function('IOReturn MtkMwx::awdlTryTransmit(')+r'''
 IOLock lock;
 mwx_softc make(){mwx_softc sc{};sc.sc_awdl_lock=&lock;sc.sc_ic.ic_if.if_flags=1;sc.sc_capa={2,3};sc.sc_awdl_vif.idx=sc.sc_awdl_vif.omac_idx=1;sc.sc_awdl_vif.vif_mn.wcid=18;sc.sc_awdl_enabled=true;
  for(int ch:{6,44,149}){sc.sc_ic.ic_channels[ch].ic_freq=ch<=14?2407+ch*5:5000+ch*5;sc.sc_ic.ic_channels[ch].ic_flags=1;sc.sc_ic.ic_chan_active[ch/8]|=1U<<(ch%8);sc.sc_ic.ic_chan_avail[ch/8]|=1U<<(ch%8);}return sc;}
 void reset(){wire.clear();commands.clear();calls=fail_at=fw_status=0;model=false;memset(owned,0,sizeof(owned));reply_status=0;alloc_fail=false;on_wait=nullptr;on_sleep=nullptr;lock.locked=false;clock_us=100000;scan_cancel_status=scan_cancels=scan_tasks=0;}
 int main(){
+ // Registration readiness is independent of AP state and secondary BSS
+ // activation/command ownership, but rejects early boot/power/reset/detach.
+ reset();auto readiness=make();MtkMwx readyHal{&readiness};
+ for(int state=0;state<=4;++state){
+  readiness.sc_ic.ic_state=state;readiness.sc_awdl_enabled=false;
+  readiness.sc_awdl_busy=true;
+  assert(readyHal.awdlInterfaceReady()&&!lock.locked&&commands.empty());
+ }
+ for(bool *blocked:{&readiness.sc_detaching,&readiness.sc_resetting,
+                    &readiness.sc_awdl_stopping,&readiness.sc_ic.ic_wcl_mac_reconfig}){
+  *blocked=true;assert(!readyHal.awdlInterfaceReady()&&!lock.locked);*blocked=false;
+ }
+ readiness.sc_ic.ic_if.if_flags=0;assert(!readyHal.awdlInterfaceReady());
+ readiness.sc_ic.ic_if.if_flags=IFF_RUNNING;assert(readyHal.awdlInterfaceReady());
+ readiness.sc_awdl_lock=nullptr;assert(!readyHal.awdlInterfaceReady());
+ readyHal.com=nullptr;assert(!readyHal.awdlInterfaceReady());
+
  // Production HAL padding removal is RXD4- and AWDL-specific.
  mbuf rx{};uint8_t*hdr=rx.bytes;hdr[0]=0x88;hdr[24]=0x80;
  memcpy(hdr+10,"\x02\x01\x02\x03\x04\x06",6);memcpy(hdr+16,mtkawdl::bssid,6);
