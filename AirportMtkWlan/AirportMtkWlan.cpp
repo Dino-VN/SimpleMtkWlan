@@ -153,7 +153,7 @@ bool AirportMtkWlan::init(OSDictionary *properties)
     if(PE_parse_boot_argn("amtk_awdl",&awdlOption,sizeof(awdlOption)))
         awdlExperimental=awdlOption==1;
     setProperty("MTKAWDLEnabled",awdlExperimental);
-    setProperty("MTKAWDLDiagnosticVersion",static_cast<uint64_t>(11),32);
+    setProperty("MTKAWDLDiagnosticVersion",static_cast<uint64_t>(12),32);
     setProperty("MTKAWDLNativeDataPathAvailable",AirportMtkAwdlInterface::nativeDataPathAvailable());
     setProperty("MTKAWDLCreateStage","awaiting-request");
     setProperty("MTKAWDLCreateStatus",static_cast<uint64_t>(static_cast<uint32_t>(kIOReturnNotReady)),32);

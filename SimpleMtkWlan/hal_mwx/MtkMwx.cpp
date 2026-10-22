@@ -419,6 +419,11 @@ struct mwx_softc {
     uint64_t sc_awdl_roc_submitted, sc_awdl_roc_send_failed;
     uint64_t sc_awdl_roc_scan_blocked, sc_awdl_roc_busy_blocked;
     uint64_t sc_awdl_roc_timeouts;
+    bool sc_awdl_roc_abort_pending;
+    uint8_t sc_awdl_roc_abort_token;
+    uint64_t sc_awdl_roc_abort_submitted, sc_awdl_roc_abort_failed, sc_awdl_roc_abort_retry_at;
+    int sc_awdl_roc_abort_status;
+    uint64_t sc_awdl_roc_queue_delay_us, sc_awdl_roc_max_queue_delay_us;
     uint64_t sc_awdl_roc_reasons[static_cast<unsigned>(mtkawdl::RocResult::Count)];
     mtkawdl::RocGrant sc_awdl_roc_last_event;
     mtkawdl::RocResult sc_awdl_roc_last_result;
@@ -694,6 +699,7 @@ pkt_hex_dump(struct mbuf *m)
 int	mwx_init(struct ifnet *);
 void	mwx_stop(struct ifnet *);
 static void mwx_awdl_quiesce(struct mwx_softc *, bool drainCalls=true);
+static int mwx_awdl_abort(struct mwx_softc *);
 static bool mwx_awdl_current(struct mwx_softc *, uint32_t);
 static int mwx_awdl_remove_context(struct mwx_softc *, uint32_t);
 void	mwx_watchdog(struct ifnet *);
@@ -8608,7 +8614,11 @@ static void mwx_awdl_quiesce(mwx_softc *sc,bool drainCalls)
     sc->sc_awdl_stopping=true;
     sc->sc_awdl_enabled=false;
     bool reserved=sc->sc_awdl_roc.pending || sc->sc_awdl_roc.granted;
-    uint8_t token=sc->sc_awdl_roc.token;
+    if(reserved) {
+        sc->sc_awdl_roc_abort_pending=true;
+        sc->sc_awdl_roc_abort_token=sc->sc_awdl_roc.token;
+        sc->sc_awdl_token_used[sc->sc_awdl_roc.token]=mwx_awdl_now();
+    }
     sc->sc_awdl_roc.cancel();
     bool busy=sc->sc_awdl_busy || (drainCalls && sc->sc_awdl_calls);
     IOLockUnlock(sc->sc_awdl_lock);
@@ -8620,12 +8630,14 @@ static void mwx_awdl_quiesce(mwx_softc *sc,bool drainCalls)
         busy=sc->sc_awdl_busy || (drainCalls && sc->sc_awdl_calls);
         IOLockUnlock(sc->sc_awdl_lock);
     }
-    if (reserved && !sc->sc_resetting && !sc->sc_detaching &&
+    if (!sc->sc_resetting && !sc->sc_detaching &&
         (sc->sc_ic.ic_if.if_flags & IFF_RUNNING)) {
-        uint8_t request[16]={};
-        mtkawdl::put16(request+4,1); mtkawdl::put16(request+6,12);
-        request[8]=sc->sc_awdl_vif.idx; request[9]=token; request[10]=0xff;
-        mwx_mcu_send_msg(sc,0x00020027,request,sizeof(request),NULL);
+        mwx_awdl_abort(sc);
+    } else {
+        IOLockLock(sc->sc_awdl_lock);
+        sc->sc_awdl_roc_abort_pending=false;
+        sc->sc_awdl_roc_abort_retry_at=0;
+        IOLockUnlock(sc->sc_awdl_lock);
     }
     memset(sc->sc_awdl_peer_used,0,sizeof(sc->sc_awdl_peer_used));
     sc->sc_awdl_channel=0;
@@ -8692,22 +8704,44 @@ bool MtkMwx::awdlChannelAllowed(uint8_t channel)
         !(c->ic_flags & (IEEE80211_CHAN_PASSIVE | IEEE80211_CHAN_DFS));
 }
 
-static void mwx_awdl_abort(mwx_softc *sc)
+static int mwx_awdl_abort(mwx_softc *sc)
 {
     IOLockLock(sc->sc_awdl_lock);
     bool reserved=sc->sc_awdl_roc.pending || sc->sc_awdl_roc.granted;
     if(sc->sc_awdl_roc.pending && mwx_awdl_now()>=sc->sc_awdl_roc.deadline)
         ++sc->sc_awdl_roc_timeouts;
-    uint8_t token=sc->sc_awdl_roc.token;
+    if(reserved) {
+        sc->sc_awdl_roc_abort_pending=true;
+        sc->sc_awdl_roc_abort_token=sc->sc_awdl_roc.token;
+    }
+    bool abortPending=sc->sc_awdl_roc_abort_pending;
+    uint8_t token=sc->sc_awdl_roc_abort_token;
+    uint32_t epoch=sc->sc_awdl_epoch;
     sc->sc_awdl_roc.cancel();
     IOLockUnlock(sc->sc_awdl_lock);
-    if (reserved) {
-        uint8_t request[16]={};
-        mtkawdl::put16(request+4,1); mtkawdl::put16(request+6,12);
-        request[8]=sc->sc_awdl_vif.idx; request[9]=token;
-        request[10]=0xff;
-        mwx_mcu_send_msg(sc,0x00020027,request,sizeof(request),NULL);
+    if(!abortPending) return 0;
+    uint8_t request[16]={};
+    mtkawdl::put16(request+4,1); mtkawdl::put16(request+6,12);
+    request[8]=sc->sc_awdl_vif.idx; request[9]=token;
+    request[10]=0xff;
+    int rv=mwx_mcu_send_msg(sc,0x00020027,request,sizeof(request),NULL);
+    uint64_t now=mwx_awdl_now();
+    IOLockLock(sc->sc_awdl_lock);
+    if(rv) ++sc->sc_awdl_roc_abort_failed;
+    else ++sc->sc_awdl_roc_abort_submitted;
+    sc->sc_awdl_roc_abort_status=rv;
+    if(sc->sc_awdl_epoch==epoch && sc->sc_awdl_roc_abort_token==token) {
+        // A failed enqueue does not release firmware ownership. Keep the
+        // cancelled token for retry before allowing any replacement acquire.
+        sc->sc_awdl_roc_abort_pending=rv!=0;
+        sc->sc_awdl_roc_abort_retry_at=rv ? now+10000 : 0;
+        sc->sc_awdl_token_used[token]=now ? now : 1;
     }
+    uint64_t failures=sc->sc_awdl_roc_abort_failed;
+    IOLockUnlock(sc->sc_awdl_lock);
+    if(rv && (failures<=8 || !(failures&(failures-1))))
+        MWX_DEV_LOG(sc,"AWDL ROC abort token=%u result=%d failures=%llu\n",token,rv,failures);
+    return rv;
 }
 
 void MtkMwx::awdlAbort()
@@ -8758,7 +8792,14 @@ static int mwx_awdl_remove_context(mwx_softc *sc,uint32_t epoch)
     if(!sc->sc_awdl_configured) return 0;
     int rv=mt7921_mcu_uni_add_dev(sc,&sc->sc_awdl_vif,&sc->sc_awdl_vif.vif_mn,0);
     if(sc->sc_awdl_epoch!=epoch) return ECANCELED;
-    if(!rv) sc->sc_awdl_configured=false;
+    if(!rv) {
+        sc->sc_awdl_configured=false;
+        IOLockLock(sc->sc_awdl_lock);
+        // Removing the BSS/OMAC also ends an abort that could not be queued.
+        sc->sc_awdl_roc_abort_pending=false;
+        sc->sc_awdl_roc_abort_retry_at=0;
+        IOLockUnlock(sc->sc_awdl_lock);
+    }
     return rv;
 }
 
@@ -8901,7 +8942,7 @@ IOReturn MtkMwx::awdlPrepareChannel(uint8_t channel)
     if(!operation.valid()) return kIOReturnNotReady;
     if(com->sc_awdl_channel==channel) return kIOReturnSuccess;
     IOLockLock(com->sc_awdl_lock);
-    bool inUse=com->sc_awdl_roc.pending ||
+    bool inUse=com->sc_awdl_roc_abort_pending || com->sc_awdl_roc.pending ||
         (com->sc_awdl_roc.granted && mwx_awdl_now()<com->sc_awdl_roc.deadline);
     IOLockUnlock(com->sc_awdl_lock);
     if(inUse) return kIOReturnBusy;
@@ -8934,8 +8975,13 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
     if(!awdlChannelAllowed(channel) || !durationMs || durationMs>mtkawdl::maxRocMs) return kIOReturnBadArgument;
     MwxAwdlOperation operation(com);
     if(!operation.valid()) { ++com->sc_awdl_roc_busy_blocked; return kIOReturnNotReady; }
-    mwx_awdl_abort(com);
+    IOLockLock(com->sc_awdl_lock);
+    bool retryLater=com->sc_awdl_roc_abort_pending && mwx_awdl_now()<com->sc_awdl_roc_abort_retry_at;
+    IOLockUnlock(com->sc_awdl_lock);
+    if(retryLater) return kIOReturnNotReady;
+    int abortRv=mwx_awdl_abort(com);
     if(!operation.valid()) return kIOReturnAborted;
+    if(abortRv) return kIOReturnIOError;
     // Initialize the secondary BSS RLM once. MT7921's ROC acquire carries
     // the temporary channel/band/width itself (Linux mt7921_mcu_set_roc).
     // Reprogramming RLM synchronously at every temporary channel switch
@@ -8972,6 +9018,24 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
     com->sc_awdl_roc.request(token,channel,now);
     IOLockUnlock(com->sc_awdl_lock);
     int rv=mwx_mcu_send_msg(com,0x00020027,request,sizeof(request),NULL);
+    uint64_t queuedAt=mwx_awdl_now();
+    if(!rv) {
+        IOLockLock(com->sc_awdl_lock);
+        com->sc_awdl_roc_queue_delay_us=queuedAt-now;
+        if(com->sc_awdl_roc_queue_delay_us>com->sc_awdl_roc_max_queue_delay_us)
+            com->sc_awdl_roc_max_queue_delay_us=com->sc_awdl_roc_queue_delay_us;
+        if(com->sc_awdl_epoch==operation.epoch && com->sc_awdl_roc.token==token) {
+            // Ring admission may release the gate while waiting for space.
+            // Start the response budget after a successful enqueue, preserving
+            // any grant already delivered before the send helper returned.
+            if(com->sc_awdl_roc.pending) {
+                com->sc_awdl_roc.requestedAt=queuedAt;
+                com->sc_awdl_roc.deadline=queuedAt+mtkawdl::rocResponseTimeoutUs;
+            }
+            com->sc_awdl_token_used[token]=queuedAt ? queuedAt : 1;
+        }
+        IOLockUnlock(com->sc_awdl_lock);
+    }
     if(rv) ++com->sc_awdl_roc_send_failed;
     else ++com->sc_awdl_roc_submitted;
     if(rv || com->sc_awdl_roc_submitted<=4)
@@ -9032,13 +9096,25 @@ void MtkMwx::awdlPublishDiagnostics()
     unsigned lastResult=static_cast<unsigned>(com->sc_awdl_roc_last_result);
     uint64_t lastAt=com->sc_awdl_roc_last_event_us, response=com->sc_awdl_roc_last_response_us;
     uint64_t timeouts=com->sc_awdl_roc_timeouts;
+    bool abortPending=com->sc_awdl_roc_abort_pending;
+    uint8_t abortToken=com->sc_awdl_roc_abort_token;
+    int abortStatus=com->sc_awdl_roc_abort_status;
+    uint64_t abortSubmitted=com->sc_awdl_roc_abort_submitted, abortFailed=com->sc_awdl_roc_abort_failed,
+             abortRetryAt=com->sc_awdl_roc_abort_retry_at;
+    uint64_t queueDelay=com->sc_awdl_roc_queue_delay_us, maxQueueDelay=com->sc_awdl_roc_max_queue_delay_us;
     IOLockUnlock(com->sc_awdl_lock);
     // Publish outside the receive lock; called at most once per second.
+    uint64_t observed=mwx_awdl_now();
+    const char *state=abortPending ? "abort-pending" :
+        radio.pending ? (observed<radio.deadline ? "waiting-grant" : "response-expired") :
+        radio.granted ? (observed<radio.deadline ? "granted" : "grant-expired") : "idle";
+    mwxController()->setProperty("MTKAWDLROCState",state);
+    mwxController()->setProperty("MTKAWDLROCStateObservedAtUS",observed,64);
     mwxController()->setProperty("MTKAWDLROCEvents",events,64);
     mwxController()->setProperty("MTKAWDLROCGrants",grants,64);
     mwxController()->setProperty("MTKAWDLROCRejected",rejected,64);
     mwxController()->setProperty("MTKAWDLROCPending",pending);
-    mwxController()->setProperty("MTKAWDLROCGranted",radio.granted);
+    mwxController()->setProperty("MTKAWDLROCGranted",radio.granted && observed<radio.deadline);
     mwxController()->setProperty("MTKAWDLROCChannel",static_cast<uint64_t>(radio.channel),32);
     mwxController()->setProperty("MTKAWDLROCToken",static_cast<uint64_t>(radio.token),32);
     mwxController()->setProperty("MTKAWDLROCObservedAtUS",radio.grantObservedAt,64);
@@ -9064,6 +9140,14 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKAWDLROCLastDurationMS",static_cast<uint64_t>(last.durationMs),32);
     mwxController()->setProperty("MTKAWDLROCRequestedAtUS",radio.requestedAt,64);
     mwxController()->setProperty("MTKAWDLROCResponseTimeoutUS",static_cast<uint64_t>(mtkawdl::rocResponseTimeoutUs),32);
+    mwxController()->setProperty("MTKAWDLROCAbortPending",abortPending);
+    mwxController()->setProperty("MTKAWDLROCAbortToken",static_cast<uint64_t>(abortToken),32);
+    mwxController()->setProperty("MTKAWDLROCAbortStatus",static_cast<uint64_t>(abortStatus),32);
+    mwxController()->setProperty("MTKAWDLROCAbortSubmitted",abortSubmitted,64);
+    mwxController()->setProperty("MTKAWDLROCAbortFailed",abortFailed,64);
+    mwxController()->setProperty("MTKAWDLROCAbortRetryAtUS",abortRetryAt,64);
+    mwxController()->setProperty("MTKAWDLROCQueueDelayUS",queueDelay,64);
+    mwxController()->setProperty("MTKAWDLROCMaxQueueDelayUS",maxQueueDelay,64);
     mwxController()->setProperty("MTKAWDLBSSBaseChannel",static_cast<uint64_t>(com->sc_awdl_channel),32);
     mwxController()->setProperty("MTKAWDLROCSubmitted",com->sc_awdl_roc_submitted,64);
     mwxController()->setProperty("MTKAWDLROCSendFailed",com->sc_awdl_roc_send_failed,64);

@@ -16,6 +16,8 @@ code=r'''
 #include <cerrno>
 #include <vector>
 #include <functional>
+#include <map>
+#include <string>
 #include <AWDL/AwdlProtocol.hpp>
 #define __packed __attribute__((packed))
 #define htole16(x) (x)
@@ -80,6 +82,10 @@ struct mwx_softc {
  uint64_t sc_awdl_roc_events=0,sc_awdl_roc_grants=0,sc_awdl_roc_rejected=0,
  sc_awdl_roc_grant_delay_us=0,sc_awdl_roc_max_grant_delay_us=0;
  uint64_t sc_awdl_roc_timeouts=0;
+ bool sc_awdl_roc_abort_pending=false;uint8_t sc_awdl_roc_abort_token=0;
+ uint64_t sc_awdl_roc_abort_submitted=0,sc_awdl_roc_abort_failed=0,sc_awdl_roc_abort_retry_at=0;
+ int sc_awdl_roc_abort_status=0;
+ uint64_t sc_awdl_roc_queue_delay_us=0,sc_awdl_roc_max_queue_delay_us=0;
  uint64_t sc_awdl_roc_reasons[static_cast<unsigned>(mtkawdl::RocResult::Count)]{};
  mtkawdl::RocGrant sc_awdl_roc_last_event{};mtkawdl::RocResult sc_awdl_roc_last_result{};
  uint64_t sc_awdl_roc_last_event_us=0,sc_awdl_roc_last_response_us=0;
@@ -94,6 +100,7 @@ struct mwx_softc {
 };
 static bool mwx_awdl_current(mwx_softc*,uint32_t);
 static void mwx_awdl_quiesce(mwx_softc*,bool drainCalls=true);
+static int mwx_awdl_abort(mwx_softc*);
 struct mbuf { uint8_t bytes[256]{};size_t len=0,offset=0,packetLen=0; };
 size_t mbuf_len(mbuf*m){return m->len;}
 size_t mbuf_pkthdr_len(mbuf*m){return m->packetLen;}
@@ -143,10 +150,10 @@ int mwx_mcu_wait_resp_int(mwx_softc*sc,int,int,uint32_t*status){assert(!sc->sc_a
 int scan_cancel_status=0,scan_cancels=0,scan_tasks=0,systq=0;
 int mt7921_mcu_hw_scan_cancel(mwx_softc*){++scan_cancels;return scan_cancel_status;}
 void task_add(int,int*){++scan_tasks;}
-class MtkMwx {public:mwx_softc *com;MtkMwx *mwxController(){return this;}void setProperty(const char*,const char*){}void setProperty(const char*,uint64_t,unsigned){}bool awdlInterfaceReady();bool awdlChannelAllowed(uint8_t);void awdlAbort();IOReturn awdlPrepareChannel(uint8_t);IOReturn awdlEnable(const uint8_t*,bool);IOReturn awdlReserve(uint8_t,uint32_t);bool awdlCanTransmit(uint8_t);IOReturn awdlPeer(const uint8_t*,bool);IOReturn awdlTransmit(mbuf_t,uint8_t);IOReturn awdlTryTransmit(mbuf_t*,uint8_t);};
+class MtkMwx {public:mwx_softc *com;std::map<std::string,uint64_t> numbers{};std::map<std::string,std::string> strings{};MtkMwx *mwxController(){return this;}void setProperty(const char*k,const char*v){strings[k]=v;}void setProperty(const char*k,uint64_t v,unsigned){numbers[k]=v;}void setProperty(const char*k,bool v){numbers[k]=v;}void awdlPublishDiagnostics();bool awdlInterfaceReady();bool awdlChannelAllowed(uint8_t);void awdlAbort();IOReturn awdlPrepareChannel(uint8_t);IOReturn awdlEnable(const uint8_t*,bool);IOReturn awdlReserve(uint8_t,uint32_t);bool awdlCanTransmit(uint8_t);IOReturn awdlPeer(const uint8_t*,bool);IOReturn awdlTransmit(mbuf_t,uint8_t);IOReturn awdlTryTransmit(mbuf_t*,uint8_t);};
 '''+structs+r'''
 mbuf*mwx_fill_sta_req_hdr(mbuf*m,mwx_vif*v,uint8_t omac,uint16_t wcid,uint16_t count){auto*p=(sta_req_hdr*)m->bytes;p->bss_idx=v->idx;p->wlan_idx_lo=wcid;p->wlan_idx_hi=wcid>>8;p->tlv_num=count;p->is_tlv_append=1;p->muar_idx=omac;return m;}
-'''+helpers+'\n'+function('static void mwx_awdl_roc_event(')+'\n'+function('static void mwx_awdl_strip_deaggregate(')+'\n'+function('bool MtkMwx::awdlInterfaceReady(')+'\n'+function('bool MtkMwx::awdlChannelAllowed(')+'\n'+function('static void mwx_awdl_abort(')+'\n'+function('void MtkMwx::awdlAbort(')+'\n'+function('static int mwx_awdl_remove_station(')+'\n'+function('static int mwx_awdl_remove_context(mwx_softc')+'\n'+function('IOReturn MtkMwx::awdlEnable(')+'\n'+function('IOReturn MtkMwx::awdlPrepareChannel(')+'\n'+function('IOReturn MtkMwx::awdlReserve(')+'\n'+function('bool MtkMwx::awdlCanTransmit(')+'\n'+function('IOReturn MtkMwx::awdlPeer(')+'\n'+function('IOReturn MtkMwx::awdlTransmit(')+'\n'+function('IOReturn MtkMwx::awdlTryTransmit(')+r'''
+'''+helpers+'\n'+function('static void mwx_awdl_roc_event(')+'\n'+function('static void mwx_awdl_strip_deaggregate(')+'\n'+function('bool MtkMwx::awdlInterfaceReady(')+'\n'+function('bool MtkMwx::awdlChannelAllowed(')+'\n'+function('static int mwx_awdl_abort(mwx_softc *sc)')+'\n'+function('void MtkMwx::awdlAbort(')+'\n'+function('static int mwx_awdl_remove_station(')+'\n'+function('static int mwx_awdl_remove_context(mwx_softc')+'\n'+function('IOReturn MtkMwx::awdlEnable(')+'\n'+function('IOReturn MtkMwx::awdlPrepareChannel(')+'\n'+function('IOReturn MtkMwx::awdlReserve(')+'\n'+function('bool MtkMwx::awdlCanTransmit(')+'\n'+function('void MtkMwx::awdlPublishDiagnostics(')+'\n'+function('IOReturn MtkMwx::awdlPeer(')+'\n'+function('IOReturn MtkMwx::awdlTransmit(')+'\n'+function('IOReturn MtkMwx::awdlTryTransmit(')+r'''
 IOLock lock;
 mwx_softc make(){mwx_softc sc{};sc.sc_awdl_lock=&lock;sc.sc_ic.ic_if.if_flags=1;sc.sc_capa={2,3};sc.sc_awdl_vif.idx=sc.sc_awdl_vif.omac_idx=1;sc.sc_awdl_vif.vif_mn.wcid=18;sc.sc_awdl_enabled=true;
  for(int ch:{6,44,149}){sc.sc_ic.ic_channels[ch].ic_freq=ch<=14?2407+ch*5:5000+ch*5;sc.sc_ic.ic_channels[ch].ic_flags=1;sc.sc_ic.ic_chan_active[ch/8]|=1U<<(ch%8);sc.sc_ic.ic_chan_avail[ch/8]|=1U<<(ch%8);}return sc;}
@@ -237,6 +244,20 @@ int main(){
  reset();sc=make();
  assert(!hal.awdlChannelAllowed(0)&&!hal.awdlChannelAllowed(166)&&hal.awdlChannelAllowed(6));
  sc.sc_ic.ic_chan_active[0]=0;assert(!hal.awdlChannelAllowed(6));sc=make();sc.sc_ic.ic_chan_avail[0]=0;assert(!hal.awdlChannelAllowed(6));sc=make();sc.sc_ic.ic_channels[6].ic_flags|=IEEE80211_CHAN_PASSIVE;assert(!hal.awdlChannelAllowed(6));sc=make();
+ // Published RF availability expires at the actual deadline, independently
+ // of the stored grant flag. Recovery and queue-delay diagnostics remain clear.
+ reset();sc=make();sc.sc_awdl_roc.request(7,6,clock_us);hal.awdlPublishDiagnostics();
+ assert(hal.strings["MTKAWDLROCState"]=="waiting-grant"&&!hal.numbers["MTKAWDLROCGranted"]);
+ assert(hal.numbers["MTKAWDLROCStateObservedAtUS"]==clock_us);
+ assert(sc.sc_awdl_roc.grant(7,6,70,clock_us));hal.awdlPublishDiagnostics();
+ assert(hal.strings["MTKAWDLROCState"]=="granted"&&hal.numbers["MTKAWDLROCGranted"]);
+ clock_us=sc.sc_awdl_roc.deadline;hal.awdlPublishDiagnostics();
+ assert(sc.sc_awdl_roc.granted&&hal.strings["MTKAWDLROCState"]=="grant-expired"&&!hal.numbers["MTKAWDLROCGranted"]);
+ sc.sc_awdl_roc_abort_pending=true;sc.sc_awdl_roc_abort_token=7;sc.sc_awdl_roc_abort_status=EIO;
+ sc.sc_awdl_roc_queue_delay_us=1200000;hal.awdlPublishDiagnostics();
+ assert(hal.strings["MTKAWDLROCState"]=="abort-pending"&&hal.numbers["MTKAWDLROCAbortPending"]);
+ assert(hal.numbers["MTKAWDLROCAbortToken"]==7&&hal.numbers["MTKAWDLROCAbortStatus"]==EIO);
+ assert(hal.numbers["MTKAWDLROCQueueDelayUS"]==1200000);
  // RLM must configure the secondary BSS before the exact ROC acquire packet.
  for(int ch:{6,44,149}){
   reset();sc=make();assert(hal.awdlReserve(ch,300)==0);
@@ -282,6 +303,62 @@ int main(){
  // distinct from physical dwell; aborting an already cleared token is idle.
  clock_us=sc.sc_awdl_roc.deadline;hal.awdlAbort();assert(sc.sc_awdl_roc_timeouts==1&&!sc.sc_awdl_roc.pending);
  hal.awdlAbort();assert(sc.sc_awdl_roc_timeouts==1);
+ // A full MCU ring can block submission for longer than the response budget.
+ // The firmware response clock starts after enqueue, not before that wait.
+ reset();sc=make();sc.sc_awdl_channel=6;
+ on_wait=[](mwx_softc*){if(wire.back().size()==28)clock_us+=1200000;};
+ assert(hal.awdlReserve(44,70)==0);
+ assert(sc.sc_awdl_roc.requestedAt==clock_us&&sc.sc_awdl_roc.deadline==clock_us+mtkawdl::rocResponseTimeoutUs);
+ assert(sc.sc_awdl_roc_queue_delay_us==1200000&&sc.sc_awdl_roc_max_queue_delay_us==1200000);
+ assert(sc.sc_awdl_token_used[sc.sc_awdl_roc.token]==clock_us);
+ on_wait=nullptr;clock_us+=3000;
+ assert(sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,44,70,clock_us));
+ assert(sc.sc_awdl_roc.responseDelayUS==3000);
+ // A grant delivered before the send helper returns must not be overwritten
+ // by publishing the final submission timestamp.
+ reset();sc=make();sc.sc_awdl_channel=6;
+ on_wait=[](mwx_softc*s){clock_us+=3000;assert(s->sc_awdl_roc.grant(s->sc_awdl_roc.token,44,70,clock_us));};
+ assert(hal.awdlReserve(44,70)==0&&sc.sc_awdl_roc.granted&&!sc.sc_awdl_roc.pending);
+ assert(sc.sc_awdl_roc.deadline==clock_us+70000&&sc.sc_awdl_roc.responseDelayUS==3000);
+ // An abort transport failure must retain its token and prevent a new acquire
+ // from overtaking it. Retry the same abort before issuing the replacement.
+ reset();sc=make();sc.sc_awdl_channel=6;assert(hal.awdlReserve(6,70)==0);
+ uint8_t abortToken=sc.sc_awdl_roc.token;
+ assert(sc.sc_awdl_roc.grant(abortToken,6,70,clock_us));
+ fail_at=calls+1;
+ assert(hal.awdlReserve(44,70)==kIOReturnIOError);
+ assert(wire.size()==2&&wire.back().size()==16&&wire.back()[9]==abortToken);
+ assert(sc.sc_awdl_roc_abort_pending&&sc.sc_awdl_roc_abort_failed==1&&!sc.sc_awdl_roc.pending&&!sc.sc_awdl_roc.granted);
+ assert(sc.sc_awdl_roc_submitted==1&&!hal.awdlCanTransmit(6)&&!sc.sc_awdl_busy&&!lock.locked);
+ auto abortCalls=calls;
+ assert(hal.awdlPrepareChannel(44)==kIOReturnBusy&&calls==abortCalls);
+ assert(hal.awdlReserve(44,70)==kIOReturnNotReady&&calls==abortCalls);
+ fail_at=0;clock_us=sc.sc_awdl_roc_abort_retry_at;
+ assert(hal.awdlReserve(44,70)==0&&!sc.sc_awdl_roc_abort_pending);
+ assert(wire.size()==4&&wire[2].size()==16&&wire[2][9]==abortToken&&wire[3].size()==28);
+ assert(sc.sc_awdl_roc_abort_submitted==1&&sc.sc_awdl_roc_submitted==2);
+ assert(sc.sc_awdl_token_used[abortToken]==clock_us);
+ // Repeated failed abort attempts cannot count an already expired pending
+ // request twice; an eventual successful abort restores fresh ROC operation.
+ reset();sc=make();sc.sc_awdl_channel=6;assert(hal.awdlReserve(6,70)==0);
+ clock_us=sc.sc_awdl_roc.deadline;fail_at=calls+1;hal.awdlAbort();
+ assert(sc.sc_awdl_roc_abort_pending&&sc.sc_awdl_roc_timeouts==1);
+ fail_at=calls+1;hal.awdlAbort();
+ assert(sc.sc_awdl_roc_abort_failed==2&&sc.sc_awdl_roc_timeouts==1);
+ fail_at=0;hal.awdlAbort();
+ assert(!sc.sc_awdl_roc_abort_pending&&sc.sc_awdl_roc_abort_submitted==1);
+ hal.awdlAbort();assert(sc.sc_awdl_roc_abort_submitted==1);
+ // Successful context removal completes a failed abort; failed context
+ // removal must keep the recovery token for the next enable attempt.
+ for(bool removeFails:{false,true}) {
+  reset();sc=make();sc.sc_awdl_configured=true;sc.sc_awdl_roc_abort_pending=true;
+  sc.sc_awdl_roc_abort_token=7;
+  if(removeFails) on_wait=[](mwx_softc*){fail_at=calls;};
+  else fail_at=1;
+  assert(hal.awdlEnable(addr,false)==(removeFails?kIOReturnIOError:kIOReturnSuccess));
+  assert(sc.sc_awdl_roc_abort_pending==removeFails&&sc.sc_awdl_configured==removeFails);
+  assert(!sc.sc_awdl_enabled&&!sc.sc_awdl_busy&&!lock.locked);
+ }
  reset();sc=make();assert(hal.awdlReserve(6,mtkawdl::maxRocMs)==0);
  assert(mtkawdl::le32(wire.back().data()+20)==1100);
  assert(!sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,6,1101,clock_us));
