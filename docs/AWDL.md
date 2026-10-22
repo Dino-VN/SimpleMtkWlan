@@ -105,7 +105,7 @@ firmware response timeout.
 
 The replacement uses the self-contained unified ROC acquire TLV, a 25ms request
 lead during idle time, and a dwell covering consecutive same-channel EAWs plus
-the lead and a 4ms guard, capped at 1000ms. MT76 advertises up to 5000ms for the
+the lead and a 4ms guard, capped at 1100ms. MT76 advertises up to 5000ms for the
 same command; the smaller cap bounds infrastructure disruption. Actual firmware
 grants may be shorter and must still be validated. Native EAW end no longer
 unconditionally cancels a usable ROC. At a channel change or renewal, the prior
@@ -127,8 +127,26 @@ wrap, 3/8ms grant delays, alternating channels and bounded grant renewal, plus
 order, AW counters and actual start/end durations with 750/1250us timer jitter.
 Under the 8ms grant-delay case the old scheduler emitted 13 starts instead of
 the required 42; the replacement emits all 42 with 41 ends and one open window.
-Kernel timing, the firmware's
-granted interval and continuous windows on hardware remain unverified until the
+
+The deeper audit reproduced two further defects before correcting them: the
+initial 1000ms cap could not cover presence 64's 1048.576ms EAW (zero starts in
+four windows), and a clipped early grant triggered repeated ROC acquisition
+each timer tick. The shared 1100ms limit now covers every accepted presence.
+A matching clipped grant remains usable until its actual deadline, without
+announcing an invalid full AW; partial data TX is tested after the start
+tolerance, followed by acquisition at the next planned lead time.
+
+The timer simulation honors the production requested timeout rather than
+forcing 1ms polling. Across all seven presence modes, 3/8ms grant delays and
+0/250/750us dispatch jitter, 42 combinations emit all 840 expected starts.
+Each event's counter, channel, start lateness, ordering and duration is checked.
+End callbacks disabling synchronization or replacing the sequence cannot
+submit a stale reserve. The seven regression suites, Release build and native
+ABI checks pass. These tests extract production code into host mocks; they do
+not establish firmware grant behavior or native callback timing on the machine.
+
+Kernel timing, the firmware's granted interval and continuous windows on
+hardware remain unverified until the
 new UUID boots and `tools/awdl/check-windows.py` observes active synchronization.
 
 ## Remaining gaps

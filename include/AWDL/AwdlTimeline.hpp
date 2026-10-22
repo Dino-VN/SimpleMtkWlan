@@ -18,7 +18,7 @@ inline bool currentWindow(const State &s,uint64_t now,Window &out) {
          uint16_t(s.counter(now)-s.counter(now)%s.presence),s.channel(now),s.presence};
     return true;
 }
-constexpr uint32_t rocLeadUs=25000, maxRocMs=1000;
+constexpr uint32_t rocLeadUs=25000;
 // ROC carries its channel configuration. Plan ahead without waiting for a
 // BSS/RLM command at each edge, and keep one grant for adjacent equal channels.
 struct RadioPlan { Window window; uint64_t requestAt; uint32_t durationMs; };

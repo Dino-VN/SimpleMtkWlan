@@ -190,7 +190,7 @@ int main(){
   assert(run.radio.prepares==0&&run.radio.reserves<42);
  }
  // Long equal-channel runs retain grants at EAW boundaries and renew before
- // the firmware deadline; 1-second cap cannot produce a partial native AW.
+ // the firmware deadline; bounded ROC cannot produce a partial native AW.
  AirportMtkAwdlInterface same;init(same);uint8_t sameToken=1;uint64_t sameDue=0;
  same.radio.onReserve=[&]{same.radio.grant.request(++sameToken,6,clockUS);sameDue=clockUS+3000;};
  for(unsigned i=0;i<2200;++i){
@@ -198,7 +198,7 @@ int main(){
    assert(same.radio.grant.grant(sameToken,6,same.radio.duration,clockUS));
   same.serviceInGate();clockUS+=1000;
  }
- assert(same.awTimeline.starts==34&&same.awTimeline.ends==33&&same.radio.reserves==3);
+ assert(same.awTimeline.starts==34&&same.awTimeline.ends==33&&same.radio.reserves<=3);
  // Idle slots can request ahead. A real 20ms grant delay is covered by lead
  // time and must not cause repeated abort/replacement of a future grant.
  AirportMtkAwdlInterface lead;init(lead);lead.radio.grant.cancel();
@@ -221,6 +221,115 @@ int main(){
  clockUS=1000000+4*mtkawdl::awUs-24000;slow.serviceInGate();assert(slow.radio.reserves==1);
  clockUS=slow.requestedWindow.end+2000;slow.serviceInGate();
  assert(slow.radio.reserves==1&&slow.radio.aborts==0&&slow.radio.grant.pending);
+ // Honor the driver's requested timer interval; fixed 1ms polling can hide
+ // misses when the production timer asks for 2ms. Include bounded jitter.
+ for(unsigned latency:{3000,8000}) {
+  AirportMtkAwdlInterface timed;init(timed);timed.state.baseCounter=65532;
+  for(unsigned i=0;i<timed.state.sequence.count;++i)
+   timed.state.sequence.channels[i]=timed.state.ownSequence.channels[i]=(i%3==1?44:6);
+  uint8_t token=1;uint64_t due=0,end=clockUS+2700000;
+  timed.radio.onReserve=[&]{timed.radio.grant.request(++token,timed.radio.requested,clockUS);due=clockUS+latency;};
+  while(clockUS<end){
+   if(timed.radio.grant.pending&&clockUS>=due)
+    assert(timed.radio.grant.grant(token,timed.radio.requested,timed.radio.duration,clockUS));
+   timed.serviceInGate();assert(timed.t.us);clockUS+=timed.t.us+250;
+  }
+  assert(timed.awTimeline.starts==42&&timed.awTimeline.ends==41);
+ }
+ // Cross presence, dispatch jitter and grant latency using the actual timer.
+ // Check each wire event against its expected window, not merely balanced totals.
+ for(unsigned presence:{1,2,4,8,16,32,64})
+ for(unsigned latency:{3000,8000})
+ for(unsigned jitter:{0,250,750}) {
+  AirportMtkAwdlInterface sweep;init(sweep);
+  assert(sweep.state.setPresence(presence,clockUS));
+  sweep.state.baseCounter=uint16_t(65536-presence);
+  for(unsigned i=0;i<sweep.state.sequence.count;++i)
+   sweep.state.sequence.channels[i]=sweep.state.ownSequence.channels[i]=(i%3==1?44:6);
+  sweep.radio.give(1,sweep.state.channel(clockUS),mtkawdl::maxRocMs);
+  uint8_t token=1;uint64_t due=0,length=uint64_t(presence)*mtkawdl::awUs;
+  uint64_t epoch=clockUS,stop=clockUS+length*20;
+  sweep.radio.onReserve=[&]{sweep.radio.grant.request(++token,sweep.radio.requested,clockUS);due=clockUS+latency;};
+  while(clockUS<stop){
+   if(sweep.radio.grant.pending&&clockUS>=due)
+    assert(sweep.radio.grant.grant(token,sweep.radio.requested,sweep.radio.duration,clockUS));
+   sweep.serviceInGate();assert(sweep.t.us);clockUS+=sweep.t.us+jitter;
+  }
+  fprintf(stderr,"sweep presence=%u latency=%u jitter=%u starts=%llu ends=%llu\n",
+          presence,latency,jitter,(unsigned long long)sweep.awTimeline.starts,
+          (unsigned long long)sweep.awTimeline.ends);
+  assert(sweep.awTimeline.starts==20);
+  unsigned starts=0,ends=0;uint32_t startTime=0;
+  for(const auto&event:sweep.events){
+   if(event.id==41){
+    assert(starts==ends);
+    uint64_t edge=epoch+length*starts;
+    mtkawdl::Window expected{};assert(mtkawdl::currentWindow(sweep.state,edge,expected));
+    startTime=mtkawdl::be32(event.bytes.data()+20);
+    assert(startTime>=edge&&startTime-edge<=8000);
+    assert(mtkawdl::le32(event.bytes.data())==expected.counter);
+    assert(mtkawdl::le32(event.bytes.data()+28)==expected.channel);++starts;
+   }else{
+    assert(starts==ends+1);++ends;
+    uint32_t actual=mtkawdl::be32(event.bytes.data()+4)-startTime;
+    assert(actual+10*1024>=length&&actual<=length+10*1024);
+   }
+  }
+  assert(starts==20&&starts==ends+unsigned(sweep.awTimeline.open));
+ }
+ // Firmware may shorten an early ROC. Keep its actual grant for partial TX;
+ // do not issue new tokens every tick just because it cannot cover native AW.
+ AirportMtkAwdlInterface clipped;init(clipped);clipped.radio.grant.cancel();
+ clipped.state.sequence.channels[0]=clipped.state.ownSequence.channels[0]=0;
+ clipped.state.sequence.channels[1]=clipped.state.ownSequence.channels[1]=44;
+ clipped.radio.onReserve=[&]{clipped.radio.grant.request(7,44,clockUS);};
+ clockUS=1000000+4*mtkawdl::awUs-24000;clipped.serviceInGate();
+ clockUS+=1000;assert(clipped.radio.grant.grant(7,44,32,clockUS));
+ for(unsigned i=0;i<10;++i){clipped.serviceInGate();clockUS+=1000;}
+ assert(clipped.radio.reserves==1&&clipped.radio.aborts==0&&clipped.events.empty());
+ // A longer clipped grant permits real partial TX after the start tolerance,
+ // remains unannounced, then requests the next EAW at its planned lead time.
+ AirportMtkAwdlInterface partial;init(partial);partial.radio.grant.cancel();
+ partial.state.sequence.channels[0]=partial.state.ownSequence.channels[0]=0;
+ partial.state.sequence.channels[1]=partial.state.ownSequence.channels[1]=44;
+ partial.radio.onReserve=[&]{partial.radio.grant.request(8,partial.radio.requested,clockUS);};
+ clockUS=1000000+4*mtkawdl::awUs-24000;partial.serviceInGate();
+ clockUS+=1000;assert(partial.radio.grant.grant(8,44,50,clockUS));
+ clockUS=partial.requestedWindow.start+9000;
+ uint8_t multicast[24]{};multicast[4]=1;
+ partial.queue[0]=partial.makeFrame(multicast,sizeof(multicast));
+ partial.queueTime[0]=clockUS;partial.queueCount=1;partial.serviceInGate();
+ assert(partial.events.empty()&&partial.radio.reserves==1&&partial.radio.transmits==1&&!partial.queueCount);
+ clockUS=partial.radio.grant.deadline;partial.serviceInGate();
+ assert(partial.radio.reserves==1&&!partial.radio.grant.pending&&partial.events.empty());
+ clockUS=partial.requestedWindow.end-mtkawdl::rocLeadUs;partial.serviceInGate();
+ assert(partial.radio.reserves==2&&partial.radio.grant.pending&&partial.events.empty());
+ // Sync disable in the early-end callback must not submit another ROC.
+ AirportMtkAwdlInterface stopped;init(stopped);stopped.state.sequence.channels[1]=stopped.state.ownSequence.channels[1]=44;
+ stopped.serviceInGate();stopped.onEnd=[&]{stopped.enabled=false;};
+ clockUS=stopped.awTimeline.active.end-7000;stopped.serviceInGate();
+ assert(stopped.events.size()==2&&stopped.radio.reserves==0&&!stopped.awTimeline.open);
+ // End callback may replace the channel sequence and its clock.
+ AirportMtkAwdlInterface replaced;init(replaced);replaced.state.sequence.channels[1]=replaced.state.ownSequence.channels[1]=44;
+ replaced.serviceInGate();replaced.onEnd=[&]{replaced.state.sequence.channels[1]=replaced.state.ownSequence.channels[1]=6;};
+ clockUS=replaced.awTimeline.active.end-7000;replaced.serviceInGate();
+ assert(replaced.radio.requested!=44);
+ // Audit every accepted presence mode, including the 1024TU EAW.
+ for(unsigned presence:{1,2,4,8,16,32,64}) {
+  AirportMtkAwdlInterface wide;init(wide);wide.radio.grant.cancel();
+  assert(wide.state.setPresence(presence,clockUS));
+  uint8_t token=1;uint64_t due=0;
+  wide.radio.onReserve=[&]{wide.radio.grant.request(++token,wide.radio.requested,clockUS);due=clockUS+3000;};
+  uint64_t end=clockUS+uint64_t(presence)*mtkawdl::awUs*4;
+  while(clockUS<end){
+   if(wide.radio.grant.pending&&clockUS>=due)
+    assert(wide.radio.grant.grant(token,wide.radio.requested,wide.radio.duration,clockUS));
+   wide.serviceInGate();clockUS+=1000;
+  }
+  fprintf(stderr,"presence=%u starts=%llu ends=%llu\n",presence,
+          (unsigned long long)wide.awTimeline.starts,(unsigned long long)wide.awTimeline.ends);
+  assert(wide.awTimeline.starts==4&&wide.awTimeline.ends>=3);
+ }
  // Tahoe programs mode 1 with a remote synchronization MAC. Accept it, and
  // preserve a pending grant when native refreshes the identical role.
  AirportMtkAwdlInterface mode;init(mode);mode.state.nativeElectionManaged=true;

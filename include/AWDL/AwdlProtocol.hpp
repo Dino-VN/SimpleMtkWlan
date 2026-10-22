@@ -13,6 +13,9 @@ static const uint8_t snap[8] = {0xaa, 0xaa, 3, 0, 0x17, 0xf2, 8, 0};
 static const unsigned maxPeers = 16, slots = 16;
 static const uint64_t peerLifetimeUs = 3000000;
 static const uint32_t awUs = 16 * 1024;
+// Largest supported EAW is 64*16TU (1048.576ms). Leave room for ROC
+// request lead/guard while bounding continuous RF ownership below MT76's 5s.
+static const uint32_t maxRocMs = 1100;
 inline uint16_t le16(const uint8_t *p) { return p[0] | uint16_t(p[1]) << 8; }
 inline uint32_t le32(const uint8_t *p) { return le16(p) | uint32_t(le16(p+2)) << 16; }
 inline uint32_t be32(const uint8_t *p) { return uint32_t(p[0])<<24 | uint32_t(p[1])<<16 | uint32_t(p[2])<<8 | p[3]; }
@@ -578,7 +581,7 @@ struct Reservation {
         token=t; channel=c; pending=true; granted=false; grantObservedAt=0; deadline=now+100000;
     }
     bool grant(uint8_t t,uint8_t c,uint32_t durationMs,uint64_t now) {
-        if(!pending || t!=token || c!=channel || now>=deadline || !durationMs || durationMs>1000) return false;
+        if(!pending || t!=token || c!=channel || now>=deadline || !durationMs || durationMs>maxRocMs) return false;
         pending=false; granted=true; grantObservedAt=now; deadline=now+uint64_t(durationMs)*1000; return true;
     }
     bool canTransmit(uint8_t c,uint64_t now) const { return granted && channel==c && now<deadline && deadline-now>2000; }

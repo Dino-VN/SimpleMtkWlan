@@ -821,6 +821,14 @@ void AirportMtkAwdlInterface::serviceInGate()
                 // abort/reacquire it just because the current EAW is late/idle.
                 timer->setTimeoutMS(1); return;
             }
+            if(grant.granted && now<grant.deadline &&
+               (grant.channel==target.channel || grant.channel==channel)) {
+                // Firmware may return a short grant. Replacing it each tick
+                // wastes usable RF time and invalidates delayed grant tokens.
+                // Keep its real lifetime; partial TX is handled below once
+                // past the start tolerance, without announcing a full AW.
+                timer->setTimeoutMS(1); return;
+            }
             if(plan.requestAt>now) {
                 uint64_t delay=plan.requestAt-now;
                 timer->setTimeoutUS(static_cast<uint32_t>(delay>2000 ? 2000 : delay)); return;

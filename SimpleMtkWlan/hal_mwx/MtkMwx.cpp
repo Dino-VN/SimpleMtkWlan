@@ -8899,7 +8899,7 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
         ++com->sc_awdl_roc_scan_blocked;
         return kIOReturnNotReady;
     }
-    if(!awdlChannelAllowed(channel) || !durationMs || durationMs>1000) return kIOReturnBadArgument;
+    if(!awdlChannelAllowed(channel) || !durationMs || durationMs>mtkawdl::maxRocMs) return kIOReturnBadArgument;
     MwxAwdlOperation operation(com);
     if(!operation.valid()) { ++com->sc_awdl_roc_busy_blocked; return kIOReturnNotReady; }
     mwx_awdl_abort(com);

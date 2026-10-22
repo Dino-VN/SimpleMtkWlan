@@ -164,9 +164,12 @@ int main(){
   assert(sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,ch,300,clock_us));
   assert(hal.awdlCanTransmit(ch));clock_us+=300001;assert(!hal.awdlCanTransmit(ch));
  }
- reset();sc=make();assert(hal.awdlReserve(6,1000)==0);
+ reset();sc=make();assert(hal.awdlReserve(6,mtkawdl::maxRocMs)==0);
+ assert(mtkawdl::le32(wire.back().data()+20)==1100);
+ assert(!sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,6,1101,clock_us));
+ assert(sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,6,1100,clock_us));
 
- reset();sc=make();assert(hal.awdlReserve(6,0)==kIOReturnBadArgument&&commands.empty());assert(hal.awdlReserve(6,1001)==kIOReturnBadArgument);sc.sc_ic.ic_state=IEEE80211_S_SCAN;assert(hal.awdlReserve(6,30)==kIOReturnNotReady&&sc.sc_awdl_roc_scan_blocked==1&&sc.sc_awdl_roc_submitted==0);
+ reset();sc=make();assert(hal.awdlReserve(6,0)==kIOReturnBadArgument&&commands.empty());assert(hal.awdlReserve(6,mtkawdl::maxRocMs+1)==kIOReturnBadArgument);sc.sc_ic.ic_state=IEEE80211_S_SCAN;assert(hal.awdlReserve(6,30)==kIOReturnNotReady&&sc.sc_awdl_roc_scan_blocked==1&&sc.sc_awdl_roc_submitted==0);
  assert(scan_cancels==1&&scan_tasks==1);
  sc.sc_ic.ic_state=0;sc.sc_flags=MWX_FLAG_SCANNING|MWX_FLAG_BGSCAN;
  scan_cancel_status=5;assert(hal.awdlReserve(6,70)==kIOReturnNotReady&&sc.sc_flags);
