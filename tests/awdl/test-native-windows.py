@@ -6,6 +6,7 @@ import tempfile
 
 root = Path(__file__).resolve().parents[2]
 source = (root / 'AirportMtkWlan/AirportMtkAwdlInterface.cpp').read_text()
+ioctl = (root / 'include/Airport/apple80211_ioctl.h').read_text()
 def function(signature):
     start = source.index(signature)
     return source[start:source.index('\n}\n', start) + 3]
@@ -25,6 +26,7 @@ constexpr unsigned APPLE80211_VERSION=1,kIOReturnSuccess=0,kIOReturnNotReady=1,k
 uint64_t clockUS=1000000;uint64_t awdlNow(){return clockUS;}
 void bzero(void*p,size_t n){memset(p,0,n);}
 struct apple80211_channel{uint32_t version,channel,flags;};
+#define __IO80211_TARGET __MAC_26_0
 struct apple80211_awdl_sync_state{uint32_t version,state;uint8_t master[6],reserved[2];
  uint32_t flags;uint8_t mode_flags,reserved2[3];};
 struct awdl_peer_advert_add{uint8_t bytes[44];};
@@ -65,7 +67,11 @@ struct AirportMtkAwdlInterface{
  uint64_t serviceTicks=0,reserveAttempts=0,grantObservations=0,awStartNotifications=0,
  nextAction=0,actionSubmitted=0,actionFailed=0,miStart=0,miSubmitted=0,miFailed=0;
  uint64_t reserveWaitUS=0,reserveMaxWaitUS=0,reserveInvalidations=0;uint32_t reserveInvalidReason=0;
- struct{unsigned mode=3;}afMode;struct{unsigned synchronization_frame_period=440;}syncParams;
+ uint32_t reserveLeadUS=mtkawdl::rocLeadUs;uint64_t grantLatencyObservedAt=0;
+ struct{unsigned mode=3;}afMode;apple80211_awdl_sync_params syncParams{1,16,16,16,440,0};
+ apple80211_awdl_sync_channel_sequence channelSequence{};
+ apple80211_awdl_presence_mode presence{};
+ apple80211_awdl_election_params electionId{};unsigned secondaryMasterChannel=0;
  uint8_t syncTemplate[2048]{},miTemplate[2048]{};size_t templateLength=0,miTemplateLength=0;
  uint16_t miCounter=0;bool miCounterValid=false;
  mbuf_t queue[64]{};uint64_t queueTime[64]{};unsigned queueCount=0,queueHead=0;
@@ -83,12 +89,31 @@ struct AirportMtkAwdlInterface{
  IOReturn setSync(bool value){enabled=value;return 0;}
  IOReturn setAWDL_SYNC_STATE(apple80211_awdl_sync_state*);
  IOReturn setAWDL_AWDL_ADVERTISERS(awdl_peer_advert_add*);
+ IOReturn setAWDL_SYNC_PARAMS(apple80211_awdl_sync_params*);
+ IOReturn setAWDL_PRESENCE_MODE(apple80211_awdl_presence_mode*);
+ IOReturn setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE(apple80211_awdl_sync_channel_sequence*);
+ IOReturn setAWDL_SECONDARY_MASTER_CHANNEL(apple80211_awdl_secondary_master_channel*);
+ IOReturn setAWDL_MASTER_CHANNEL(apple80211_awdl_master_channel*);
+ IOReturn setAWDL_ELECTION_PARAMS(apple80211_awdl_election_params*);
 };
 '''
+structs=[]
+for name in ['apple80211_awdl_sync_params','apple80211_awdl_sync_channel_sequence',
+             'apple80211_awdl_presence_mode','apple80211_awdl_election_params',
+             'apple80211_awdl_secondary_master_channel','apple80211_awdl_master_channel']:
+    start=ioctl.index('struct '+name+' {')
+    structs.append(ioctl[start:ioctl.index('} __attribute__((packed));',start)+len('} __attribute__((packed));')])
+code=code.replace('struct awdl_peer_advert_add', '\n'.join(structs)+'\nstruct awdl_peer_advert_add')
 for sig in ['void AirportMtkAwdlInterface::notifyAvailabilityWindowStart(',
             'void AirportMtkAwdlInterface::notifyAvailabilityWindowEnd(',
             'void AirportMtkAwdlInterface::serviceInGate(',
             'IOReturn AirportMtkAwdlInterface::setAWDL_SYNC_STATE(',
+            'IOReturn AirportMtkAwdlInterface::setAWDL_SYNC_PARAMS(',
+            'IOReturn AirportMtkAwdlInterface::setAWDL_PRESENCE_MODE(',
+            'IOReturn AirportMtkAwdlInterface::setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE(',
+            'IOReturn AirportMtkAwdlInterface::setAWDL_MASTER_CHANNEL(',
+            'IOReturn AirportMtkAwdlInterface::setAWDL_SECONDARY_MASTER_CHANNEL(',
+            'IOReturn AirportMtkAwdlInterface::setAWDL_ELECTION_PARAMS(',
             'IOReturn AirportMtkAwdlInterface::setAWDL_AWDL_ADVERTISERS(']:
     code += function(sig)
 code += r'''
@@ -421,6 +446,148 @@ int main(){
  mode.radio.grant.request(7,6,clockUS);unsigned aborts=mode.radio.aborts;
  control.flags=65532;assert(mode.setAWDL_SYNC_STATE(&control)==0);
  assert(mode.radio.aborts==aborts&&mode.radio.grant.pending&&mode.syncState.flags==65532);
+ // Native opmode reprogramming at 0/10/20TU must take effect after the
+ // recorded AW-end, including a synchronous setter in the start callback.
+ for(unsigned offset:{0U,10U*1024,20U*1024}) {
+  AirportMtkAwdlInterface transition;init(transition);
+  transition.state.nativeElectionManaged=true;
+  apple80211_awdl_sync_state modeRequest{};modeRequest.version=1;modeRequest.state=3;
+  memcpy(modeRequest.master,local,6);
+  if(!offset) transition.onStart=[&]{assert(!transition.setAWDL_SYNC_STATE(&modeRequest));};
+  transition.serviceInGate();uint64_t end=transition.awTimeline.radioEnd;
+  if(offset) {clockUS+=offset;assert(!transition.setAWDL_SYNC_STATE(&modeRequest));}
+  assert(transition.awTimeline.open&&transition.events.size()==1&&transition.radio.aborts==0);
+  assert(transition.state.syncRole==1);
+  transition.onStart=nullptr;clockUS=end;transition.serviceInGate();
+  assert(transition.events.size()>=2&&transition.events[1].id==43&&transition.state.syncRole==3);
+  assert((mtkawdl::be32(transition.events[1].bytes.data()+4)-
+          mtkawdl::be32(transition.events[0].bytes.data()+20))/1024==64);
+ }
+ // Exercise sequence/presence/social-channel and election setters together.
+ // Last requests win while the event and PSF keep the old schedule.
+ AirportMtkAwdlInterface controls;init(controls);controls.state.nativeElectionManaged=true;
+ controls.serviceInGate();uint64_t controlsEnd=controls.awTimeline.radioEnd;
+ clockUS+=10000;apple80211_awdl_sync_channel_sequence sequence{};
+ sequence.version=1;sequence.length=16;sequence.step_count=3;
+ for(unsigned i=0;i<16;++i)sequence.seqs[i].channel=44;
+ assert(!controls.setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE(&sequence));
+ apple80211_awdl_presence_mode presence{1,8};assert(!controls.setAWDL_PRESENCE_MODE(&presence));
+ apple80211_awdl_secondary_master_channel secondary{1,6};
+ assert(!controls.setAWDL_SECONDARY_MASTER_CHANNEL(&secondary));
+ apple80211_awdl_master_channel primary{1,6};assert(!controls.setAWDL_MASTER_CHANNEL(&primary));
+ apple80211_awdl_election_params election{};election.version=1;memcpy(election.master,local,6);
+ controls.syncParams.non_election_master=1;assert(!controls.setAWDL_ELECTION_PARAMS(&election));
+ assert(controls.state.sequence.channels[3]==6&&controls.state.presence==4&&controls.state.syncRole==1);
+ assert(controls.state.controlsDirty&&controls.awTimeline.open&&controls.radio.aborts==0);
+ uint8_t controlFrame[512];mtkawdl::Advertisement controlWire{};
+ size_t controlSize=mtkawdl::buildAction(controls.state,controlFrame,sizeof(controlFrame),clockUS);
+ assert(mtkawdl::parseAction(controlFrame,controlSize,controlWire)&&controlWire.presence==4&&controlWire.sequence.channels[3]==6);
+ uint16_t nextCounter=controls.state.counter(controlsEnd);
+ clockUS=controlsEnd;controls.serviceInGate();
+ assert(controls.state.sequence.channels[0]==6&&controls.state.sequence.channels[1]==6&&
+        controls.state.sequence.channels[3]==44&&controls.state.presence==8&&controls.state.syncRole==3);
+ assert(controls.state.counter(clockUS)==nextCounter&&!controls.state.controlsDirty);
+ assert(controls.events[1].id==43&&mtkawdl::be32(controls.events[1].bytes.data()+4)==controlsEnd);
+ // Changing the selected native advertiser in the start callback must not
+ // cut a zero-TU end. Consume its validated RX clock after the full old AW.
+ AirportMtkAwdlInterface newParent;init(newParent);newParent.state.nativeElectionManaged=true;
+ auto &newSample=newParent.nativePeerSamples[0];newSample.valid=true;newSample.received=clockUS;
+ memcpy(newSample.peer,peer,6);auto &newAd=newSample.advertisement;
+ memcpy(newAd.master,peer,6);memcpy(newAd.sync,peer,6);
+ newAd.counter=0;newAd.down=64;newAd.period=16;newAd.presence=4;newAd.sequence=newParent.state.sequence;
+ auto &newPeer=newParent.state.peers[0];newPeer.used=true;newPeer.seen=clockUS;memcpy(newPeer.mac,peer,6);
+ awdl_peer_advert_add newAdvert{};mtkawdl::put16(newAdvert.bytes+2,64);
+ mtkawdl::put16(newAdvert.bytes+10,16);mtkawdl::put16(newAdvert.bytes+12,16);newAdvert.bytes[16]=4;
+ mtkawdl::putBE32(newAdvert.bytes+20,uint32_t(clockUS));
+ memcpy(newAdvert.bytes+32,peer,6);memcpy(newAdvert.bytes+38,peer,6);
+ newParent.onStart=[&]{assert(!newParent.setAWDL_AWDL_ADVERTISERS(&newAdvert));};
+ newParent.serviceInGate();uint64_t parentEnd=newParent.awTimeline.radioEnd;
+ assert(newParent.events.size()==1&&newParent.radio.aborts==0&&!newParent.state.nativeParentSelected);
+ newParent.onStart=nullptr;clockUS=parentEnd;newParent.serviceInGate();
+ assert(newParent.events.size()>=2&&newParent.events[1].id==43&&newParent.state.nativeParentSelected);
+ assert(mtkawdl::be32(newParent.events[1].bytes.data()+4)==parentEnd&&newParent.state.counter(clockUS)==4);
+ // A parent with an unrelated counter does not reset an emitted host/wire
+ // timeline. The discontinuity is rejected and remains observable.
+ AirportMtkAwdlInterface discontinuity;init(discontinuity);discontinuity.state.nativeElectionManaged=true;
+ discontinuity.serviceInGate();uint64_t discontinuityEnd=discontinuity.awTimeline.radioEnd;
+ clockUS+=10000;auto &foreign=discontinuity.state.peers[0];foreign.used=true;foreign.seen=foreign.epoch=clockUS;
+ foreign.baseCounter=23296;memcpy(foreign.mac,peer,6);memcpy(foreign.advertisement.master,peer,6);
+ discontinuity.state.selectNativeParent(peer);discontinuity.state.elect(clockUS);
+ uint16_t expectedCounter=discontinuity.state.counter(discontinuityEnd);
+ clockUS=discontinuityEnd;discontinuity.serviceInGate();
+ assert(discontinuity.state.counter(clockUS)==expectedCounter&&discontinuity.state.clockRejected==1);
+ assert(discontinuity.events.size()>=2&&discontinuity.events[1].id==43&&
+        mtkawdl::be32(discontinuity.events[1].bytes.data()+4)==discontinuityEnd);
+ AirportMtkAwdlInterface endCallback;init(endCallback);endCallback.serviceInGate();
+ endCallback.onEnd=[&]{size_t events=endCallback.events.size();endCallback.serviceInGate();
+  assert(endCallback.events.size()==events&&!endCallback.awTimeline.open);};
+ clockUS=endCallback.awTimeline.radioEnd;endCallback.serviceInGate();
+ assert(endCallback.events.size()==2&&!endCallback.state.controlsHeld);
+ // Repeat opmode/PSF/sequence programming every EAW across counter wrap.
+ AirportMtkAwdlInterface toggles;init(toggles);toggles.state.nativeElectionManaged=true;
+ toggles.state.baseCounter=65532;
+ auto &togglePeer=toggles.state.peers[0];togglePeer.used=true;togglePeer.seen=togglePeer.epoch=clockUS;
+ togglePeer.baseCounter=65532;memcpy(togglePeer.mac,peer,6);memcpy(togglePeer.advertisement.master,peer,6);
+ toggles.state.selectNativeParent(peer);toggles.state.elect(clockUS);
+ uint64_t toggleStop=clockUS+2700000,toggleDue=0;uint8_t toggleToken=1;
+ toggles.radio.onReserve=[&]{toggles.radio.grant.request(++toggleToken,6,clockUS);toggleDue=clockUS+3000;};
+ uint16_t programmed=0;bool programmedValid=false;
+ while(clockUS<toggleStop) {
+  if(toggles.radio.grant.pending&&clockUS>=toggleDue)
+   assert(toggles.radio.grant.grant(toggleToken,6,toggles.radio.duration,clockUS));
+  if(toggles.awTimeline.open&&clockUS-toggles.awTimeline.lastStart>=10000&&
+     (!programmedValid||programmed!=toggles.awTimeline.active.counter)) {
+   programmed=toggles.awTimeline.active.counter;programmedValid=true;
+   apple80211_awdl_sync_state mode{};mode.version=1;mode.state=programmed%8?1:2;memcpy(mode.master,peer,6);
+   assert(!toggles.setAWDL_SYNC_STATE(&mode));
+   apple80211_awdl_sync_params params{1,16,16,16,programmed%8?440U:110U,0};
+   assert(!toggles.setAWDL_SYNC_PARAMS(&params));
+   apple80211_awdl_sync_channel_sequence seq{};seq.version=1;seq.length=16;seq.step_count=3;
+   for(unsigned j=0;j<16;++j)seq.seqs[j].channel=6;
+   assert(!toggles.setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE(&seq));
+   // A new RX observation retains the same peer's clock despite opmode changes.
+   togglePeer.seen=clockUS;toggles.state.elect(clockUS);
+  }
+  toggles.serviceInGate();assert(toggles.t.us);clockUS+=toggles.t.us+250;
+ }
+ assert(toggles.awTimeline.starts==42&&toggles.awTimeline.ends==41&&toggles.reserveInvalidations==0);
+ unsigned toggleStarts=0,toggleEnds=0;uint16_t toggleCounter=65528;uint32_t toggleStart=0,lastToggleStart=0;
+ for(const auto&e:toggles.events) {
+  if(e.id==41) {assert(toggleStarts==toggleEnds);uint16_t c=mtkawdl::le32(e.bytes.data());
+   assert(c==uint16_t(toggleCounter+4));toggleCounter=c;
+   toggleStart=mtkawdl::be32(e.bytes.data()+20);
+   if(toggleStarts) {int64_t gap=int64_t(uint32_t(toggleStart-lastToggleStart))-4*int64_t(mtkawdl::awUs);
+    assert(gap>=-5*1024&&gap<=5*1024);}
+   lastToggleStart=toggleStart;++toggleStarts;
+  } else {assert(toggleStarts==toggleEnds+1);++toggleEnds;
+   unsigned duration=(mtkawdl::be32(e.bytes.data()+4)-toggleStart)/1024;
+   assert(duration>=54&&duration<=74);}
+ }
+ // Never reopen an early-closed real EAW with a changed role/master record.
+ AirportMtkAwdlInterface earlyControl;init(earlyControl);earlyControl.state.nativeElectionManaged=true;
+ earlyControl.state.sequence.channels[1]=earlyControl.state.ownSequence.channels[1]=44;
+ earlyControl.serviceInGate();uint64_t earlyEnd=earlyControl.awTimeline.active.end;
+ apple80211_awdl_sync_state earlyMode{};earlyMode.version=1;earlyMode.state=3;memcpy(earlyMode.master,local,6);
+ clockUS+=10000;assert(!earlyControl.setAWDL_SYNC_STATE(&earlyMode));
+ clockUS=earlyEnd-7000;earlyControl.serviceInGate();assert(earlyControl.events.size()==2);
+ // The measured 97ms grant delay exceeds the old 55ms lookahead. Learn a
+ // bounded lead from accepted grants and cover following sparse channel AWs.
+ AirportMtkAwdlInterface latency;init(latency);latency.radio.grant.cancel();
+ const uint8_t latencyChannels[16]={6,0,0,44,0,0,0,0,6,0,0,44,0,0,0,0};
+ memcpy(latency.state.sequence.channels,latencyChannels,16);latency.state.ownSequence=latency.state.sequence;
+ clockUS+=97000;latency.radio.grant.request(1,6,clockUS-97000);
+ assert(latency.radio.grant.grant(1,6,100,clockUS));
+ latency.serviceInGate();assert(latency.reserveLeadUS==105000);
+ uint64_t latencyDue=0,latencyStop=clockUS+2*16*4*mtkawdl::awUs;uint8_t latencyToken=1;
+ latency.radio.onReserve=[&]{clockUS+=5000;latency.radio.grant.request(++latencyToken,latency.radio.requested,clockUS);latencyDue=clockUS+(latency.radio.requested==44?97000:3000);};
+ while(clockUS<latencyStop) {
+  if(latency.radio.grant.pending&&clockUS>=latencyDue)
+   assert(latency.radio.grant.grant(latencyToken,latency.radio.requested,latency.radio.duration,clockUS));
+  latency.serviceInGate();assert(latency.t.us);clockUS+=latency.t.us+250;
+ }
+ unsigned offChannel=0;for(const auto&e:latency.events)if(e.id==41&&mtkawdl::le32(e.bytes.data()+28)==44)++offChannel;
+ fprintf(stderr,"adaptive offchannel=%u lead=%u reserves=%u starts=%llu\n",offChannel,latency.reserveLeadUS,latency.radio.reserves,(unsigned long long)latency.awTimeline.starts);
+ assert(offChannel==4&&latency.reserveLeadUS>=105000&&latency.reserveLeadUS<=125000);
  // Repeating native advertisers must not compare the peer's different radio
  // sequence against ours and repeatedly tear down an otherwise valid grant.
  AirportMtkAwdlInterface selected;init(selected);selected.state.nativeElectionManaged=true;
@@ -446,7 +613,7 @@ int main(){
  uint16_t hostCounter=selected.state.counter(clockUS);aborts=selected.radio.aborts;
  assert(selected.setAWDL_AWDL_ADVERTISERS(&advert)==0);
  assert(selected.awTimeline.open&&selected.radio.aborts==aborts&&selected.state.counter(clockUS)==hostCounter);
- assert(selected.state.clockRejected==1);
+ assert(selected.state.clockRejected==0); // observation is consumed at AW end
  // A fresh selected-parent PSF can arrive while the synchronous RLM wait
  // releases the gate, then again while ROC is pending and during the AW.
  // Keep the radio clock AND outgoing synchronization TLV on one timeline.

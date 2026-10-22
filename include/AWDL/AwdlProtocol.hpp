@@ -229,6 +229,46 @@ struct State {
     // Both event production and synchronization TLVs use epoch/baseCounter.
     uint64_t clockHoldUntil, clockDeferredAt, clockDeferred;
     void holdClock(uint64_t until) { clockHoldUntil=until; }
+    // The selected clock survives opmode changes and temporary peer expiry.
+    // Effective radio controls are a transaction applied between AW events.
+    bool nativeClockSelected, nativeTimelineStarted, controlsHeld, controlsDirty;
+    uint8_t clockParent[6], clockRoot[6];
+    uint64_t controlsDeferred;
+    struct Controls {
+        Sequence sequence;
+        uint8_t presence, role, forced[6], parent[6];
+        bool parentSelected;
+    } pendingControls;
+    void holdControls() {
+        if(controlsHeld) return;
+        pendingControls.sequence=ownSequence; pendingControls.presence=ownPresence;
+        pendingControls.role=syncRole; memcpy(pendingControls.forced,forcedSync,6);
+        memcpy(pendingControls.parent,nativeParent,6);
+        pendingControls.parentSelected=nativeParentSelected;
+        controlsHeld=true; controlsDirty=false;
+    }
+    void discardControls() { controlsHeld=controlsDirty=false; }
+    uint8_t requestedRole() const { return controlsHeld ? pendingControls.role : syncRole; }
+    void selectNativeParent(const uint8_t *address) {
+        nativeElectionManaged=true;
+        if(controlsHeld) {
+            if(!pendingControls.parentSelected || memcmp(pendingControls.parent,address,6)) {
+                memcpy(pendingControls.parent,address,6); pendingControls.parentSelected=true;
+                controlsDirty=true; ++controlsDeferred;
+            }
+        } else { memcpy(nativeParent,address,6); nativeParentSelected=true; }
+    }
+    bool releaseControls(uint64_t now) {
+        if(!controlsHeld) return false;
+        bool changed=controlsDirty; controlsHeld=controlsDirty=false;
+        if(changed) {
+            setSyncRole(pendingControls.role,pendingControls.forced);
+            setSequence(pendingControls.sequence,now);
+            memcpy(nativeParent,pendingControls.parent,6);
+            nativeParentSelected=pendingControls.parentSelected;
+        }
+        elect(now); return changed;
+    }
     void init(const uint8_t *address, uint64_t now) {
         memset(this,0,sizeof(*this)); memcpy(mac,address,6);
         memcpy(master,address,6); memcpy(sync,address,6);
@@ -255,6 +295,13 @@ struct State {
         if (role<1 || role>3 || !address || !unicast(address) ||
             (role==2 ? !memcmp(address,mac,6) :
              role==3 ? memcmp(address,mac,6) : (!nativeElectionManaged && memcmp(address,mac,6)))) return false;
+        if(controlsHeld) {
+            if(pendingControls.role!=role || memcmp(pendingControls.forced,address,6)) {
+                pendingControls.role=role; memcpy(pendingControls.forced,address,6);
+                controlsDirty=true; ++controlsDeferred;
+            }
+            return true;
+        }
         if (syncRole==role && !memcmp(forcedSync,address,6)) return true;
         holdClock(0);
         syncRole=role; memcpy(forcedSync,address,6);
@@ -264,6 +311,13 @@ struct State {
     }
     bool setPresence(uint8_t value,uint64_t now) {
         if (!validPresence(value)) return false;
+        if(controlsHeld) {
+            if(pendingControls.presence!=value) {
+                pendingControls.presence=value; pendingControls.sequence.step=value-1;
+                controlsDirty=true; ++controlsDeferred;
+            }
+            return true;
+        }
         ownPresence=value; ownSequence.step=value-1;
         if (!synchronized) {
             // Keep the current AW counter and sub-AW phase through a change
@@ -274,11 +328,32 @@ struct State {
         }
         return true;
     }
+    bool setSequence(const Sequence &value,uint64_t now) {
+        if(!validSequence(value) || !validPresence(unsigned(value.step)+1)) return false;
+        if(controlsHeld) {
+            if(memcmp(&pendingControls.sequence,&value,sizeof(value))) {
+                pendingControls.sequence=value; pendingControls.presence=value.step+1;
+                controlsDirty=true; ++controlsDeferred;
+            }
+        } else {
+            ownSequence=value; setPresence(value.step+1,now);
+            sequence=value; presence=value.step+1;
+        }
+        return true;
+    }
+    void setSocialChannel(unsigned index,uint8_t channel,uint64_t now) {
+        Sequence desired=controlsHeld ? pendingControls.sequence : ownSequence;
+        if(index>=desired.count) return;
+        desired.channels[index]=channel; setSequence(desired,now);
+    }
     int find(const uint8_t *address) const {
         for(unsigned i=0;i<maxPeers;++i) if(peers[i].used && !memcmp(peers[i].mac,address,6)) return i;
         return -1;
     }
     void elect(uint64_t now) {
+        // Peer RX may refresh observations, but cannot alter an open AW's
+        // role, parent, channel or clock. Commit the latest controls at end.
+        if(controlsHeld) return;
         // Only a top master advances its own election counter. Followers
         // advertise the counter learned from their selected master.
         if(now<electionEpoch || synchronized) electionEpoch=now;
@@ -320,8 +395,9 @@ struct State {
             memcpy(master,mac,6); memcpy(sync,mac,6); return;
         }
         const Peer &p=peers[best];
-        bool sameClock=synchronized && !memcmp(sync,p.mac,6) &&
-            !memcmp(master,p.advertisement.master,6);
+        bool sameClock=nativeElectionManaged ? nativeClockSelected &&
+            !memcmp(clockParent,p.mac,6) && !memcmp(clockRoot,p.advertisement.master,6) :
+            synchronized && !memcmp(sync,p.mac,6) && !memcmp(master,p.advertisement.master,6);
         synchronized=true;
         memcpy(master,p.advertisement.master,6);
         memcpy(sync,p.mac,6);
@@ -332,13 +408,18 @@ struct State {
         presence=nativeElectionManaged ? ownPresence : p.advertisement.presence;
         masterMetric=p.advertisement.metric; masterCounter=p.advertisement.masterCounter;
         distance=p.advertisement.distance+1;
-        if(!nativeElectionManaged || !sameClock) {
+        bool adopt=!nativeElectionManaged || (!nativeClockSelected && !nativeTimelineStarted);
+        if(nativeElectionManaged && !sameClock) {
+            nativeClockSelected=true; memcpy(clockParent,p.mac,6);
+            memcpy(clockRoot,p.advertisement.master,6);
+        }
+        if(adopt) {
             holdClock(0);
-            // Initial native parent selection may adopt its counter. Repeated
-            // advertisements from that parent are clock observations, not a
-            // request to replace the timeline on every RX/timer tick.
+            // Initial native selection before any AW may adopt its counter.
+            // Once announced, even a different parent is a bounded clock
+            // observation; no event-only renumbering can preserve RF sync.
             epoch=p.epoch; baseCounter=p.baseCounter; clockSampleAt=p.seen;
-        } else if(p.seen>clockSampleAt) {
+        } else if(!sameClock || p.seen>clockSampleAt) {
             uint64_t local=now>=epoch ? now-epoch : 0;
             uint64_t remote=now>=p.epoch ? now-p.epoch : 0;
             int32_t delta=int16_t(uint16_t(p.baseCounter+remote/awUs)-counter(now))*int32_t(awUs)+
@@ -621,11 +702,14 @@ inline size_t decodeData(uint8_t *out,size_t capacity,const uint8_t *f,size_t n,
 // A matching, unexpired firmware grant is mandatory before any transmission.
 struct Reservation {
     uint64_t deadline, grantObservedAt; uint8_t token, channel; bool pending, granted;
+    uint32_t responseDelayUS;
     void request(uint8_t t,uint8_t c,uint64_t now) {
         token=t; channel=c; pending=true; granted=false; grantObservedAt=0; deadline=now+100000;
+        responseDelayUS=0;
     }
     bool grant(uint8_t t,uint8_t c,uint32_t durationMs,uint64_t now) {
         if(!pending || t!=token || c!=channel || now>=deadline || !durationMs || durationMs>maxRocMs) return false;
+        responseDelayUS=static_cast<uint32_t>(now-(deadline-100000));
         pending=false; granted=true; grantObservedAt=now; deadline=now+uint64_t(durationMs)*1000; return true;
     }
     bool canTransmit(uint8_t c,uint64_t now) const { return granted && channel==c && now<deadline && deadline-now>2000; }

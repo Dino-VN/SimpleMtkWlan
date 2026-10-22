@@ -537,6 +537,7 @@ IOReturn AirportMtkAwdlInterface::setSyncInGate(bool value)
     setProperty("MTKAWDLSyncTransition",value ? "enabling" : "disabling");
     if(!value) {
         enabled=false;
+        state.discardControls();
         state.holdClock(0);
         if(awTimeline.open) notifyAvailabilityWindowEnd(awdlNow());
         awTimeline.reset(); drainCompletions();
@@ -661,6 +662,10 @@ void AirportMtkAwdlInterface::notifyAvailabilityWindowEnd(uint64_t now)
     setProperty("MTKAWDLAWEndNotifications",awTimeline.ends,64);
     setProperty("MTKAWDLAWWindowOpen",false);
     postMessage(APPLE80211_M_AWDL_AVAILABILITY_WINDOW_EXTENSIONS_END,&payload,sizeof(payload),true);
+    // End callbacks may enqueue the last part of a control transaction.
+    // Keep it deferred until native has consumed the preceding end event.
+    if(enabled && !stopping) state.releaseControls(awdlNow());
+    else state.discardControls();
 }
 void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
 {
@@ -687,8 +692,11 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLClockRejected",state.clockRejected,64);
     setProperty("MTKAWDLClockDeferred",state.clockDeferred,64);
     setProperty("MTKAWDLClockHoldUntilUS",state.clockHoldUntil,64);
+    setProperty("MTKAWDLControlsDeferred",state.controlsDeferred,64);
+    setProperty("MTKAWDLControlsPending",state.controlsDirty);
     setProperty("MTKAWDLReserveWaitUS",reserveWaitUS,64);
     setProperty("MTKAWDLReserveMaxWaitUS",reserveMaxWaitUS,64);
+    setProperty("MTKAWDLReserveLeadUS",static_cast<uint64_t>(reserveLeadUS),32);
     setProperty("MTKAWDLReserveInvalidations",reserveInvalidations,64);
     setProperty("MTKAWDLReserveInvalidReason",static_cast<uint64_t>(reserveInvalidReason),32);
     setProperty("MTKAWDLRequestedAWChannel",static_cast<uint64_t>(requestedWindow.channel),32);
@@ -734,10 +742,14 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
 void AirportMtkAwdlInterface::serviceInGate()
 {
     if(!enabled || stopping) return;
+    // Native end dispatch can reenter the timer/service path. Finish its
+    // control transaction before opening another AW with the old snapshot.
+    if(state.controlsHeld && !awTimeline.open) { timer->setTimeoutMS(1); return; }
     ++serviceTicks;
     if(!hal->awdlIsEnabled()) {
         // Transport reset invalidates the secondary BSS and all grants.
         state.holdClock(0);
+        state.discardControls();
         enabled=false; dataPeers.reset(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); trafficActive=false;
         trafficPeerInstalled=false; bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
         setProperty("MTKAWDLSyncEnabled",false);
@@ -899,6 +911,14 @@ void AirportMtkAwdlInterface::serviceInGate()
     }
     mtkawdl::Reservation grant={};
     bool grantReady=hal->awdlGrantSnapshot(grant) && grant.canTransmit(channel,now);
+    if(grant.granted && grant.grantObservedAt && grant.grantObservedAt!=grantLatencyObservedAt) {
+        grantLatencyObservedAt=grant.grantObservedAt;
+        // Accepted ROC response latency is measured from the pending request
+        // deadline (submission +100ms), independently of the RLM wait.
+        uint64_t need=uint64_t(grant.responseDelayUS)+reserveWaitUS+8000;
+        if(need>125000) need=125000;
+        if(need>reserveLeadUS) reserveLeadUS=static_cast<uint32_t>(need);
+    }
     if(awTimeline.open && (!grant.granted || grant.channel!=awTimeline.active.channel ||
                          grant.token!=awTimeline.token ||
                          grant.grantObservedAt!=awTimeline.grantObservedAt)) {
@@ -915,7 +935,7 @@ void AirportMtkAwdlInterface::serviceInGate()
         bool pending=grant.pending && now<grant.deadline;
         if(!pending) {
             mtkawdl::RadioPlan plan={};
-            if(!mtkawdl::planRadio(state,now,plan)) { timer->setTimeoutMS(2); return; }
+            if(!mtkawdl::planRadio(state,now,plan,reserveLeadUS)) { timer->setTimeoutMS(2); return; }
             mtkawdl::Window target=plan.window;
             if(!target.channel || !hal->awdlChannelAllowed(target.channel)) {
                 timer->setTimeoutMS(1); return;
@@ -985,7 +1005,9 @@ void AirportMtkAwdlInterface::serviceInGate()
     if(grantedChannel!=channel) ++grantObservations;
     uint8_t nativeRole=state.syncRole;
     if(!awTimeline.open && awTimeline.begin(window,grant,now,state.sync,state.master,nativeRole,&state.sequence)) {
+        state.nativeTimelineStarted=true;
         state.holdClock(window.end);
+        state.holdControls();
         // Set lifecycle state before dispatch: native may synchronously call
         // back into sync/advertisers setters while receiving this event.
         notifyAvailabilityWindowStart(channel,now);
@@ -1266,12 +1288,9 @@ IOReturn AirportMtkAwdlInterface::setAWDL_AWDL_ADVERTISERS(awdl_peer_advert_add 
                         memcmp(&state.sequence,&state.ownSequence,sizeof(state.sequence));
                     // A refreshed PSF from the same selected parent does not
                     // revoke the radio grant when its clock estimate changes.
-                    if(changed && awTimeline.open) notifyAvailabilityWindowEnd(now);
-                    if(stopping) return kIOReturnNotReady;
                     auto &p=state.peers[peer]; p.advertisement=a; p.epoch=epoch; p.baseCounter=base;
-                    memcpy(state.nativeParent,sample.peer,6); state.nativeParentSelected=true;
-                    state.nativeElectionManaged=true; state.elect(now);
-                    if(changed && enabled) {
+                    state.selectNativeParent(sample.peer); state.elect(now);
+                    if(changed && enabled && !state.controlsHeld) {
                         hal->awdlAbort(); requestedChannel=grantedChannel=0;
                         nextAction=0; miCounterValid=false; timer->setTimeoutMS(1);
                     }
@@ -1308,11 +1327,10 @@ IOReturn AirportMtkAwdlInterface::setAWDL_SYNC_STATE(apple80211_awdl_sync_state 
     // Native regularly refreshes opmode/flags. A duplicate must not cancel
     // a live or pending ROC, or close an otherwise valid AW.
     if(same) { syncState=*d; return kIOReturnSuccess; }
-    if(awTimeline.open) notifyAvailabilityWindowEnd(awdlNow());
     if(stopping) return kIOReturnNotReady;
     syncState=*d; state.elect(awdlNow());
     setProperty("MTKAWDLSyncRole",d->state,32);
-    if(enabled) { hal->awdlAbort(); requestedChannel=grantedChannel=0; nextAction=0; timer->setTimeoutMS(1); }
+    if(enabled && !state.controlsHeld) { hal->awdlAbort(); requestedChannel=grantedChannel=0; nextAction=0; timer->setTimeoutMS(1); }
     return kIOReturnSuccess;
 }
 IOReturn AirportMtkAwdlInterface::setAWDL_PRESENCE_MODE(apple80211_awdl_presence_mode *d) {
@@ -1329,7 +1347,7 @@ IOReturn AirportMtkAwdlInterface::setAWDL_SYNC_PARAMS(apple80211_awdl_sync_param
        (d->synchronization_frame_period!=110 && d->synchronization_frame_period!=440))
         return kIOReturnUnsupported;
     // A period update must not reset an already selected synchronization peer.
-    if(state.syncRole!=2) state.setSyncRole(d->non_election_master ? 3 : 1,state.mac);
+    if(state.requestedRole()!=2) state.setSyncRole(d->non_election_master ? 3 : 1,state.mac);
     state.psfPeriod=d->synchronization_frame_period;
     state.elect(awdlNow()); syncParams=*d; nextAction=0;
     setProperty("MTKAWDLPSFPeriodMS",static_cast<uint64_t>(state.psfPeriod),32);
@@ -1362,10 +1380,9 @@ IOReturn AirportMtkAwdlInterface::getPEER_CACHE_MAXIMUM_SIZE(apple80211_peer_cac
 IOReturn AirportMtkAwdlInterface::getAWDL_MASTER_CHANNEL(apple80211_awdl_master_channel *d) { if(!d) return kIOReturnBadArgument; *d={APPLE80211_VERSION,state.ownSequence.channels[0]}; return kIOReturnSuccess; }
 IOReturn AirportMtkAwdlInterface::setAWDL_MASTER_CHANNEL(apple80211_awdl_master_channel *d) {
     if(!d || d->version>APPLE80211_VERSION || d->master_channel>165 || !hal->awdlChannelAllowed(d->master_channel)) return kIOReturnBadArgument;
-    // Apply a primary social channel to the local discovery schedule. A
-    // received master's schedule takes precedence while synchronized.
-    state.ownSequence.channels[0]=d->master_channel;
-    if(!state.synchronized) state.sequence=state.ownSequence;
+    // Native owns the effective sequence; stage social channel updates when
+    // a granted AW is still using the previous schedule.
+    state.setSocialChannel(0,d->master_channel,awdlNow());
     channelSequence.seqs[0].channel=d->master_channel;
     return kIOReturnSuccess;
 }
@@ -1376,8 +1393,7 @@ IOReturn AirportMtkAwdlInterface::setAWDL_SECONDARY_MASTER_CHANNEL(apple80211_aw
        !hal->awdlChannelAllowed(d->secondary_master_channel))) return kIOReturnBadArgument;
     secondaryMasterChannel=d->secondary_master_channel;
     // Keep a second discovery channel until the complete native sequence arrives.
-    if(state.ownSequence.count>1) state.ownSequence.channels[1]=secondaryMasterChannel;
-    if(!state.synchronized) state.sequence=state.ownSequence;
+    state.setSocialChannel(1,secondaryMasterChannel,awdlNow());
     channelSequence.seqs[1].channel=secondaryMasterChannel;
     setProperty("MTKAWDLSecondaryMasterChannel",static_cast<uint64_t>(secondaryMasterChannel),32);
     return kIOReturnSuccess;
@@ -1390,8 +1406,7 @@ IOReturn AirportMtkAwdlInterface::setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE(apple
         return kIOReturnUnsupported;
     mtkawdl::Sequence s={}; s.count=d->length; s.step=d->step_count;
     for(unsigned i=0;i<s.count;++i) { unsigned c=d->seqs[i].channel; if(c && (c>165 || !hal->awdlChannelAllowed(c))) return kIOReturnBadArgument; s.channels[i]=c; }
-    state.ownSequence=s; state.setPresence(s.step+1,awdlNow());
-    state.sequence=s; state.presence=s.step+1;
+    state.setSequence(s,awdlNow());
     channelSequence=*d;
     setProperty("MTKAWDLNativeChannelSequence",state.ownSequence.channels,state.ownSequence.count);
     return kIOReturnSuccess;

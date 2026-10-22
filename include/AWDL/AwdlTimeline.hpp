@@ -25,7 +25,7 @@ constexpr uint32_t rocLeadUs=55000;
 // Prepare the BSS and ROC before the edge, and keep one grant for adjacent
 // equal channels. A grant alone never changes the announced schedule.
 struct RadioPlan { Window window; uint64_t requestAt; uint32_t durationMs; };
-inline bool planRadio(const State &s,uint64_t now,RadioPlan &out) {
+inline bool planRadio(const State &s,uint64_t now,RadioPlan &out,uint32_t leadUs=rocLeadUs) {
     Window target={};
     if(!currentWindow(s,now,target)) return false;
     if(!target.channel || now-target.start>8000) {
@@ -35,7 +35,7 @@ inline bool planRadio(const State &s,uint64_t now,RadioPlan &out) {
         }
     }
     if(!target.channel) return false;
-    uint64_t at=target.start>rocLeadUs ? target.start-rocLeadUs : 0;
+    uint64_t at=target.start>leadUs ? target.start-leadUs : 0;
     if(at<now) at=now;
     uint64_t end=target.end;
     for(unsigned i=1;i<s.sequence.count;++i) {
@@ -85,6 +85,9 @@ struct Timeline {
         // Native sanityCheckAWEnd allows +/-10 TU, not an arbitrary partial
         // dwell. Never announce a 32ms grant as a complete 64TU native AW.
         if(end-now+10*1024<unsigned(w.presence)*awUs) { ++shortGrants; return false; }
+        // Early preparation closes within native's duration tolerance. A
+        // control/clock change must not announce the same physical EAW again.
+        if(emitted && now<active.end) return false;
         // RX clock corrections can move an edge by a fraction of a TU.
         // Identify the last notified window by counter/presence/master too;
         // its timestamp alone must not permit a second start for that AW.

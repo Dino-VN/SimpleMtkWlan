@@ -149,6 +149,28 @@ static void nativeClockTests()
     auto epoch=s.epoch;auto base=s.baseCounter;
     s.elect(1200001);assert(s.epoch==epoch&&s.baseCounter==base);
     s.holdClock(1500000);assert(s.setSyncRole(3,local)&&!s.clockHoldUntil);
+    // Native refreshes roles and parent controls while following the same
+    // peer. Role toggles must not readopt a discontinuous AW counter.
+    for(uint16_t initial:{uint16_t(18080),uint16_t(65532)}) {
+        State clock;clock.init(local,1000000);
+        clock.nativeElectionManaged=clock.nativeParentSelected=true;
+        memcpy(clock.nativeParent,remote,6);
+        auto &parent=clock.peers[0];parent.used=true;parent.seen=parent.epoch=1000000;
+        parent.baseCounter=initial;memcpy(parent.mac,remote,6);
+        memcpy(parent.advertisement.master,remote,6);clock.elect(1000000);
+        uint64_t now=1100000;uint16_t before=clock.counter(now);
+        parent.baseCounter=224;parent.epoch=now;parent.seen=now;
+        assert(clock.setSyncRole(1,remote));clock.elect(now);
+        assert(clock.counter(now)==before);
+        assert(clock.setSyncRole(2,remote));clock.elect(now+1);
+        assert(clock.counter(now+1)==before&&clock.clockRejected==1);
+        // A new selected parent can arrive with an unrelated AW namespace.
+        // An already announced timeline cannot jump to its counter.
+        uint8_t other[6]={2,9,8,7,6,5};
+        memcpy(parent.mac,other,6);memcpy(parent.advertisement.master,other,6);
+        parent.seen=now+2;clock.nativeTimelineStarted=true;clock.selectNativeParent(other);
+        clock.elect(now+2);assert(clock.counter(now+2)==before&&clock.clockRejected==2);
+    }
 }
 static void templateTests()
 {

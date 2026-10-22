@@ -184,7 +184,7 @@ struct AirportMtkAwdlInterface:NativeProtocol {
  IOSkywalkPacketBufferPool *txPool=nullptr,*rxPool=nullptr;
  IOSkywalkTxSubmissionQueue *txSubmit=nullptr;IOSkywalkTxCompletionQueue *txComplete=nullptr;IOSkywalkRxCompletionQueue *rxComplete=nullptr;
  unsigned queuesAdded=0,completionCount=0,queueCount=0;IOSkywalkPacket *completions[128]={};
- struct State {uint8_t mac[6]={2,1,2,3,4,5};bool nativeElectionManaged=false;int ownSequence=9,sequence=9;void holdClock(uint64_t){}void init(const uint8_t *m,uint64_t){memcpy(mac,m,6);ownSequence=sequence=0;}} state;
+ struct State {uint8_t mac[6]={2,1,2,3,4,5};bool nativeElectionManaged=false;int ownSequence=9,sequence=9;void holdClock(uint64_t){}void discardControls(){}void init(const uint8_t *m,uint64_t){memcpy(mac,m,6);ownSequence=sequence=0;}} state;
  struct {bool open=false;void reset(){open=false;}} awTimeline;void notifyAvailabilityWindowEnd(uint64_t){awTimeline.open=false;}
  uint8_t nativePeerSamples[16]{};
  struct {uint8_t master[6]={};} syncState;
