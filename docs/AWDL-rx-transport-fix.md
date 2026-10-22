@@ -1,5 +1,9 @@
 # AWDL raw data transport follow-up
 
+Offload interpretation corrected by [the Tahoe offload investigation](AWDL-offload-fix.md):
+native Skywalk may enable software TSO/partial checksumming after preparation.
+Those BSD flags alone do not prove unsupported physical offload.
+
 The installed queue-activation build (`b24320d`, UUID
 `F79AE847-84BA-3E34-91B7-CE20A1707920`) accepts BSD/native TX, but its BSD and
 native RX counters remain zero. Management peer discovery alone does not prove
@@ -13,7 +17,8 @@ exposes the stages needed to locate any remaining radio/peer failure.
   our submission callback only copies bytes and metadata is discarded. Return
   zero so the network stack completes checksums and segments packets before
   raw AWDL submission. The installed interface advertised TSO4, TSO6,
-  PARTIAL_CSUM and ZEROINVERT_CSUM; the replacement must remove those options.
+  PARTIAL_CSUM and ZEROINVERT_CSUM; later evidence establishes that Skywalk
+  can legitimately provide those options in software.
 * MT7921 hardware deaggregation is enabled in `mwx_mac_init`, while its raw RX
   alignment correction was compiled out. Apply the mt76 two-byte header
   relocation/pull only to RXD4-marked, unprotected NoDS AWDL QoS A-MSDUs.

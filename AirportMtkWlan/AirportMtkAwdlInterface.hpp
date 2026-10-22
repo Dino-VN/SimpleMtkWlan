@@ -28,6 +28,7 @@ public:
     int getNumTxQueues() override { return 1; }
     int getTxHeadroom() override { return 0; }
     UInt getHardwareAssists() override;
+    void setHardwareAssists(unsigned int,unsigned int) override;
     IOReturn prepareBSDInterface(ifnet_t,unsigned int) override;
     IOReturn enable(unsigned int) override;
     IOReturn disable(unsigned int) override;
@@ -111,6 +112,7 @@ public:
     IOReturn setAWDL_RTG_PEER_STATS_CONFIG(apple80211_rtg_peer_stats_cfg*) override { return kIOReturnUnsupported; }
     IOReturn getTX_RATE(apple80211_tx_rate*) override { return kIOReturnUnsupported; }
 private:
+    void publishBSDOffloadState(ifnet_t);
     bool createDataPath();
     void releaseDataPath();
     void drainCompletions();

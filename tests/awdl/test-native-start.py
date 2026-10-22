@@ -15,6 +15,8 @@ def fn(text, signature):
     return text[begin:text.index('\n}\n',begin)+3]
 functions='\n'.join(fn(source,s) for s in [
  'UInt AirportMtkAwdlInterface::getHardwareAssists(',
+ 'void AirportMtkAwdlInterface::setHardwareAssists(',
+ 'void AirportMtkAwdlInterface::publishBSDOffloadState(',
  'IOReturn AirportMtkAwdlInterface::prepareBSDInterface(',
  'bool AirportMtkAwdlInterface::start(',
  'bool AirportMtkAwdlInterface::createDataPath(',
@@ -44,15 +46,23 @@ stubs=r'''
 #include <vector>
 #include <algorithm>
 #include <functional>
+#include <cerrno>
+#include <map>
+#include <string>
 #define XYLog(...) ((void)0)
 using IOReturn=unsigned;
 using UInt=unsigned;
 using ifnet_t=void*;
 constexpr unsigned IFCAP_HWCSUM=3,IFCAP_TSO=0x60,IFCAP_LRO=0x80,IFCAP_CSUM_PARTIAL=0x2000,
  IFCAP_CSUM_ZERO_INVERT=0x4000,IFCAP_LRO_NUM_SEG=0x8000;
-unsigned hwassist=0x37f,capabilities=0xffff;int offloadError=0,capsError=0,bsdPrepareStatus=0;
+unsigned hwassist=0x37f,capabilities=0xffff,supported=0xffff;int offloadError=0,capsError=0,supportedError=0,bsdPrepareStatus=0;
+bool ignoreCaps=false;
 int ifnet_set_offload(ifnet_t,unsigned value){if(offloadError)return offloadError;hwassist=value;return 0;}
-int ifnet_set_capabilities_enabled(ifnet_t,unsigned value,unsigned mask){if(capsError)return capsError;capabilities=(capabilities&~mask)|(value&mask);return 0;}
+int ifnet_set_capabilities_enabled(ifnet_t,unsigned value,unsigned mask){if(capsError)return capsError;if(!ignoreCaps)capabilities=(capabilities&~mask)|(value&mask);return 0;}
+int ifnet_set_capabilities_supported(ifnet_t,unsigned value,unsigned mask){if(supportedError)return supportedError;supported=(supported&~mask)|(value&mask);return 0;}
+unsigned ifnet_offload(ifnet_t){return hwassist;}
+unsigned ifnet_capabilities_supported(ifnet_t){return supported;}
+unsigned ifnet_capabilities_enabled(ifnet_t){return capabilities;}
 using IOThread=void*;using AbsoluteTime=uint64_t;
 constexpr unsigned kIOReturnTimeout=10,kMillisecondScale=1,THREAD_UNINT=0;
 IOThread IOThreadSelf(){static int identity;return &identity;}
@@ -148,7 +158,10 @@ uint64_t awdlNow(){return 123;}
 void *bsdAddress=nullptr;
 void ifnet_set_lladdr(void *bsd,const void *mac,unsigned length){assert(length==6);memcpy(bsd,mac,6);}
 struct NativeProtocol:IOService {
- virtual unsigned getHardwareAssists(){return 0x37f;}
+ unsigned cachedAssists=0x37f;
+ virtual unsigned getHardwareAssists(){return cachedAssists;}
+ virtual void setHardwareAssists(unsigned value,unsigned mask){cachedAssists=(cachedAssists&~mask)|value;}
+ virtual ifnet_t getBSDInterface(){return this;}
  virtual IOReturn prepareBSDInterface(ifnet_t,unsigned){return bsdPrepareStatus;}
  ether_addr agentMac={}; bool agentStarted=false; unsigned macDepth=0;
  virtual IOReturn setMacAddress(ether_addr&)=0;
@@ -185,10 +198,13 @@ struct AirportMtkAwdlInterface:NativeProtocol {
  bool initWithController(AirportMtkWlan*c,ether_addr*,MtkMwx*h){owner=c;hal=h;return true;}
  bool attach(IOService*){return true;}void detach(IOService*){}void setInterfaceRole(unsigned){}void setInterfaceId(unsigned){}
  const char *getBSDNamePrefix(){return "awdl";}
- void setProperty(const char*,bool){}void setProperty(const char*,const char*){}void setProperty(const char*,const void*,unsigned){}void setProperty(const char*,uint64_t,unsigned){}
+ std::map<std::string,uint64_t> properties;
+ void setProperty(const char*,bool){}void setProperty(const char*,const char*){}void setProperty(const char*,const void*,unsigned){}void setProperty(const char*k,uint64_t v,unsigned){properties[k]=v;}
  bool initRegistrationInfo(IOSkywalkEthernetInterface::RegistrationInfo*,unsigned,unsigned){return !infoFail;}
  IOReturn registerEthernetInterface(IOSkywalkEthernetInterface::RegistrationInfo *info,IOSkywalkPacketQueue**,unsigned count,IOSkywalkPacketBufferPool*,IOSkywalkPacketBufferPool*,unsigned){const char *prefix=nullptr;uint32_t unit=1;memcpy(&prefix,info->bytes+0x30,sizeof(prefix));memcpy(&unit,info->bytes+0x38,sizeof(unit));assert(!strcmp(prefix,"awdl")&&unit==0);uint32_t subfamily=0,media=0;memcpy(&subfamily,info->bytes+0x0c,4);memcpy(&media,info->bytes+0x28,4);assert(subfamily==3&&media==0x80);assert(count==3&&queuesAdded==3&&deferred);registered=!registerFail;return registerFail?7:0;}
  unsigned getHardwareAssists() override;
+ void setHardwareAssists(unsigned,unsigned) override;
+ void publishBSDOffloadState(ifnet_t);
  IOReturn prepareBSDInterface(ifnet_t,unsigned) override;
  bool start(IOService*);bool createDataPath();void releaseDataPath();void drainCompletions();void inputNative(const uint8_t*,size_t);void setDataPathEnabled(bool);void stop(IOService*);
  IOReturn enable(unsigned) override;IOReturn disable(unsigned) override;
@@ -220,10 +236,26 @@ int main(){
  assert(!offloadBase->prepareBSDInterface(&offload,0)&&!hwassist);
  assert(!(capabilities&(IFCAP_HWCSUM|IFCAP_TSO|IFCAP_LRO|IFCAP_CSUM_PARTIAL|IFCAP_CSUM_ZERO_INVERT|IFCAP_LRO_NUM_SEG)));
  assert(capabilities&0x400); // Preserve Skywalk support.
+ assert(supported&0x400);
+ assert(!(supported&(IFCAP_HWCSUM|IFCAP_TSO|IFCAP_LRO|IFCAP_CSUM_PARTIAL|IFCAP_CSUM_ZERO_INVERT|IFCAP_LRO_NUM_SEG)));
+ assert(offload.cachedAssists==0);
+ offloadBase->setHardwareAssists(0x37f,0x37f);assert(offload.cachedAssists==0);
+ assert(offload.properties["MTKAWDLBSDPreparedOffload"]==0);
+ // Model native-host activation after preparation: Skywalk software assists
+ // are observed and must not be removed by diagnostics or BSD enable.
+ hwassist=0x703000;capabilities|=0x6060;supported|=0x6060;
+ offload.publishBSDOffloadState(&offload);
+ assert(hwassist==0x703000&&offload.properties["MTKAWDLBSDCurrentOffload"]==hwassist);
+ assert(offload.properties["MTKAWDLBSDPreparedOffload"]==0);
  bsdPrepareStatus=kIOReturnNotReady;hwassist=123;
  assert(offloadBase->prepareBSDInterface(&offload,0)==kIOReturnNotReady&&hwassist==123);bsdPrepareStatus=0;
  offloadError=1;assert(offloadBase->prepareBSDInterface(&offload,0)==kIOReturnError);offloadError=0;
  capsError=1;assert(offloadBase->prepareBSDInterface(&offload,0)==kIOReturnError);capsError=0;
+ supportedError=1;assert(offloadBase->prepareBSDInterface(&offload,0)==kIOReturnError);supportedError=0;
+ capabilities|=IFCAP_TSO;ignoreCaps=true;
+ assert(offloadBase->prepareBSDInterface(&offload,0)==kIOReturnError);
+ assert(offload.properties["MTKAWDLBSDOffloadStatus"]==EIO);ignoreCaps=false;
+ assert(offloadBase->prepareBSDInterface(&offload,0)==0);
  for(int n=1;n<=5;++n){reset();failFactory=n;failure();}
  for(int n=1;n<=3;++n){reset();failAdd=n;failure();}
  reset();resourceAvailable=false;failure();assert(factory==0&&nativeStarts==0);

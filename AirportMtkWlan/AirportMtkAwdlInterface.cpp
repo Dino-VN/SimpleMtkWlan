@@ -4,6 +4,7 @@
 #ifdef MTK_NATIVE_AWDL
 #include <IOKit/IOCommandGate.h>
 #include <sys/kpi_mbuf.h>
+#include <sys/errno.h>
 #include <Airport/macOS26/IO80211Buffer.h>
 
 #define super IO80211AWDLProtocol
@@ -153,21 +154,47 @@ UInt AirportMtkAwdlInterface::getHardwareAssists()
     // Native Ethernet preparation calls this virtual before ifnet_set_offload.
     // Raw AWDL TX neither segments TSO packets nor completes partial checksums.
     // Let networking produce complete, MTU-sized datagrams before submission.
-    // prepareBSDInterface also clears capabilities left enabled by Tahoe.
+    // Skywalk may advertise software GSO/copy checksumming on BSD later.
     return 0;
+}
+void AirportMtkAwdlInterface::setHardwareAssists(unsigned int,unsigned int)
+{
+    // Native registration/restore may update the cached assists directly.
+    // Skywalk snapshots this cache before enabling its own software GSO and
+    // copy/checksum path. Never advertise an unsupported physical assist.
+    super::setHardwareAssists(0,~0u);
+}
+void AirportMtkAwdlInterface::publishBSDOffloadState(ifnet_t interface)
+{
+    setProperty("MTKAWDLDriverHardwareAssists",static_cast<uint64_t>(super::getHardwareAssists()),32);
+    if(!interface) return;
+    setProperty("MTKAWDLBSDCurrentOffload",static_cast<uint64_t>(ifnet_offload(interface)),32);
+    setProperty("MTKAWDLBSDCurrentCapabilities",static_cast<uint64_t>(ifnet_capabilities_supported(interface)),32);
+    setProperty("MTKAWDLBSDCurrentEnabled",static_cast<uint64_t>(ifnet_capabilities_enabled(interface)),32);
 }
 IOReturn AirportMtkAwdlInterface::prepareBSDInterface(ifnet_t interface,unsigned int options)
 {
+    setHardwareAssists(0,~0u);
     IOReturn status=super::prepareBSDInterface(interface,options);
     if(status!=kIOReturnSuccess) return status;
     // ifnet_set_offload(0) clears hwassist, but Tahoe skips updating enabled
     // capabilities when the translated mask is zero. Clear those explicitly
     // while retaining unrelated native capabilities such as Skywalk.
+    const unsigned mask=IFCAP_HWCSUM | IFCAP_TSO | IFCAP_LRO | IFCAP_CSUM_PARTIAL |
+        IFCAP_CSUM_ZERO_INVERT | 0x8000u; // Tahoe IFCAP_LRO_NUM_SEG; absent in build SDK.
     int error=ifnet_set_offload(interface,0);
-    if(!error) error=ifnet_set_capabilities_enabled(interface,0,
-        IFCAP_HWCSUM | IFCAP_TSO | IFCAP_LRO | IFCAP_CSUM_PARTIAL |
-        IFCAP_CSUM_ZERO_INVERT | 0x8000u); // Tahoe IFCAP_LRO_NUM_SEG; absent in build SDK.
+    if(!error) error=ifnet_set_capabilities_enabled(interface,0,mask);
+    if(!error) error=ifnet_set_capabilities_supported(interface,0,mask);
+    unsigned offload=ifnet_offload(interface);
+    unsigned supported=ifnet_capabilities_supported(interface), active=ifnet_capabilities_enabled(interface);
+    // Success is a verified driver snapshot, not merely a successful setter.
+    // Host activation may later advertise software GSO/copy checksumming.
+    if(!error && (offload || ((supported|active)&mask))) error=EIO;
+    setProperty("MTKAWDLBSDPreparedOffload",static_cast<uint64_t>(offload),32);
+    setProperty("MTKAWDLBSDPreparedCapabilities",static_cast<uint64_t>(supported),32);
+    setProperty("MTKAWDLBSDPreparedEnabled",static_cast<uint64_t>(active),32);
     setProperty("MTKAWDLBSDOffloadStatus",static_cast<uint64_t>(error),32);
+    publishBSDOffloadState(interface);
     return error ? kIOReturnError : kIOReturnSuccess;
 }
 IOReturn AirportMtkAwdlInterface::enable(unsigned int options)
@@ -179,6 +206,7 @@ IOReturn AirportMtkAwdlInterface::enable(unsigned int options)
     // BCM proximity subclass explicitly starts its queues after that call.
     IOReturn status=super::enable(options);
     if(status==kIOReturnSuccess && !stopping) {
+        publishBSDOffloadState(getBSDInterface());
         enableDatapath();
         if(!dataPathEnabled) status=kIOReturnNotReady;
     } else if(status==kIOReturnSuccess) status=kIOReturnNotReady;
@@ -637,6 +665,7 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     if(lastDiagnostic && now-lastDiagnostic<1000000) return;
     lastDiagnostic=now;
     hal->awdlPublishDiagnostics();
+    publishBSDOffloadState(getBSDInterface());
     setProperty("MTKAWDLDataTxSubmitted",dataTxSubmitted,64);
     setProperty("MTKAWDLDataTxFailed",dataTxFailed,64);
     setProperty("MTKAWDLDataTxDeferred",dataTxDeferred,64);

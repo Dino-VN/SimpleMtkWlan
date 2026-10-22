@@ -1,5 +1,10 @@
 # AWDL runtime check, 2026-10-22
 
+Correction: this historical report's classification of BSD TSO/partial
+checksum flags as unsupported hardware is superseded by
+[the native-host offload investigation](AWDL-offload-fix.md). Tahoe may
+advertise these flags for software processing after saving driver assists.
+
 ## Continuous-window candidate boot at 14:48:30 +0700
 
 The user updated/rebooted into the audited candidate at commit `fbbe85f`.

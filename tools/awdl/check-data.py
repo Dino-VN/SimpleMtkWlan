@@ -41,6 +41,27 @@ def snapshot():
                    map(int, row[4:10])))
     return {'native': native, 'bsd': bsd, 'hal': hal}
 
+def offload_state(native, interface):
+    # Tahoe native-host activation deliberately advertises software TSO and
+    # partial checksumming after snapshotting the driver's physical assists.
+    # ifconfig options alone cannot establish unsupported hardware offload.
+    flags = re.findall(r'\b(?:TSO4|TSO6|PARTIAL_CSUM|ZEROINVERT_CSUM)\b', interface)
+    keys = ('MTKAWDLDriverHardwareAssists', 'MTKAWDLBSDPreparedOffload',
+            'MTKAWDLBSDPreparedCapabilities', 'MTKAWDLBSDPreparedEnabled')
+    result = {'bsd_flags': flags, 'status': 'unverified', 'reasons': []}
+    if native.get('MTKAWDLBSDOffloadStatus') != 0:
+        result['reasons'].append('BSD driver offload preparation failed or its diagnostic is absent.')
+    elif any(key not in native for key in keys):
+        result['reasons'].append('The loaded build lacks the verified driver offload snapshot; BSD flags may be Skywalk software assists.')
+    elif native[keys[0]] or native[keys[1]] or (native[keys[2]] | native[keys[3]]) & 0xe0e3:
+        result['status'] = 'failed'
+        result['reasons'].append('The driver advertises checksum/TSO/LRO offload it cannot perform.')
+    else:
+        result['status'] = 'passed'
+        result['interpretation'] = ('BSD flags are consistent with Tahoe native-host software GSO/copy checksumming; '
+                                    'the driver advertises no physical offload. Packet correctness still requires traffic validation.')
+    return result
+
 def check():
     loaded = run(['kmutil', 'showloaded', '--list-only']).decode(errors='replace')
     identity = next((line for line in loaded.splitlines()
@@ -103,11 +124,8 @@ def check():
             result['transport_findings'].append('No raw AWDL data reached the receiver during this interval.')
     if not after['native'].get('MTKAWDLDataPathEnabled', False):
         result['reasons'].append('The native datapath is disabled or its diagnostic is absent.')
-    if after['native'].get('MTKAWDLBSDOffloadStatus') != 0:
-        result['reasons'].append('BSD offload setup failed or its diagnostic is absent.')
-    unsupported = re.findall(r'\b(?:TSO4|TSO6|PARTIAL_CSUM|ZEROINVERT_CSUM)\b', result['interface'])
-    if unsupported:
-        result['reasons'].append('BSD still enables unsupported offloads: ' + ', '.join(unsupported))
+    result['offload'] = offload_state(after['native'], result['interface'])
+    result['reasons'].extend(result['offload']['reasons'])
     try:
         sanity = run(['/usr/bin/log', 'show', '--start', started, '--style', 'compact',
                       '--predicate', 'process == "kernel" AND eventMessage CONTAINS "AWDL SANITY FAILURE"']).decode(errors='replace')
