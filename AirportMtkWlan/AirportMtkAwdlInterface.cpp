@@ -517,6 +517,36 @@ IOReturn AirportMtkAwdlInterface::syncGated(OSObject*,void *arg,void *value,void
     auto self=static_cast<AirportMtkAwdlInterface *>(arg);
     return self->setSyncInGate(value!=NULL);
 }
+void AirportMtkAwdlInterface::finishAvailabilityWindowForDisable()
+{
+    if(!awTimeline.open) return;
+    // Stop new traffic first, but retain an actually granted AW long enough
+    // to end within native's 10-TU duration tolerance. This is a real wait,
+    // never a future timestamp. Reset/detach/revocation still end immediately.
+    uint64_t length=uint64_t(awTimeline.active.presence)*mtkawdl::awUs;
+    uint64_t minimum=length>10*1024 ? length-10*1024 : 0;
+    uint64_t earliest=awTimeline.lastStart+minimum;
+    uint64_t waitedAt=awdlNow();
+    while(!stopping && awTimeline.open && _fCommandGate &&
+          awdlNow()<earliest && earliest<=awTimeline.radioEnd) {
+        mtkawdl::Reservation live={};
+        if(!hal || !hal->awdlGrantSnapshot(live) || !live.granted ||
+           live.token!=awTimeline.token || live.channel!=awTimeline.active.channel ||
+           live.grantObservedAt!=awTimeline.grantObservedAt || live.deadline<earliest ||
+           awdlNow()>=live.deadline) break;
+        uint64_t observed=awdlNow();
+        if(observed>=earliest) break;
+        uint64_t remaining=earliest-observed;
+        if(remaining>10000) remaining=10000;
+        AbsoluteTime wake;
+        clock_interval_to_deadline(static_cast<unsigned>((remaining+999)/1000),kMillisecondScale,&wake);
+        IOReturn slept=_fCommandGate->commandSleep(&syncOwner,wake,THREAD_UNINT);
+        if(slept!=THREAD_AWAKENED && slept!=THREAD_TIMED_OUT) break;
+    }
+    uint64_t now=awdlNow();
+    setProperty("MTKAWDLDisableAWWaitUS",now-waitedAt,64);
+    if(awTimeline.open) notifyAvailabilityWindowEnd(now);
+}
 IOReturn AirportMtkAwdlInterface::setSyncInGate(bool value)
 {
     if(stopping || !hal || !timer || !_fCommandGate) return kIOReturnNotReady;
@@ -537,12 +567,11 @@ IOReturn AirportMtkAwdlInterface::setSyncInGate(bool value)
     setProperty("MTKAWDLSyncTransition",value ? "enabling" : "disabling");
     if(!value) {
         enabled=false;
-        state.discardControls();
-        state.holdClock(0);
-        if(awTimeline.open) notifyAvailabilityWindowEnd(awdlNow());
+        finishAvailabilityWindowForDisable();
+        state.discardControls(); state.holdClock(0);
         awTimeline.reset(); drainCompletions();
     }
-    IOReturn status=hal->awdlEnable(state.mac,value);
+    IOReturn status=stopping ? kIOReturnNotReady : hal->awdlEnable(state.mac,value);
     if(stopping) status=kIOReturnNotReady;
     if(status==kIOReturnSuccess) enabled=value;
     if(!enabled) {
@@ -696,6 +725,8 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLClockHoldoverTransitions",state.nativeHoldoverTransitions,64);
     setProperty("MTKAWDLNativeParentSelected",state.nativeParentSelected);
     setProperty("MTKAWDLSelectedClockValidated",state.nativeClockValidated);
+    setProperty("MTKAWDLClockAcquisitionPending",state.nativeClockAcquisitionPending);
+    setProperty("MTKAWDLClockAcquisitions",state.nativeClockAcquisitions,64);
     setProperty("MTKAWDLClockParent",state.clockParent,6);
     setProperty("MTKAWDLSelectedParent",state.nativeParent,6);
     setProperty("MTKAWDLSelectedPeerLive",state.synchronized && !state.nativeClockHoldover);
@@ -925,7 +956,7 @@ void AirportMtkAwdlInterface::serviceInGate()
         // Accepted response latency is measured from submission, independently
         // of the preceding synchronous RLM wait.
         uint64_t need=uint64_t(grant.responseDelayUS)+reserveWaitUS+8000;
-        if(need>125000) need=125000;
+        if(need>mtkawdl::rocResponseTimeoutUs) need=mtkawdl::rocResponseTimeoutUs;
         if(need>reserveLeadUS) reserveLeadUS=static_cast<uint32_t>(need);
     }
     if(awTimeline.open && (!grant.granted || grant.channel!=awTimeline.active.channel ||
@@ -959,11 +990,14 @@ void AirportMtkAwdlInterface::serviceInGate()
                 timer->setTimeoutMS(1); return;
             }
             if(grant.granted && now<grant.deadline &&
-               (grant.channel==target.channel || grant.channel==channel)) {
+               ((grant.channel==channel && (!awTimeline.emitted || now>=awTimeline.active.end)) ||
+                (grant.channel==target.channel && requestedChannel==target.channel &&
+                 requestedWindow.start==target.start))) {
                 // Firmware may return a short grant. Replacing it each tick
                 // wastes usable RF time and invalidates delayed grant tokens.
-                // Keep its real lifetime; partial TX is handled below once
-                // past the start tolerance, without announcing a full AW.
+                // Keep a short grant submitted for this target, or usable
+                // current-slot RF time. An old grant ending in an idle gap
+                // must not delay the next reservation beyond its requestAt.
                 timer->setTimeoutMS(1); return;
             }
             if(plan.requestAt>now) {
@@ -1316,12 +1350,21 @@ IOReturn AirportMtkAwdlInterface::setAWDL_AWDL_ADVERTISERS(awdl_peer_advert_add 
                     bool changed=!state.nativeParentSelected || memcmp(state.nativeParent,sample.peer,6) ||
                         memcmp(state.master,a.master,6) || state.presence!=state.ownPresence ||
                         memcmp(&state.sequence,&state.ownSequence,sizeof(state.sequence));
-                    // A refreshed PSF from the same selected parent does not
-                    // revoke the radio grant when its clock estimate changes.
-                    auto &p=state.peers[peer]; p.advertisement=a; p.epoch=epoch; p.baseCounter=base;
-                    state.selectNativeParent(sample.peer); state.elect(now);
+                    // Native can replay a cached PSF after newer RX arrived.
+                    // Keep the newest observation of this same clock tree;
+                    // replacing only epoch but retaining the newer seen time
+                    // makes an old sample look fresh and reverses discipline.
+                    auto &p=state.peers[peer];
+                    if(p.seen<=sample.received || memcmp(p.advertisement.master,a.master,6)) {
+                        p.advertisement=a; p.epoch=epoch; p.baseCounter=base;
+                        p.seen=sample.received;
+                    }
+                    state.selectNativeParent(sample.peer,a.master); state.elect(now);
                     if(changed && enabled && !state.controlsHeld) {
                         hal->awdlAbort(); requestedChannel=grantedChannel=0;
+                        // No announced AW remains. The aborted reservation's
+                        // future edge must not hold acquisition of this parent.
+                        state.holdClock(0); state.elect(awdlNow());
                         nextAction=0; miCounterValid=false; timer->setTimeoutMS(1);
                     }
                     status=kIOReturnSuccess;

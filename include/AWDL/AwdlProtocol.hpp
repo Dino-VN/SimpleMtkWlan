@@ -236,9 +236,11 @@ struct State {
     // The selected clock survives opmode changes and temporary peer expiry.
     // Effective radio controls are a transaction applied between AW events.
     bool nativeClockSelected, nativeTimelineStarted, controlsHeld, controlsDirty;
-    bool nativeClockHoldover, nativeClockValidated;
-    uint64_t nativeHoldoverTransitions;
+    bool nativeClockHoldover, nativeClockValidated, nativeClockAcquisitionPending;
+    uint64_t nativeHoldoverTransitions, nativeClockAcquisitions;
     uint8_t clockParent[6], clockRoot[6];
+    uint8_t acquisitionParent[6], acquisitionRoot[6];
+    bool acquisitionRootKnown;
     uint64_t controlsDeferred;
     struct Controls {
         Sequence sequence;
@@ -255,8 +257,15 @@ struct State {
     }
     void discardControls() { controlsHeld=controlsDirty=false; }
     uint8_t requestedRole() const { return controlsHeld ? pendingControls.role : syncRole; }
-    void selectNativeParent(const uint8_t *address) {
+    void selectNativeParent(const uint8_t *address,const uint8_t *root=nullptr) {
         nativeElectionManaged=true;
+        // Only an explicit native selection authorizes acquiring another AW
+        // namespace. Ordinary RX from an already selected peer remains a
+        // bounded drift observation, even if it carries a discontinuous clock.
+        nativeClockAcquisitionPending=!nativeClockSelected || memcmp(clockParent,address,6) ||
+            (root && memcmp(clockRoot,root,6));
+        memcpy(acquisitionParent,address,6); acquisitionRootKnown=root!=nullptr;
+        if(root) memcpy(acquisitionRoot,root,6);
         if(controlsHeld) {
             if(!pendingControls.parentSelected || memcmp(pendingControls.parent,address,6)) {
                 memcpy(pendingControls.parent,address,6); pendingControls.parentSelected=true;
@@ -426,6 +435,17 @@ struct State {
         bool sameClock=nativeElectionManaged ? nativeClockSelected &&
             !memcmp(clockParent,p.mac,6) && !memcmp(clockRoot,p.advertisement.master,6) :
             synchronized && !memcmp(sync,p.mac,6) && !memcmp(master,p.advertisement.master,6);
+        // A native selection authorizes this parent/root only. RX arriving
+        // while the old AW closes cannot substitute an unrelated clock tree.
+        if(nativeElectionManaged && nativeClockAcquisitionPending &&
+           (memcmp(acquisitionParent,p.mac,6) ||
+            (acquisitionRootKnown && memcmp(acquisitionRoot,p.advertisement.master,6)))) return;
+        bool adopt=!nativeElectionManaged || nativeClockAcquisitionPending ||
+            (!nativeClockSelected && !nativeTimelineStarted);
+        if(adopt && nativeElectionManaged && now<clockHoldUntil) {
+            if(p.seen>clockDeferredAt) { clockDeferredAt=p.seen; ++clockDeferred; }
+            return;
+        }
         nativeClockHoldover=false; synchronized=true;
         memcpy(master,p.advertisement.master,6);
         memcpy(sync,p.mac,6);
@@ -436,18 +456,20 @@ struct State {
         presence=nativeElectionManaged ? ownPresence : p.advertisement.presence;
         masterMetric=p.advertisement.metric; masterCounter=p.advertisement.masterCounter;
         distance=p.advertisement.distance+1;
-        bool adopt=!nativeElectionManaged || (!nativeClockSelected && !nativeTimelineStarted);
         if(nativeElectionManaged && !sameClock) {
             nativeClockSelected=true; nativeClockValidated=false; memcpy(clockParent,p.mac,6);
             memcpy(clockRoot,p.advertisement.master,6);
         }
         if(adopt) {
             holdClock(0);
-            // Initial native selection before any AW may adopt its counter.
-            // Once announced, even a different parent is a bounded clock
-            // observation; no event-only renumbering can preserve RF sync.
+            // Native programChipWithNewMaster supplies a real selected-peer
+            // counter/down/timestamp. Acquire that shared event/wire clock at
+            // a safe edge, including when local warmup AWs already ran.
             epoch=p.epoch; baseCounter=p.baseCounter; clockSampleAt=p.seen;
-            if(nativeElectionManaged) nativeClockValidated=true;
+            if(nativeElectionManaged) {
+                nativeClockValidated=true; nativeClockAcquisitionPending=false;
+                ++nativeClockAcquisitions;
+            }
         } else if(!sameClock || p.seen>clockSampleAt) {
             uint64_t local=now>=epoch ? now-epoch : 0;
             uint64_t remote=now>=p.epoch ? now-p.epoch : 0;

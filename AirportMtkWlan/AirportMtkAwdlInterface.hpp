@@ -168,6 +168,7 @@ private:
     uint64_t miStart = 0, miSubmitted = 0, miFailed = 0;
     uint16_t miCounter = 0; bool miCounterValid = false;
     mtkawdl::Timeline awTimeline;
+    void finishAvailabilityWindowForDisable();
     mtkawdl::Window requestedWindow={};
     struct NativePeerSample {
         mtkawdl::Advertisement advertisement;

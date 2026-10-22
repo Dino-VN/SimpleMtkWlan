@@ -260,6 +260,42 @@ int main(){
  }
  assert(lead.awTimeline.starts==4&&lead.awTimeline.ends==3&&lead.radio.reserves==4);
 
+ // A live grant ending in the idle gap cannot cover the next same-channel
+ // AW. Renew at its preparation edge instead of waiting for old expiry.
+ AirportMtkAwdlInterface idleRenew;init(idleRenew);idleRenew.radio.give(2,6,100);
+ for(unsigned i=0;i<16;++i)
+  idleRenew.state.sequence.channels[i]=idleRenew.state.ownSequence.channels[i]=(i==0||i==2?6:0);
+ uint64_t renewDue=0;uint8_t renewToken=2;
+ idleRenew.radio.onReserve=[&]{idleRenew.radio.grant.request(++renewToken,6,clockUS);renewDue=clockUS+45000;};
+ for(unsigned i=0;i<200;++i){
+  if(idleRenew.radio.grant.pending&&clockUS>=renewDue)
+   assert(idleRenew.radio.grant.grant(renewToken,6,idleRenew.radio.duration,clockUS));
+  idleRenew.serviceInGate();clockUS+=1000;
+ }
+ assert(idleRenew.awTimeline.starts==2&&idleRenew.awTimeline.ends==2&&idleRenew.radio.reserves==1);
+
+ // Observed firmware latency can be 500ms. A 590ms idle gap can cover it,
+ // but the old 125ms lead cap unnecessarily misses the following 44 AW.
+ AirportMtkAwdlInterface longLead;init(longLead);longLead.radio.grant.cancel();
+ for(unsigned i=0;i<16;++i)
+  longLead.state.sequence.channels[i]=longLead.state.ownSequence.channels[i]=(i==0?6:i==10?44:0);
+ uint64_t longDue=0;uint8_t longToken=1;
+ longLead.radio.onReserve=[&]{longLead.radio.grant.request(++longToken,longLead.radio.requested,clockUS);
+  longDue=clockUS+(longLead.radio.requested==44?500000:3000);};
+ // A real earlier response supplies the measured latency for adaptation.
+ clockUS+=70000;longLead.radio.grant.request(++longToken,6,clockUS-500000);
+ assert(longLead.radio.grant.grant(longToken,6,10,clockUS));
+ uint64_t longEnd=1000000+12*4*mtkawdl::awUs;
+ while(clockUS<longEnd){
+  if(longLead.radio.grant.pending&&clockUS>=longDue)
+   assert(longLead.radio.grant.grant(longToken,longLead.radio.requested,longLead.radio.duration,clockUS));
+  longLead.serviceInGate();clockUS+=longLead.t.us+250;
+ }
+ fprintf(stderr,"long-latency lead=%u starts=%llu ends=%llu\n",longLead.reserveLeadUS,
+  (unsigned long long)longLead.awTimeline.starts,(unsigned long long)longLead.awTimeline.ends);
+ assert(longLead.reserveLeadUS>=508000&&longLead.awTimeline.starts==1&&longLead.awTimeline.ends==1);
+ assert(mtkawdl::le32(longLead.events[0].bytes.data()+28)==44);
+
  // The sparse native schedule needs enough lead for off-channel arbitration.
  // Model 45ms grants: requests issued 25ms before an edge miss every active
  // off-channel start while immediate home-channel grants conceal the problem.
@@ -376,14 +412,17 @@ int main(){
  const uint8_t missingMac[]={2,1,2,3,4,8};missingParent.selectNativeParent(missingMac);
  missingParent.elect(clockUS);assert(!missingParent.radioScheduleReady()&&!missingParent.channel(clockUS));
  assert(!mtkawdl::buildAction(missingParent,holdFrame,sizeof(holdFrame),clockUS));
- // Observing a new parent with an incompatible counter does not validate
- // its clock or grant permission to enter holdover when that peer expires.
+ // Explicitly selecting a new parent authorizes its distinct AW namespace.
+ // Once acquired, normal fresh discontinuities still cannot rebase it.
  auto &incompatible=missingParent.peers[2];incompatible.used=true;incompatible.seen=clockUS;
  incompatible.epoch=clockUS;incompatible.baseCounter=10000;
  memcpy(incompatible.mac,missingMac,6);memcpy(incompatible.advertisement.master,missingMac,6);
- missingParent.elect(clockUS);assert(missingParent.clockRejected&&!missingParent.nativeClockValidated);
- missingParent.elect(clockUS+mtkawdl::peerLifetimeUs+1);
- assert(!missingParent.nativeClockHoldover&&!missingParent.radioScheduleReady());
+ missingParent.holdClock(0);missingParent.elect(clockUS);
+ assert(missingParent.nativeClockValidated&&missingParent.counter(clockUS)==10000);
+ incompatible.seen=clockUS+1;incompatible.baseCounter+=64;
+ missingParent.elect(clockUS+1);assert(missingParent.clockRejected);
+ missingParent.elect(clockUS+mtkawdl::peerLifetimeUs+2);
+ assert(missingParent.nativeClockHoldover&&missingParent.radioScheduleReady());
  // Non-election master wins even if a previously selected peer is live.
  mtkawdl::State ownMaster=holdover.state;ownMaster.discardControls();
  assert(ownMaster.setSyncRole(3,local));ownMaster.elect(clockUS);
@@ -652,16 +691,17 @@ int main(){
  newParent.onStart=nullptr;clockUS=parentEnd;newParent.serviceInGate();
  assert(newParent.events.size()>=2&&newParent.events[1].id==43&&newParent.state.nativeParentSelected);
  assert(mtkawdl::be32(newParent.events[1].bytes.data()+4)==parentEnd&&newParent.state.counter(clockUS)==4);
- // A parent with an unrelated counter does not reset an emitted host/wire
- // timeline. The discontinuity is rejected and remains observable.
+ // First native selection after warmup acquires the actual peer clock only
+ // after the old native end, then shares that counter with outgoing PSFs.
  AirportMtkAwdlInterface discontinuity;init(discontinuity);discontinuity.state.nativeElectionManaged=true;
  discontinuity.serviceInGate();uint64_t discontinuityEnd=discontinuity.awTimeline.radioEnd;
  clockUS+=10000;auto &foreign=discontinuity.state.peers[0];foreign.used=true;foreign.seen=foreign.epoch=clockUS;
  foreign.baseCounter=23296;memcpy(foreign.mac,peer,6);memcpy(foreign.advertisement.master,peer,6);
  discontinuity.state.selectNativeParent(peer);discontinuity.state.elect(clockUS);
- uint16_t expectedCounter=discontinuity.state.counter(discontinuityEnd);
+ assert(discontinuity.state.counter(clockUS)==0&&!discontinuity.state.nativeClockValidated);
  clockUS=discontinuityEnd;discontinuity.serviceInGate();
- assert(discontinuity.state.counter(clockUS)==expectedCounter&&discontinuity.state.clockRejected==1);
+ assert(discontinuity.state.counter(clockUS)==23299&&!discontinuity.state.clockRejected);
+ assert(discontinuity.state.nativeClockValidated&&discontinuity.state.nativeClockAcquisitions==1);
  assert(discontinuity.events.size()>=2&&discontinuity.events[1].id==43&&
         mtkawdl::be32(discontinuity.events[1].bytes.data()+4)==discontinuityEnd);
  AirportMtkAwdlInterface endCallback;init(endCallback);endCallback.serviceInGate();
@@ -760,6 +800,25 @@ int main(){
  assert(selected.setAWDL_AWDL_ADVERTISERS(&advert)==0);
  assert(selected.awTimeline.open&&selected.radio.aborts==aborts&&selected.state.counter(clockUS)==hostCounter);
  assert(selected.state.clockRejected==0); // observation is consumed at AW end
+ // Cached native advertiser replay must not replace a newer same-tree PSF
+ // while retaining its newer timestamp. Keep the observation coherent.
+ AirportMtkAwdlInterface replay;init(replay);replay.state.nativeElectionManaged=true;
+ auto &replaySample=replay.nativePeerSamples[0];replaySample=sample;
+ replaySample.received=clockUS-10000;replaySample.advertisement.counter=4;
+ replaySample.advertisement.down=64;replaySample.advertisement.presence=4;
+ auto &newest=replay.state.peers[0];newest.used=true;newest.seen=clockUS;
+ newest.epoch=clockUS-20000;newest.baseCounter=18080;
+ newest.advertisement=replaySample.advertisement;newest.advertisement.counter=18081;
+ memcpy(newest.mac,peer,6);uint64_t newestEpoch=newest.epoch;
+ awdl_peer_advert_add replayAdvert=advert;mtkawdl::put16(replayAdvert.bytes,4);
+ mtkawdl::putBE32(replayAdvert.bytes+20,uint32_t(replaySample.received));
+ // The old local ROC was preparing a future edge. Native selection aborts
+ // that reservation and must clear its clock hold before acquiring the peer.
+ replay.state.holdClock(clockUS+200000);replay.radio.grant.request(10,6,clockUS);
+ assert(!replay.setAWDL_AWDL_ADVERTISERS(&replayAdvert));
+ assert(newest.seen==clockUS&&newest.epoch==newestEpoch&&newest.baseCounter==18080);
+ assert(replay.state.nativeClockValidated&&replay.state.counter(clockUS)==18081);
+ assert(!replay.state.clockHoldUntil&&!replay.state.nativeClockAcquisitionPending);
  // A fresh selected-parent PSF can arrive while the synchronous RLM wait
  // releases the gate, then again while ROC is pending and during the AW.
  // Keep the radio clock AND outgoing synchronization TLV on one timeline.

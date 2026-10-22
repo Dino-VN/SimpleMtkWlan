@@ -199,6 +199,7 @@ struct AirportMtkAwdlInterface:NativeProtocol {
  IOReturn setMacAddress(ether_addr&) override;ether_addr getSelfMacAddr() override;
  unsigned queueHead=0,requestedChannel=0,grantedChannel=0;uint64_t nextAction=0,requestDeadline=0;mbuf_t queue[64]={};
  unsigned refs=1;void retain(){++refs;} void release() override {if(!--refs)delete this;} IOReturn setSync(bool);IOReturn setSyncInGate(bool);static IOReturn syncGated(OSObject*,void*,void*,void*,void*);
+ void finishAvailabilityWindowForDisable(){if(awTimeline.open)notifyAvailabilityWindowEnd(awdlNow());}
  uint64_t nativeTx=0,nativeRx=0,nativeDrops=0;Timer clock;Timer *timer=&clock;
  ~AirportMtkAwdlInterface(){releaseDataPath();assert(!nativeStarted);}
  static bool nativeDataPathAvailable(){return true;}

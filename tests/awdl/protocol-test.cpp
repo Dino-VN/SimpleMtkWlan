@@ -164,12 +164,44 @@ static void nativeClockTests()
         assert(clock.counter(now)==before);
         assert(clock.setSyncRole(2,remote));clock.elect(now+1);
         assert(clock.counter(now+1)==before&&clock.clockRejected==1);
-        // A new selected parent can arrive with an unrelated AW namespace.
-        // An already announced timeline cannot jump to its counter.
+        // An explicit new native selection supplies another AW namespace.
+        // Acquire it at the safe edge instead of rejecting it forever.
         uint8_t other[6]={2,9,8,7,6,5};
         memcpy(parent.mac,other,6);memcpy(parent.advertisement.master,other,6);
         parent.seen=now+2;clock.nativeTimelineStarted=true;clock.selectNativeParent(other);
-        clock.elect(now+2);assert(clock.counter(now+2)==before&&clock.clockRejected==2);
+        clock.elect(now+2);assert(clock.counter(now+2)==224&&clock.clockRejected==1);
+        assert(clock.nativeClockValidated&&clock.nativeClockAcquisitions==2);
+    }
+    // Local warmup AWs must not prevent the first real native clock selection.
+    for(uint16_t peerBase:{uint16_t(18080),uint16_t(65532)}) {
+        State warm;warm.init(local,1000000);warm.nativeTimelineStarted=true;
+        warm.nativeElectionManaged=true;warm.holdClock(1065536);
+        auto &p=warm.peers[0];p.used=true;p.seen=p.epoch=1012000;p.baseCounter=peerBase;
+        memcpy(p.mac,remote,6);memcpy(p.advertisement.master,remote,6);
+        warm.selectNativeParent(remote,remote);warm.elect(1012000);
+        assert(warm.counter(1012000)==0&&!warm.nativeClockValidated);
+        assert(warm.nativeClockAcquisitionPending&&warm.clockDeferred==1);
+        warm.holdClock(0);warm.elect(1065536);
+        assert(warm.counter(1065536)==uint16_t(peerBase+3));
+        assert(warm.nativeClockValidated&&warm.nativeClockAcquisitions==1&&!warm.clockRejected);
+        uint64_t acquiredEpoch=warm.epoch;
+        p.baseCounter+=64;p.seen=1065537;
+        warm.elect(p.seen);assert(warm.clockRejected==1&&warm.epoch==acquiredEpoch);
+        warm.selectNativeParent(remote,remote);warm.elect(p.seen+1);
+        assert(warm.nativeClockAcquisitions==1&&warm.clockRejected==1);
+        uint8_t newRoot[6]={2,9,8,7,6,4};memcpy(p.advertisement.master,newRoot,6);
+        warm.selectNativeParent(remote,newRoot);warm.elect(p.seen+2);
+        assert(warm.nativeClockAcquisitions==2&&warm.nativeClockValidated);
+        // A different root arriving during deferred acquisition is not the
+        // clock selected by native. Wait for its selected tree, or cancellation.
+        uint8_t thirdRoot[6]={2,9,8,7,6,3};
+        warm.holdClock(1200000);warm.selectNativeParent(remote,thirdRoot);
+        uint64_t heldEpoch=warm.epoch;memcpy(p.advertisement.master,thirdRoot,6);
+        warm.elect(1100000);assert(warm.epoch==heldEpoch&&warm.nativeClockAcquisitionPending);
+        memcpy(p.advertisement.master,newRoot,6);warm.elect(1200000);
+        assert(warm.epoch==heldEpoch&&warm.nativeClockAcquisitions==2);
+        warm.selectNativeParent(remote,newRoot);warm.elect(1200001);
+        assert(!warm.nativeClockAcquisitionPending&&warm.nativeClockAcquisitions==2);
     }
 }
 static void templateTests()
