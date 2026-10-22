@@ -418,6 +418,11 @@ struct mwx_softc {
     uint64_t sc_awdl_roc_grant_delay_us, sc_awdl_roc_max_grant_delay_us;
     uint64_t sc_awdl_roc_submitted, sc_awdl_roc_send_failed;
     uint64_t sc_awdl_roc_scan_blocked, sc_awdl_roc_busy_blocked;
+    uint64_t sc_awdl_roc_timeouts;
+    uint64_t sc_awdl_roc_reasons[static_cast<unsigned>(mtkawdl::RocResult::Count)];
+    mtkawdl::RocGrant sc_awdl_roc_last_event;
+    mtkawdl::RocResult sc_awdl_roc_last_result;
+    uint64_t sc_awdl_roc_last_event_us, sc_awdl_roc_last_response_us;
     uint64_t sc_awdl_tx_submitted, sc_awdl_tx_bad_frame, sc_awdl_tx_no_grant;
     uint64_t sc_awdl_tx_busy, sc_awdl_tx_no_peer, sc_awdl_tx_backpressure;
     uint64_t sc_awdl_tx_copy_failed, sc_awdl_tx_dma_failed;
@@ -3728,6 +3733,28 @@ mwx_mcu_send_mbuf_wait(struct mwx_softc *sc, uint32_t cmd, struct mbuf *m)
 	return mwx_mcu_wait_resp_int(sc, cmd, seq, NULL);
 }
 
+static void mwx_awdl_roc_event(mwx_softc *sc,const uint8_t *p,size_t n,uint64_t now)
+{
+    if(!sc->sc_awdl_lock) return;
+    IOLockLock(sc->sc_awdl_lock);
+    ++sc->sc_awdl_roc_events;
+    sc->sc_awdl_roc_last_event_us=now;
+    sc->sc_awdl_roc_last_response_us=sc->sc_awdl_roc.pending && now>=sc->sc_awdl_roc.requestedAt ?
+        now-sc->sc_awdl_roc.requestedAt : 0;
+    bool enabled=sc->sc_awdl_enabled && !sc->sc_awdl_stopping && !sc->sc_resetting && !sc->sc_detaching;
+    mtkawdl::RocResult result=mtkawdl::receiveRocGrant(sc->sc_awdl_roc,p,n,
+        sc->sc_awdl_vif.idx,enabled,now,sc->sc_awdl_roc_last_event);
+    sc->sc_awdl_roc_last_result=result;
+    ++sc->sc_awdl_roc_reasons[static_cast<unsigned>(result)];
+    if(result==mtkawdl::RocResult::Accepted) {
+        ++sc->sc_awdl_roc_grants;
+        sc->sc_awdl_roc_grant_delay_us=sc->sc_awdl_roc.responseDelayUS;
+        if(sc->sc_awdl_roc_grant_delay_us>sc->sc_awdl_roc_max_grant_delay_us)
+            sc->sc_awdl_roc_max_grant_delay_us=sc->sc_awdl_roc_grant_delay_us;
+    } else ++sc->sc_awdl_roc_rejected;
+    IOLockUnlock(sc->sc_awdl_lock);
+}
+
 void
 mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 {
@@ -3764,27 +3791,8 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 	sc->sc_mcu_events++;
 	sc->sc_last_mcu_eid = rxd_eid;
     if ((rxd_option & MCU_UNI_CMD_UNSOLICITED_EVENT) && rxd_eid == MCU_UNI_EVENT_ROC) {
-        // Unified event header (4 bytes), then a 20-byte grant TLV.
-        const uint8_t *p=mtod(m,const uint8_t *);
-        if(sc->sc_awdl_lock) {
-            uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
-            IOLockLock(sc->sc_awdl_lock);
-            ++sc->sc_awdl_roc_events;
-            uint64_t requestedAt=sc->sc_awdl_roc.pending && sc->sc_awdl_roc.deadline>=100000 ?
-                sc->sc_awdl_roc.deadline-100000 : ns/1000;
-            // Linux v6.17 mt7921_roc_grant_tlv: 20-byte TLV; ROC reqtype=1.
-            bool accepted=mbuf_len(m)>=24 && mtkawdl::le16(p+4)==0 &&
-                mtkawdl::le16(p+6)==20 && p[8]==sc->sc_awdl_vif.idx && p[10]==0 && p[17]==1 &&
-                sc->sc_awdl_enabled && !sc->sc_awdl_stopping && !sc->sc_resetting && !sc->sc_detaching &&
-                sc->sc_awdl_roc.grant(p[9],p[11],mtkawdl::le32(p+20),ns/1000);
-            if(accepted) {
-                ++sc->sc_awdl_roc_grants;
-                sc->sc_awdl_roc_grant_delay_us=ns/1000-requestedAt;
-                if(sc->sc_awdl_roc_grant_delay_us>sc->sc_awdl_roc_max_grant_delay_us)
-                    sc->sc_awdl_roc_max_grant_delay_us=sc->sc_awdl_roc_grant_delay_us;
-            } else ++sc->sc_awdl_roc_rejected;
-            IOLockUnlock(sc->sc_awdl_lock);
-        }
+        uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+        mwx_awdl_roc_event(sc,mtod(m,const uint8_t *),mbuf_len(m),ns/1000);
         m_freem(m); return;
     }
 
@@ -8677,6 +8685,8 @@ static void mwx_awdl_abort(mwx_softc *sc)
 {
     IOLockLock(sc->sc_awdl_lock);
     bool reserved=sc->sc_awdl_roc.pending || sc->sc_awdl_roc.granted;
+    if(sc->sc_awdl_roc.pending && mwx_awdl_now()>=sc->sc_awdl_roc.deadline)
+        ++sc->sc_awdl_roc_timeouts;
     uint8_t token=sc->sc_awdl_roc.token;
     sc->sc_awdl_roc.cancel();
     IOLockUnlock(sc->sc_awdl_lock);
@@ -8929,10 +8939,10 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
     // response window, including after disable/enable or a reset.
     uint64_t now=mwx_awdl_now();
     for(unsigned i=0;i<255 && com->sc_awdl_token_used[token] &&
-        now-com->sc_awdl_token_used[token]<1000000;++i) {
+        now-com->sc_awdl_token_used[token]<mtkawdl::rocTokenQuarantineUs;++i) {
         if(++token==0) token=1;
     }
-    if(com->sc_awdl_token_used[token] && now-com->sc_awdl_token_used[token]<1000000)
+    if(com->sc_awdl_token_used[token] && now-com->sc_awdl_token_used[token]<mtkawdl::rocTokenQuarantineUs)
         return kIOReturnBusy;
     uint8_t request[28]={};
     mtkawdl::put16(request+6,24);
@@ -9003,6 +9013,12 @@ void MtkMwx::awdlPublishDiagnostics()
     bool pending=com->sc_awdl_roc.pending;
     mtkawdl::Reservation radio=com->sc_awdl_roc;
     uint64_t delay=com->sc_awdl_roc_grant_delay_us, maxDelay=com->sc_awdl_roc_max_grant_delay_us;
+    uint64_t reasons[static_cast<unsigned>(mtkawdl::RocResult::Count)];
+    memcpy(reasons,com->sc_awdl_roc_reasons,sizeof(reasons));
+    mtkawdl::RocGrant last=com->sc_awdl_roc_last_event;
+    unsigned lastResult=static_cast<unsigned>(com->sc_awdl_roc_last_result);
+    uint64_t lastAt=com->sc_awdl_roc_last_event_us, response=com->sc_awdl_roc_last_response_us;
+    uint64_t timeouts=com->sc_awdl_roc_timeouts;
     IOLockUnlock(com->sc_awdl_lock);
     // Publish outside the receive lock; called at most once per second.
     mwxController()->setProperty("MTKAWDLROCEvents",events,64);
@@ -9016,6 +9032,25 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKAWDLROCDeadlineUS",radio.deadline,64);
     mwxController()->setProperty("MTKAWDLROCGrantDelayUS",delay,64);
     mwxController()->setProperty("MTKAWDLROCMaxGrantDelayUS",maxDelay,64);
+    static const char *const names[]={"Accepted","Malformed","NoGrant","WrongBss",
+        "FirmwareStatus","WrongType","Disabled","NotPending","Token","Channel","Late","Duration"};
+    static_assert(sizeof(names)/sizeof(names[0])==static_cast<unsigned>(mtkawdl::RocResult::Count),"ROC reason names");
+    for(unsigned i=1;i<static_cast<unsigned>(mtkawdl::RocResult::Count);++i) {
+        char property[64]; snprintf(property,sizeof(property),"MTKAWDLROCReject%s",names[i]);
+        mwxController()->setProperty(property,reasons[i],64);
+    }
+    mwxController()->setProperty("MTKAWDLROCLastResult",events ? names[lastResult] : "None");
+    mwxController()->setProperty("MTKAWDLROCResponseTimeouts",timeouts,64);
+    mwxController()->setProperty("MTKAWDLROCLastEventUS",lastAt,64);
+    mwxController()->setProperty("MTKAWDLROCLastResponseUS",response,64);
+    mwxController()->setProperty("MTKAWDLROCLastBss",static_cast<uint64_t>(last.bss),32);
+    mwxController()->setProperty("MTKAWDLROCLastToken",static_cast<uint64_t>(last.token),32);
+    mwxController()->setProperty("MTKAWDLROCLastChannel",static_cast<uint64_t>(last.channel),32);
+    mwxController()->setProperty("MTKAWDLROCLastFirmwareStatus",static_cast<uint64_t>(last.status),32);
+    mwxController()->setProperty("MTKAWDLROCLastRequestType",static_cast<uint64_t>(last.requestType),32);
+    mwxController()->setProperty("MTKAWDLROCLastDurationMS",static_cast<uint64_t>(last.durationMs),32);
+    mwxController()->setProperty("MTKAWDLROCRequestedAtUS",radio.requestedAt,64);
+    mwxController()->setProperty("MTKAWDLROCResponseTimeoutUS",static_cast<uint64_t>(mtkawdl::rocResponseTimeoutUs),32);
     mwxController()->setProperty("MTKAWDLROCSubmitted",com->sc_awdl_roc_submitted,64);
     mwxController()->setProperty("MTKAWDLROCSendFailed",com->sc_awdl_roc_send_failed,64);
     mwxController()->setProperty("MTKAWDLROCScanBlocked",com->sc_awdl_roc_scan_blocked,64);

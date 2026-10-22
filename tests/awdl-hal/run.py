@@ -77,6 +77,12 @@ struct mwx_softc {
  mwx_vif sc_awdl_vif; mwx_node sc_awdl_peers[3];bool sc_awdl_peer_used[3],sc_awdl_station_pending[4];
  mtkawdl::Reservation sc_awdl_roc;uint8_t sc_awdl_address[6];
  uint64_t sc_awdl_roc_submitted=0,sc_awdl_roc_send_failed=0,sc_awdl_roc_scan_blocked=0,sc_awdl_roc_busy_blocked=0;
+ uint64_t sc_awdl_roc_events=0,sc_awdl_roc_grants=0,sc_awdl_roc_rejected=0,
+ sc_awdl_roc_grant_delay_us=0,sc_awdl_roc_max_grant_delay_us=0;
+ uint64_t sc_awdl_roc_timeouts=0;
+ uint64_t sc_awdl_roc_reasons[static_cast<unsigned>(mtkawdl::RocResult::Count)]{};
+ mtkawdl::RocGrant sc_awdl_roc_last_event{};mtkawdl::RocResult sc_awdl_roc_last_result{};
+ uint64_t sc_awdl_roc_last_event_us=0,sc_awdl_roc_last_response_us=0;
  uint64_t sc_awdl_tx_submitted=0,sc_awdl_tx_bad_frame=0,sc_awdl_tx_no_grant=0,sc_awdl_tx_busy=0,
  sc_awdl_tx_no_peer=0,sc_awdl_tx_backpressure=0,sc_awdl_tx_copy_failed=0,sc_awdl_tx_dma_failed=0;
  int sc_awdl_tx_errno=0;
@@ -140,7 +146,7 @@ void task_add(int,int*){++scan_tasks;}
 class MtkMwx {public:mwx_softc *com;MtkMwx *mwxController(){return this;}void setProperty(const char*,const char*){}void setProperty(const char*,uint64_t,unsigned){}bool awdlChannelAllowed(uint8_t);void awdlAbort();IOReturn awdlPrepareChannel(uint8_t);IOReturn awdlEnable(const uint8_t*,bool);IOReturn awdlReserve(uint8_t,uint32_t);bool awdlCanTransmit(uint8_t);IOReturn awdlPeer(const uint8_t*,bool);IOReturn awdlTransmit(mbuf_t,uint8_t);IOReturn awdlTryTransmit(mbuf_t*,uint8_t);};
 '''+structs+r'''
 mbuf*mwx_fill_sta_req_hdr(mbuf*m,mwx_vif*v,uint8_t omac,uint16_t wcid,uint16_t count){auto*p=(sta_req_hdr*)m->bytes;p->bss_idx=v->idx;p->wlan_idx_lo=wcid;p->wlan_idx_hi=wcid>>8;p->tlv_num=count;p->is_tlv_append=1;p->muar_idx=omac;return m;}
-'''+helpers+'\n'+function('static void mwx_awdl_strip_deaggregate(')+'\n'+function('bool MtkMwx::awdlChannelAllowed(')+'\n'+function('static void mwx_awdl_abort(')+'\n'+function('void MtkMwx::awdlAbort(')+'\n'+function('static int mwx_awdl_remove_station(')+'\n'+function('static int mwx_awdl_remove_context(mwx_softc')+'\n'+function('IOReturn MtkMwx::awdlEnable(')+'\n'+function('IOReturn MtkMwx::awdlPrepareChannel(')+'\n'+function('IOReturn MtkMwx::awdlReserve(')+'\n'+function('bool MtkMwx::awdlCanTransmit(')+'\n'+function('IOReturn MtkMwx::awdlPeer(')+'\n'+function('IOReturn MtkMwx::awdlTransmit(')+'\n'+function('IOReturn MtkMwx::awdlTryTransmit(')+r'''
+'''+helpers+'\n'+function('static void mwx_awdl_roc_event(')+'\n'+function('static void mwx_awdl_strip_deaggregate(')+'\n'+function('bool MtkMwx::awdlChannelAllowed(')+'\n'+function('static void mwx_awdl_abort(')+'\n'+function('void MtkMwx::awdlAbort(')+'\n'+function('static int mwx_awdl_remove_station(')+'\n'+function('static int mwx_awdl_remove_context(mwx_softc')+'\n'+function('IOReturn MtkMwx::awdlEnable(')+'\n'+function('IOReturn MtkMwx::awdlPrepareChannel(')+'\n'+function('IOReturn MtkMwx::awdlReserve(')+'\n'+function('bool MtkMwx::awdlCanTransmit(')+'\n'+function('IOReturn MtkMwx::awdlPeer(')+'\n'+function('IOReturn MtkMwx::awdlTransmit(')+'\n'+function('IOReturn MtkMwx::awdlTryTransmit(')+r'''
 IOLock lock;
 mwx_softc make(){mwx_softc sc{};sc.sc_awdl_lock=&lock;sc.sc_ic.ic_if.if_flags=1;sc.sc_capa={2,3};sc.sc_awdl_vif.idx=sc.sc_awdl_vif.omac_idx=1;sc.sc_awdl_vif.vif_mn.wcid=18;sc.sc_awdl_enabled=true;
  for(int ch:{6,44,149}){sc.sc_ic.ic_channels[ch].ic_freq=ch<=14?2407+ch*5:5000+ch*5;sc.sc_ic.ic_channels[ch].ic_flags=1;sc.sc_ic.ic_chan_active[ch/8]|=1U<<(ch%8);sc.sc_ic.ic_chan_avail[ch/8]|=1U<<(ch%8);}return sc;}
@@ -154,6 +160,53 @@ int main(){
  assert(!memcmp(mtod(&rx,uint8_t*),raw.bytes,26));
  rx=raw;rx.bytes[16]^=1;mwx_awdl_strip_deaggregate(&rx,3);assert(rx.offset==0);
  rx=raw;rx.len=50;mwx_awdl_strip_deaggregate(&rx,3);assert(rx.offset==0);
+
+ // Actual RX grant handler: exact Linux struct offsets and bounded framing,
+ // late responses, every rejection reason and unchanged state on rejection.
+ reset();auto events=make();
+ std::vector<uint8_t> event(24);mtkawdl::put16(event.data()+6,20);
+ event[8]=1;event[9]=7;event[11]=44;event[17]=1;mtkawdl::put32(event.data()+20,300);
+ auto reject=[&](const std::vector<uint8_t>&bytes,mtkawdl::RocResult reason,uint64_t at){
+  auto before=events.sc_awdl_roc;auto count=events.sc_awdl_roc_rejected;
+  mwx_awdl_roc_event(&events,bytes.data(),bytes.size(),at);
+  assert(events.sc_awdl_roc_last_result==reason&&events.sc_awdl_roc_rejected==count+1);
+  assert(!memcmp(&before,&events.sc_awdl_roc,sizeof(before)));
+  assert(events.sc_awdl_roc_reasons[static_cast<unsigned>(reason)]);
+ };
+ events.sc_awdl_roc.request(7,44,clock_us);
+ for(unsigned size=0;size<24;++size){auto truncated=event;truncated.resize(size);
+  reject(truncated,size==4?mtkawdl::RocResult::NoGrant:mtkawdl::RocResult::Malformed,clock_us+1000);}
+ for(unsigned len:{0,3,19,21,65535}){auto bad=event;mtkawdl::put16(bad.data()+6,len);
+  reject(bad,mtkawdl::RocResult::Malformed,clock_us+1000);}
+ auto bad=event;bad[4]=3;reject(bad,mtkawdl::RocResult::NoGrant,clock_us+1000);
+ bad=event;bad[8]=0;reject(bad,mtkawdl::RocResult::WrongBss,clock_us+1000);
+ bad=event;bad[10]=2;reject(bad,mtkawdl::RocResult::FirmwareStatus,clock_us+1000);
+ bad=event;bad[17]=0;reject(bad,mtkawdl::RocResult::WrongType,clock_us+1000);
+ bad=event;bad[9]=6;reject(bad,mtkawdl::RocResult::Token,clock_us+1000);
+ bad=event;bad[11]=6;reject(bad,mtkawdl::RocResult::Channel,clock_us+1000);
+ for(unsigned ms:{0,1101}){bad=event;mtkawdl::put32(bad.data()+20,ms);reject(bad,mtkawdl::RocResult::Duration,clock_us+1000);}
+ events.sc_awdl_enabled=false;reject(event,mtkawdl::RocResult::Disabled,clock_us+1000);events.sc_awdl_enabled=true;
+ for(bool*flag:{&events.sc_awdl_stopping,&events.sc_resetting,&events.sc_detaching}){
+  *flag=true;reject(event,mtkawdl::RocResult::Disabled,clock_us+1000);*flag=false;}
+ reject(event,mtkawdl::RocResult::Late,clock_us-1);
+ reject(event,mtkawdl::RocResult::Late,clock_us+mtkawdl::rocResponseTimeoutUs);
+ auto duplicate=event;duplicate.insert(duplicate.end(),event.begin()+4,event.end());
+ reject(duplicate,mtkawdl::RocResult::Malformed,clock_us+1000);
+ bad=event;bad.push_back(1);reject(bad,mtkawdl::RocResult::Malformed,clock_us+1000);
+ // Unknown bounded TLV before the grant is allowed. Arrival 504ms after
+ // submission matches the observed slow HAL scale and used to be rejected.
+ std::vector<uint8_t> extended(event.begin(),event.begin()+4);
+ extended.insert(extended.end(),{9,0,4,0});extended.insert(extended.end(),event.begin()+4,event.end());
+ mwx_awdl_roc_event(&events,extended.data(),extended.size(),clock_us+504334);
+ assert(events.sc_awdl_roc_last_result==mtkawdl::RocResult::Accepted&&events.sc_awdl_roc_grants==1);
+ assert(events.sc_awdl_roc_grant_delay_us==504334&&events.sc_awdl_roc_max_grant_delay_us==504334);
+ assert(events.sc_awdl_roc.deadline==clock_us+504334+300000);
+ reject(event,mtkawdl::RocResult::NotPending,clock_us+504335);
+ // Cancel/reissue never lets an old token become the new grant.
+ events.sc_awdl_roc.cancel();events.sc_awdl_roc.request(8,44,clock_us+600000);
+ reject(event,mtkawdl::RocResult::Token,clock_us+600001);
+ uint64_t total=0;for(auto count:events.sc_awdl_roc_reasons)total+=count;
+ assert(total==events.sc_awdl_roc_events&&total==events.sc_awdl_roc_grants+events.sc_awdl_roc_rejected);
  uint8_t addr[6]={2,1,2,3,4,5};
  reset();auto sc=make();MtkMwx hal{&sc};
  assert(hal.awdlPrepareChannel(6)==0&&commands.size()==1&&commands[0]==MCU_UNI_CMD_BSS_INFO_UPDATE&&!sc.sc_awdl_roc.pending);
@@ -196,7 +249,11 @@ int main(){
  assert(hal.awdlReserve(44,70)==kIOReturnAborted&&commands.size()==1&&!sc.sc_awdl_channel&&!sc.sc_awdl_roc.pending);
  // The request timeout starts after the synchronous RLM response.
  reset();sc=make();on_wait=[](mwx_softc*){if(commands.back()==MCU_UNI_CMD_BSS_INFO_UPDATE)clock_us+=45000;};
- assert(hal.awdlReserve(44,70)==0&&sc.sc_awdl_roc.deadline==245000);
+ assert(hal.awdlReserve(44,70)==0&&sc.sc_awdl_roc.requestedAt==145000&&sc.sc_awdl_roc.deadline==145000+mtkawdl::rocResponseTimeoutUs);
+ // An unanswered request expires once. Deadline and pending grant stay
+ // distinct from physical dwell; aborting an already cleared token is idle.
+ clock_us=sc.sc_awdl_roc.deadline;hal.awdlAbort();assert(sc.sc_awdl_roc_timeouts==1&&!sc.sc_awdl_roc.pending);
+ hal.awdlAbort();assert(sc.sc_awdl_roc_timeouts==1);
  reset();sc=make();assert(hal.awdlReserve(6,mtkawdl::maxRocMs)==0);
  assert(mtkawdl::le32(wire.back().data()+20)==1100);
  assert(!sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,6,1101,clock_us));
@@ -212,7 +269,7 @@ int main(){
  sc.sc_awdl_busy=true;memcpy(sc.sc_awdl_address,addr,6);auto before=commands.size();assert(hal.awdlEnable(addr,true)==0&&commands.size()==before);uint8_t other[6]={2,8,7,6,5,4};assert(hal.awdlEnable(other,true)==kIOReturnBusy);sc.sc_awdl_busy=false;
  reset();sc=make();fail_at=1;assert(hal.awdlReserve(6,30)==kIOReturnIOError&&commands.size()==1&&!sc.sc_awdl_roc.pending);
  reset();sc=make();on_wait=[](mwx_softc*s){++s->sc_awdl_epoch;s->sc_awdl_stopping=true;};assert(hal.awdlReserve(6,30)==kIOReturnAborted&&commands.size()==1&&!sc.sc_awdl_roc.pending&&!sc.sc_awdl_busy);
- reset();sc=make();sc.sc_awdl_channel=6;for(int i=1;i<256;i++)sc.sc_awdl_token_used[i]=clock_us;assert(hal.awdlReserve(6,30)==kIOReturnBusy&&commands.empty());clock_us+=1000001;assert(hal.awdlReserve(6,30)==0);
+ reset();sc=make();sc.sc_awdl_channel=6;for(int i=1;i<256;i++)sc.sc_awdl_token_used[i]=clock_us;assert(hal.awdlReserve(6,30)==kIOReturnBusy&&commands.empty());clock_us+=mtkawdl::rocTokenQuarantineUs+1;assert(hal.awdlReserve(6,30)==0);
  reset();sc=make();assert(hal.awdlPeer(addr,true)==0);assert(sc.sc_awdl_peers[0].wcid==15&&sc.sc_awdl_peer_used[0]);auto&peer=wire[0];assert(peer.size()==80&&peer[1]==15&&peer[5]==1);assert(mtkawdl::le32(peer.data()+12)==(STA_TYPE_STA|NETWORK_P2P));assert(mtkawdl::le16(peer.data()+30)==52);assert(peer[78]==1);assert(!memcmp(peer.data()+20,addr,6));
  auto*alias=sc.sc_awdl_peers[0].ni.ni_macaddr;assert(hal.awdlPeer(alias,false)==0&&!sc.sc_awdl_peer_used[0]);assert(!memcmp(wire.back().data()+20,addr,6));uint8_t zero[6]={};assert(!memcmp(sc.sc_awdl_peers[0].ni.ni_macaddr,zero,6));
  for(int i=0;i<3;i++){addr[5]=i;assert(hal.awdlPeer(addr,true)==0&&sc.sc_awdl_peers[i].wcid==15+i);}addr[5]=4;assert(hal.awdlPeer(addr,true)==kIOReturnNoResources);

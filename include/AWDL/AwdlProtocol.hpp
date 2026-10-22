@@ -16,6 +16,10 @@ static const uint32_t awUs = 16 * 1024;
 // Largest supported EAW is 64*16TU (1048.576ms). Leave room for ROC
 // request lead/guard while bounding continuous RF ownership below MT76's 5s.
 static const uint32_t maxRocMs = 1100;
+// mt7921_set_roc waits HZ (one second). A delayed firmware response must
+// retain its request identity; this timeout does not grant any RF time.
+static const uint32_t rocResponseTimeoutUs = 1000000;
+static const uint32_t rocTokenQuarantineUs = rocResponseTimeoutUs + maxRocMs*1000;
 inline uint16_t le16(const uint8_t *p) { return p[0] | uint16_t(p[1]) << 8; }
 inline uint32_t le32(const uint8_t *p) { return le16(p) | uint32_t(le16(p+2)) << 16; }
 inline uint32_t be32(const uint8_t *p) { return uint32_t(p[0])<<24 | uint32_t(p[1])<<16 | uint32_t(p[2])<<8 | p[3]; }
@@ -700,20 +704,66 @@ inline size_t decodeData(uint8_t *out,size_t capacity,const uint8_t *f,size_t n,
     return len;
 }
 // A matching, unexpired firmware grant is mandatory before any transmission.
+enum class RocResult : uint8_t {
+    Accepted, Malformed, NoGrant, WrongBss, FirmwareStatus, WrongType,
+    Disabled, NotPending, Token, Channel, Late, Duration, Count
+};
 struct Reservation {
-    uint64_t deadline, grantObservedAt; uint8_t token, channel; bool pending, granted;
+    uint64_t deadline, grantObservedAt, requestedAt; uint8_t token, channel; bool pending, granted;
     uint32_t responseDelayUS;
     void request(uint8_t t,uint8_t c,uint64_t now) {
-        token=t; channel=c; pending=true; granted=false; grantObservedAt=0; deadline=now+100000;
+        token=t; channel=c; pending=true; granted=false; grantObservedAt=0;
+        requestedAt=now; deadline=now+rocResponseTimeoutUs;
         responseDelayUS=0;
     }
+    RocResult accept(uint8_t t,uint8_t c,uint32_t durationMs,uint64_t now) {
+        if(!pending) return RocResult::NotPending;
+        if(t!=token) return RocResult::Token;
+        if(c!=channel) return RocResult::Channel;
+        if(now<requestedAt || now>=deadline) return RocResult::Late;
+        if(!durationMs || durationMs>maxRocMs) return RocResult::Duration;
+        responseDelayUS=static_cast<uint32_t>(now-requestedAt);
+        pending=false; granted=true; grantObservedAt=now; deadline=now+uint64_t(durationMs)*1000;
+        return RocResult::Accepted;
+    }
     bool grant(uint8_t t,uint8_t c,uint32_t durationMs,uint64_t now) {
-        if(!pending || t!=token || c!=channel || now>=deadline || !durationMs || durationMs>maxRocMs) return false;
-        responseDelayUS=static_cast<uint32_t>(now-(deadline-100000));
-        pending=false; granted=true; grantObservedAt=now; deadline=now+uint64_t(durationMs)*1000; return true;
+        return accept(t,c,durationMs,now)==RocResult::Accepted;
     }
     bool canTransmit(uint8_t c,uint64_t now) const { return granted && channel==c && now<deadline && deadline-now>2000; }
-    void cancel() { pending=granted=false; deadline=grantObservedAt=0; }
+    void cancel() { pending=granted=false; deadline=grantObservedAt=requestedAt=0; responseDelayUS=0; }
 };
+// Unified ROC event: four-byte header followed by bounded TLVs. MT7921's
+// grant tag is zero and its complete structure is 20 bytes (mt7921.h).
+struct RocGrant {
+    uint8_t bss, token, status, channel, requestType;
+    uint32_t durationMs;
+};
+inline RocResult decodeRocGrant(const uint8_t *p,size_t n,RocGrant &out) {
+    out={};
+    if(!p || n<4) return RocResult::Malformed;
+    bool found=false;
+    for(size_t at=4;at<n;) {
+        if(n-at<4) return RocResult::Malformed;
+        uint16_t tag=le16(p+at), len=le16(p+at+2);
+        if(len<4 || len>n-at) return RocResult::Malformed;
+        if(tag==0) {
+            if(found || len!=20) return RocResult::Malformed;
+            found=true;
+            out={p[at+4],p[at+5],p[at+6],p[at+7],p[at+13],le32(p+at+16)};
+        }
+        at+=len;
+    }
+    return found ? RocResult::Accepted : RocResult::NoGrant;
+}
+inline RocResult receiveRocGrant(Reservation &reservation,const uint8_t *p,size_t n,
+                                uint8_t bss,bool enabled,uint64_t now,RocGrant &out) {
+    RocResult result=decodeRocGrant(p,n,out);
+    if(result!=RocResult::Accepted) return result;
+    if(out.bss!=bss) return RocResult::WrongBss;
+    if(out.status) return RocResult::FirmwareStatus;
+    if(out.requestType!=1) return RocResult::WrongType;
+    if(!enabled) return RocResult::Disabled;
+    return reservation.accept(out.token,out.channel,out.durationMs,now);
+}
 }
 #endif

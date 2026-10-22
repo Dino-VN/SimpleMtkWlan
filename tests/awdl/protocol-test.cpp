@@ -391,7 +391,7 @@ int main()
     assert(grant.grant(3,44,50,1002000)); assert(grant.canTransmit(44,1003000));
     assert(!grant.canTransmit(6,1003000) && !grant.canTransmit(44,1051000));
     grant.cancel(); assert(!grant.canTransmit(44,1003000));
-    grant.request(4,6,2000000); assert(!grant.grant(4,6,50,2100000));
+    grant.request(4,6,2000000); assert(!grant.grant(4,6,50,2000000+rocResponseTimeoutUs));
     grant.request(5,6,2000000); assert(!grant.grant(5,6,0,2001000));
     Peer p={}; assert(rx.acceptData(p,65535)); assert(rx.acceptData(p,0));
     assert(!rx.acceptData(p,65535)); assert(rx.acceptData(p,65534)); assert(!rx.acceptData(p,65534));

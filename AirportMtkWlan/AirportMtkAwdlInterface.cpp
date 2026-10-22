@@ -895,10 +895,12 @@ void AirportMtkAwdlInterface::serviceInGate()
         if(awTimeline.open) notifyAvailabilityWindowEnd(now);
         if(stopping || !enabled) return;
         // An idle slot may already be preparing the following channel.
-        // Preserve that ROC across ticks until its target expires.
+        // Preserve pending responses and live grants through idle slots.
+        // Missing the original target does not expire firmware RF ownership.
         if(requestedChannel && requestedWindow.end<=now) {
             mtkawdl::Reservation pending={};
-            if(!hal->awdlGrantSnapshot(pending) || !pending.pending || now>=pending.deadline) {
+            if(!hal->awdlGrantSnapshot(pending) ||
+               ((!pending.pending && !pending.granted) || now>=pending.deadline)) {
                 state.holdClock(0);
                 hal->awdlAbort(); requestedChannel=grantedChannel=0;
             }
@@ -913,8 +915,8 @@ void AirportMtkAwdlInterface::serviceInGate()
     bool grantReady=hal->awdlGrantSnapshot(grant) && grant.canTransmit(channel,now);
     if(grant.granted && grant.grantObservedAt && grant.grantObservedAt!=grantLatencyObservedAt) {
         grantLatencyObservedAt=grant.grantObservedAt;
-        // Accepted ROC response latency is measured from the pending request
-        // deadline (submission +100ms), independently of the RLM wait.
+        // Accepted response latency is measured from submission, independently
+        // of the preceding synchronous RLM wait.
         uint64_t need=uint64_t(grant.responseDelayUS)+reserveWaitUS+8000;
         if(need>125000) need=125000;
         if(need>reserveLeadUS) reserveLeadUS=static_cast<uint32_t>(need);
@@ -978,7 +980,10 @@ void AirportMtkAwdlInterface::serviceInGate()
             reserveWaitUS=now-requestAt;
             if(reserveWaitUS>reserveMaxWaitUS) reserveMaxWaitUS=reserveWaitUS;
             mtkawdl::Window after={};
-            uint64_t checkTime=now<target.start ? target.start : now;
+            // Verify the original schedule coordinates even if RLM finished
+            // after this EAW. A newly submitted pending ROC can still serve
+            // following equal-channel windows; its first missed AW stays absent.
+            uint64_t checkTime=target.start;
             reserveInvalidReason=0;
             if(plannedRole!=state.syncRole || memcmp(parent,state.sync,6) ||
                memcmp(root,state.master,6) || memcmp(&sequence,&state.sequence,sizeof(sequence)))
@@ -987,14 +992,20 @@ void AirportMtkAwdlInterface::serviceInGate()
                after.start!=target.start || after.channel!=target.channel ||
                after.counter!=target.counter || after.presence!=target.presence)
                 reserveInvalidReason|=2;
-            if(now>=target.end) reserveInvalidReason|=4;
+            if(now>=target.end) {
+                mtkawdl::Reservation submitted={};
+                bool usable=status==kIOReturnSuccess && hal->awdlGrantSnapshot(submitted) &&
+                    submitted.channel==target.channel && now<submitted.deadline &&
+                    (submitted.pending || submitted.granted);
+                if(!usable) reserveInvalidReason|=4;
+            }
             if(reserveInvalidReason) {
                 ++reserveInvalidations; state.holdClock(0);
                 hal->awdlAbort(); requestedChannel=grantedChannel=0;
                 timer->setTimeoutMS(1); return;
             }
             if(status==kIOReturnSuccess) {
-                requestedChannel=target.channel; requestDeadline=now+100000;
+                requestedChannel=target.channel; requestDeadline=now+mtkawdl::rocResponseTimeoutUs;
             } else { requestedChannel=0; state.holdClock(0); }
         }
         timer->setTimeoutMS(1); return;

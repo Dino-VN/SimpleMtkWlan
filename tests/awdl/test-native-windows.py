@@ -288,6 +288,27 @@ int main(){
  clockUS=1000000+4*mtkawdl::awUs-24000;slow.serviceInGate();assert(slow.radio.reserves==1);
  clockUS=slow.requestedWindow.end+2000;slow.serviceInGate();
  assert(slow.radio.reserves==1&&slow.radio.aborts==0&&slow.radio.grant.pending);
+ // A 200ms response must retain its token beyond the missed target. Use
+ // real partial RF time, then announce only the next fully covered EAW.
+ clockUS=slow.radio.grant.requestedAt+200000;
+ slow.serviceInGate();assert(slow.radio.reserves==1&&slow.radio.aborts==0);
+ assert(slow.radio.grant.grant(7,44,300,clockUS));
+ slow.serviceInGate();assert(slow.events.empty());
+ clockUS=1000000+16*mtkawdl::awUs+1000;slow.serviceInGate(); // idle
+ assert(slow.radio.aborts==0&&slow.radio.grant.granted&&slow.events.empty());
+ clockUS=1000000+20*mtkawdl::awUs;slow.serviceInGate();
+ assert(slow.events.size()==1&&mtkawdl::le32(slow.events[0].bytes.data())==20);
+ clockUS=slow.awTimeline.radioEnd;slow.serviceInGate();
+ assert(slow.events.size()==2&&slow.events[1].id==43);
+ // RLM can return after the originally planned EAW. The just-submitted
+ // pending ROC still describes the same channel/schedule; do not cancel it.
+ AirportMtkAwdlInterface delayedRlm;init(delayedRlm);delayedRlm.radio.grant.cancel();
+ for(unsigned i=0;i<16;++i)
+  delayedRlm.state.sequence.channels[i]=delayedRlm.state.ownSequence.channels[i]=(i%2?44:0);
+ delayedRlm.radio.onReserve=[&]{clockUS+=200000;delayedRlm.radio.grant.request(9,44,clockUS);};
+ clockUS=1000000+4*mtkawdl::awUs-24000;delayedRlm.serviceInGate();
+ assert(delayedRlm.reserveWaitUS==200000&&delayedRlm.reserveInvalidations==0&&
+        delayedRlm.radio.aborts==0&&delayedRlm.radio.grant.pending&&delayedRlm.requestedChannel==44);
  // Honor the driver's requested timer interval; fixed 1ms polling can hide
  // misses when the production timer asks for 2ms. Include bounded jitter.
  for(unsigned latency:{3000,8000}) {
