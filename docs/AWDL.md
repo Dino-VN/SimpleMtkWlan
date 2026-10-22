@@ -11,9 +11,11 @@ The replacement uses a null source for directly allocated RX, with regression
 coverage that reproduces the old panic callback before verifying success and
 error cleanup. Native cache/traffic registration now keeps data membership and
 replay independent of the three-second synchronization advertisement lifetime.
-Expired radio schedules still cannot authorize a unicast TX slot. Slow RLM
-channel setup runs during idle time before requesting the short ROC near the
-following EAW edge. BSD preparation clears hardware offloads and the enabled
+Expired radio schedules still cannot authorize a unicast TX slot. ROC now
+carries channel configuration directly without a synchronous RLM wait on each
+switch. The scheduler requests ahead and retains a grant across adjacent
+equal-channel EAWs; firmware grant receipt and expiry still govern RF access.
+BSD preparation clears hardware offloads and the enabled
 checksum/TSO capabilities that Tahoe leaves stale when offload is zero.
 These changes require a new boot and actual AirDrop transfer verification;
 passing host regressions and static ABI checks does not establish kernel or
@@ -87,11 +89,47 @@ encodings, duplication, fragments, A-MSDU, HT control and incomplete IPv6 frames
 are rejected.
 
 The MT7921 transport uses a separate BSS/OMAC/WMM context, broadcast WCID18,
-and up to three unicast WCIDs15..17. It configures RLM before requesting a
-firmware remain-on-channel grant, validates regulatory availability, and permits
+and up to three unicast WCIDs15..17. The unified remain-on-channel request
+includes channel/band/width, validates regulatory availability, and permits
 TX only on a matching unexpired grant. Lifecycle generations and operation/API
 drains protect teardown across MCU waits; native waits release the command gate
 so replies can be delivered. Receive-filter restoration preserves unrelated bits.
+
+### Continuous native windows
+
+The D957401C boot recorded 9715 ROC submissions but only 597 accepted grants
+and five paired native windows. The scheduler previously waited for synchronous
+BSS RLM programming at channel changes and aborted RF at every native EAW end.
+It also discarded pending requests when the target EAW ended, earlier than the
+firmware response timeout.
+
+The replacement uses the self-contained unified ROC acquire TLV, a 25ms request
+lead during idle time, and a dwell covering consecutive same-channel EAWs plus
+the lead and a 4ms guard, capped at 1000ms. MT76 advertises up to 5000ms for the
+same command; the smaller cap bounds infrastructure disruption. Actual firmware
+grants may be shorter and must still be validated. Native EAW end no longer
+unconditionally cancels a usable ROC. At a channel change or renewal, the prior
+window may end up to 8ms early, reduced by its start lateness so total duration
+remains within native +/-10TU tolerance. Each next start requires an observed
+matching grant and enough remaining duration. No catch-up events are emitted.
+
+REA/Hopper evidence `ev_95cc907161f49ec46f3f765bac02369f4ddd3b0a948063c72f7cdd59e92923cd`
+for native `sanityCheckAWEnd` at `0xffffff80021e4f5e` confirms that a duration
+difference of 11TU or more is rejected. Source KC SHA256 is
+`21d6da1c4c3e7b72dddf5144da8a4c4b48e294249a16018a5006b61bb2155ccc`;
+the mapped offline function SHA256 is
+`7ffa03854ad6f54bf833b12fa3d84742ab1b14795053821418d60d86cd0e40d8`.
+This is static evidence; the wrapper omits external callees and data.
+
+Production scheduler regression tests require every non-idle EAW across counter
+wrap, 3/8ms grant delays, alternating channels and bounded grant renewal, plus
+20ms early grants from idle and delayed pending responses. They validate event
+order, AW counters and actual start/end durations with 750/1250us timer jitter.
+Under the 8ms grant-delay case the old scheduler emitted 13 starts instead of
+the required 42; the replacement emits all 42 with 41 ends and one open window.
+Kernel timing, the firmware's
+granted interval and continuous windows on hardware remain unverified until the
+new UUID boots and `tools/awdl/check-windows.py` observes active synchronization.
 
 ## Remaining gaps
 

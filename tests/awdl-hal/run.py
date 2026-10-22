@@ -152,8 +152,21 @@ int main(){
  reset();sc=make();
  assert(!hal.awdlChannelAllowed(0)&&!hal.awdlChannelAllowed(166)&&hal.awdlChannelAllowed(6));
  sc.sc_ic.ic_chan_active[0]=0;assert(!hal.awdlChannelAllowed(6));sc=make();sc.sc_ic.ic_chan_avail[0]=0;assert(!hal.awdlChannelAllowed(6));sc=make();sc.sc_ic.ic_channels[6].ic_flags|=IEEE80211_CHAN_PASSIVE;assert(!hal.awdlChannelAllowed(6));sc=make();
- for(int ch:{6,44,149}){reset();sc=make();assert(hal.awdlReserve(ch,30)==0);assert(commands[0]==0x20002);std::vector<uint8_t> rlm={1,0,0,0,2,0,16,0,(uint8_t)ch,(uint8_t)ch,0,0,2,3,1,0,0,(uint8_t)(ch<=14?0:1),0,0};assert(wire[0]==rlm);auto&roc=wire.back();assert(roc.size()==28&&roc[8]==1&&roc[10]==ch&&roc[14]==ch&&roc[19]==1&&mtkawdl::le32(roc.data()+20)==30);assert(!hal.awdlCanTransmit(ch));assert(!sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token+1,ch,30,clock_us));assert(sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,ch,30,clock_us));assert(hal.awdlCanTransmit(ch));clock_us+=30001;assert(!hal.awdlCanTransmit(ch));}
- reset();sc=make();assert(hal.awdlReserve(6,0)==kIOReturnBadArgument&&commands.empty());assert(hal.awdlReserve(6,71)==kIOReturnBadArgument);sc.sc_ic.ic_state=IEEE80211_S_SCAN;assert(hal.awdlReserve(6,30)==kIOReturnNotReady&&sc.sc_awdl_roc_scan_blocked==1&&sc.sc_awdl_roc_submitted==0);
+ // Golden ROC packet alone; no synchronous RLM command or wait on switch.
+ for(int ch:{6,44,149}){
+  reset();sc=make();assert(hal.awdlReserve(ch,300)==0);
+  assert(commands.size()==1&&commands[0]==0x00020027);
+  const auto&roc=wire[0];
+  assert(roc.size()==28&&roc[8]==1&&roc[10]==ch&&roc[12]==(ch<=14?1:2));
+  assert(roc[14]==ch&&roc[17]==ch&&roc[19]==1&&mtkawdl::le32(roc.data()+20)==300);
+  assert(!hal.awdlCanTransmit(ch));
+  assert(!sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token+1,ch,300,clock_us));
+  assert(sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,ch,300,clock_us));
+  assert(hal.awdlCanTransmit(ch));clock_us+=300001;assert(!hal.awdlCanTransmit(ch));
+ }
+ reset();sc=make();assert(hal.awdlReserve(6,1000)==0);
+
+ reset();sc=make();assert(hal.awdlReserve(6,0)==kIOReturnBadArgument&&commands.empty());assert(hal.awdlReserve(6,1001)==kIOReturnBadArgument);sc.sc_ic.ic_state=IEEE80211_S_SCAN;assert(hal.awdlReserve(6,30)==kIOReturnNotReady&&sc.sc_awdl_roc_scan_blocked==1&&sc.sc_awdl_roc_submitted==0);
  assert(scan_cancels==1&&scan_tasks==1);
  sc.sc_ic.ic_state=0;sc.sc_flags=MWX_FLAG_SCANNING|MWX_FLAG_BGSCAN;
  scan_cancel_status=5;assert(hal.awdlReserve(6,70)==kIOReturnNotReady&&sc.sc_flags);

@@ -8899,16 +8899,14 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
         ++com->sc_awdl_roc_scan_blocked;
         return kIOReturnNotReady;
     }
-    if(!awdlChannelAllowed(channel) || !durationMs || durationMs>70) return kIOReturnBadArgument;
+    if(!awdlChannelAllowed(channel) || !durationMs || durationMs>1000) return kIOReturnBadArgument;
     MwxAwdlOperation operation(com);
     if(!operation.valid()) { ++com->sc_awdl_roc_busy_blocked; return kIOReturnNotReady; }
     mwx_awdl_abort(com);
     if(!operation.valid()) return kIOReturnAborted;
-    if(com->sc_awdl_channel!=channel) {
-        int rv=mwx_awdl_set_channel(com,channel,operation.epoch);
-        if(!operation.valid()) return kIOReturnAborted;
-        if(rv) return kIOReturnIOError;
-    }
+    // The unified ROC acquire TLV already contains channel, bandwidth, band
+    // and center channels, as in mt7921_mcu_set_roc. A synchronous BSS RLM
+    // update here delays every switch and invalidates short native AW edges.
     uint8_t token=com->sc_awdl_roc.token+1;
     if(!token) token=1;
     // Firmware returns only an 8-bit token. Do not reuse one inside the
@@ -8940,12 +8938,13 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
     if(rv || com->sc_awdl_roc_submitted<=4)
         MWX_DEV_LOG(com,"AWDL ROC submit token=%u channel=%u duration=%u result=%d\n",
                     token,channel,durationMs,rv);
-    if(!operation.valid()) return kIOReturnAborted;
-    if(rv) {
+    bool current=operation.valid();
+    if(rv || !current) {
         IOLockLock(com->sc_awdl_lock);
-        com->sc_awdl_roc.cancel();
+        if(com->sc_awdl_roc.token==token) com->sc_awdl_roc.cancel();
         IOLockUnlock(com->sc_awdl_lock);
     }
+    if(!current) return kIOReturnAborted;
     return rv ? kIOReturnIOError : kIOReturnSuccess;
 }
 

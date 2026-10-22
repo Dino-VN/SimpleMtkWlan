@@ -710,8 +710,28 @@ void AirportMtkAwdlInterface::serviceInGate()
         // timer runs late. Administrative cancellation uses its observed time.
         notifyAvailabilityWindowEnd(awTimeline.radioEnd);
         if(stopping || !enabled) return;
-        hal->awdlAbort(); requestedChannel=grantedChannel=0;
+        // Native EAW end is distinct from firmware ROC expiry. A grant can
+        // cover several consecutive windows on the same channel.
         now=awdlNow();
+    }
+    if(awTimeline.open && now<awTimeline.active.end) {
+        mtkawdl::Window next={}; mtkawdl::Reservation live={};
+        bool snapshot=hal->awdlGrantSnapshot(live);
+        bool nextValid=mtkawdl::currentWindow(state,awTimeline.active.end,next);
+        uint64_t startDelay=awTimeline.lastStart-awTimeline.active.start;
+        uint64_t early=startDelay<10*1024 ? 10*1024-startDelay : 0;
+        if(early>8000) early=8000;
+        if(snapshot && nextValid && next.channel && hal->awdlChannelAllowed(next.channel) &&
+           !mtkawdl::grantCoversWindow(next,live,next.start) &&
+           early && awTimeline.active.end-now<=early) {
+            // Give the next ROC a bounded head start. Native permits +/-10TU
+            // in actual AW duration, including lateness of this window's start.
+            // Close before abort so callbacks never observe an unpaired start.
+            notifyAvailabilityWindowEnd(now);
+            if(stopping || !enabled) return;
+            hal->awdlAbort(); requestedChannel=grantedChannel=0;
+            now=awdlNow();
+        }
     }
     // Expire queued data even while ROC requests fail or the slot is idle.
     // A full queue must not remain wedged waiting for a radio grant.
@@ -749,7 +769,6 @@ void AirportMtkAwdlInterface::serviceInGate()
     if(awTimeline.due(now)) {
         notifyAvailabilityWindowEnd(awTimeline.radioEnd);
         if(stopping || !enabled) return;
-        hal->awdlAbort(); requestedChannel=grantedChannel=0;
         now=awdlNow();
     }
     mtkawdl::Window window={};
@@ -760,8 +779,11 @@ void AirportMtkAwdlInterface::serviceInGate()
         if(stopping || !enabled) return;
         // An idle slot may already be preparing the following channel.
         // Preserve that ROC across ticks until its target expires.
-        if(requestedChannel && requestedWindow.start<=now) {
-            hal->awdlAbort(); requestedChannel=grantedChannel=0;
+        if(requestedChannel && requestedWindow.end<=now) {
+            mtkawdl::Reservation pending={};
+            if(!hal->awdlGrantSnapshot(pending) || !pending.pending || now>=pending.deadline) {
+                hal->awdlAbort(); requestedChannel=grantedChannel=0;
+            }
         }
     }
     if(awTimeline.open && (awTimeline.active.channel!=channel ||
@@ -779,36 +801,36 @@ void AirportMtkAwdlInterface::serviceInGate()
         notifyAvailabilityWindowEnd(now<awTimeline.radioEnd ? now : awTimeline.radioEnd);
         if(stopping || !enabled) return;
     }
-    if(!grantReady) {
+    if(!grantReady || (!awTimeline.open && now-window.start<=8000 &&
+                       !mtkawdl::grantCoversWindow(window,grant,now))) {
         // Do not replace the last 2ms TX guard of a live grant with another
         // short ROC. Prepare the next EAW after closing this one.
         if(awTimeline.open) { timer->setTimeoutMS(1); return; }
-        if(!requestedChannel || now>=requestDeadline || requestedWindow.end<=now) {
-            // Once this edge is missed, reserve the next EAW while idle.
-            // Channel programming can sleep; doing it only after the next
-            // boundary makes each channel change miss another start.
-            mtkawdl::Window target=window;
-            if(now-window.start>8000 && !mtkawdl::currentWindow(state,window.end,target)) {
-                timer->setTimeoutMS(1); return;
-            }
+        if(grantReady && now-window.start<=8000 &&
+           !mtkawdl::grantCoversWindow(window,grant,now)) ++awTimeline.shortGrants;
+        bool pending=grant.pending && now<grant.deadline;
+        if(!pending) {
+            mtkawdl::RadioPlan plan={};
+            if(!mtkawdl::planRadio(state,now,plan)) { timer->setTimeoutMS(2); return; }
+            mtkawdl::Window target=plan.window;
             if(!target.channel || !hal->awdlChannelAllowed(target.channel)) {
                 timer->setTimeoutMS(1); return;
             }
-            // RLM configuration waits for firmware and can take longer than
-            // the AW-start tolerance. Prepare it while idle, independently of
-            // the short ROC whose lifetime must cover the following EAW.
-            if(target.start>now && target.start-now>8000) {
-                IOReturn prepare=hal->awdlPrepareChannel(target.channel);
-                if(stopping || !enabled) return;
-                setProperty("MTKAWDLChannelPrepareStatus",static_cast<uint64_t>(prepare),32);
-                timer->setTimeoutMS(2); return;
+            if(target.start>now && mtkawdl::grantCoversWindow(target,grant,target.start)) {
+                // An early grant is for the upcoming EAW. Do not repeatedly
+                // abort/reacquire it just because the current EAW is late/idle.
+                timer->setTimeoutMS(1); return;
+            }
+            if(plan.requestAt>now) {
+                uint64_t delay=plan.requestAt-now;
+                timer->setTimeoutUS(static_cast<uint32_t>(delay>2000 ? 2000 : delay)); return;
             }
             uint8_t parent[6],root[6];
             memcpy(parent,state.sync,6); memcpy(root,state.master,6);
             mtkawdl::Sequence sequence=state.sequence;
-            // Request the full supported dwell. Grant receipt defines the
-            // actual usable interval; command submission never grants RF use.
-            uint32_t duration=70;
+            // Include lead time and adjacent equal-channel EAWs in the dwell.
+            // Firmware receipt still defines the only usable RF interval.
+            uint32_t duration=plan.durationMs;
             reserveDuration=duration; ++reserveAttempts;
             requestedWindow=target;
             IOReturn status=hal->awdlReserve(target.channel,duration);
@@ -826,7 +848,7 @@ void AirportMtkAwdlInterface::serviceInGate()
                 timer->setTimeoutMS(1); return;
             }
             if(status==kIOReturnSuccess) {
-                requestedChannel=target.channel; requestDeadline=target.end;
+                requestedChannel=target.channel; requestDeadline=now+100000;
             } else requestedChannel=0;
         }
         timer->setTimeoutMS(1); return;

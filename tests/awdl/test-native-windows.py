@@ -130,14 +130,14 @@ int main(){
  // Reentrant end must not dispatch duplicate ends.
  callback.onEnd=[&]{callback.notifyAvailabilityWindowEnd(clockUS);};
  callback.notifyAvailabilityWindowEnd(clockUS);assert(callback.events.size()==2);
- // Slow RLM configuration happens early; the short ROC stays near the edge.
+ // Channel changes use ROC directly; no synchronous RLM wait at the edge.
  AirportMtkAwdlInterface prepare;init(prepare);prepare.radio.grant.cancel();
  prepare.state.sequence.channels[1]=prepare.state.ownSequence.channels[1]=44;
  prepare.radio.onPrepare=[&]{clockUS+=20000;};
- clockUS+=20000;prepare.serviceInGate();assert(prepare.radio.reserves==0&&prepare.radio.prepares==1&&prepare.radio.preparedChannel==44);
+ clockUS+=20000;prepare.serviceInGate();assert(prepare.radio.reserves==0&&prepare.radio.prepares==0);
  prepare.radio.onPrepare=nullptr;
  clockUS=1000000+4*mtkawdl::awUs-7000;prepare.serviceInGate();
- assert(prepare.radio.reserves==1&&prepare.radio.requested==44&&prepare.radio.duration==70);
+ assert(prepare.radio.reserves==1&&prepare.radio.requested==44&&prepare.radio.duration>70);
  assert(prepare.events.empty());
  // Keep a pending future ROC while the current slot has no radio channel.
  AirportMtkAwdlInterface idle;init(idle);idle.radio.grant.cancel();
@@ -158,11 +158,69 @@ int main(){
  continuous.radio.onReserve=[&]{continuous.radio.grant.request(++nextToken,continuous.radio.requested,clockUS);grantAt=clockUS+3000;};
  for(unsigned i=0;i<210;++i){
   if(continuous.radio.grant.pending&&clockUS>=grantAt)
-   assert(continuous.radio.grant.grant(nextToken,continuous.radio.requested,70,clockUS));
+   assert(continuous.radio.grant.grant(nextToken,continuous.radio.requested,continuous.radio.duration,clockUS));
   continuous.serviceInGate();clockUS+=1000;
  }
  assert(continuous.awTimeline.starts==4&&continuous.awTimeline.ends==3);
- assert(continuous.radio.reserves==3);
+ assert(continuous.radio.reserves==2);
+ // Long runs must emit every scheduled non-idle EAW, not just count pairs.
+ // Simulate MCU grant latency, timer jitter, counter wrap and channel changes.
+ for(unsigned latency:{3000,8000}) {
+  AirportMtkAwdlInterface run;init(run);run.state.baseCounter=65532;
+  for(unsigned i=0;i<run.state.sequence.count;++i)
+   run.state.sequence.channels[i]=run.state.ownSequence.channels[i]=(i%3==1?44:6);
+  uint8_t token=1;uint64_t due=0;
+  run.radio.onReserve=[&]{run.radio.grant.request(++token,run.radio.requested,clockUS);due=clockUS+latency;};
+  for(unsigned i=0;i<2700;++i){
+   if(run.radio.grant.pending&&clockUS>=due)
+    assert(run.radio.grant.grant(token,run.radio.requested,run.radio.duration,clockUS));
+   run.serviceInGate();clockUS+=i%2 ? 1250 : 750;
+  }
+  assert(run.awTimeline.starts==42&&run.awTimeline.ends==41);
+  unsigned starts=0,ends=0;uint32_t startTime=0;uint16_t previous=65528;
+  for(const auto&event:run.events){
+   if(event.id==41){assert(starts==ends);++starts;
+    uint16_t counter=mtkawdl::le32(event.bytes.data());assert(counter==uint16_t(previous+4));previous=counter;
+    startTime=mtkawdl::be32(event.bytes.data()+20);
+   }else{assert(starts==ends+1);++ends;
+    uint32_t duration=mtkawdl::be32(event.bytes.data()+4)-startTime;
+    assert(duration/1024>=54&&duration/1024<=74);
+   }
+  }
+  assert(run.radio.prepares==0&&run.radio.reserves<42);
+ }
+ // Long equal-channel runs retain grants at EAW boundaries and renew before
+ // the firmware deadline; 1-second cap cannot produce a partial native AW.
+ AirportMtkAwdlInterface same;init(same);uint8_t sameToken=1;uint64_t sameDue=0;
+ same.radio.onReserve=[&]{same.radio.grant.request(++sameToken,6,clockUS);sameDue=clockUS+3000;};
+ for(unsigned i=0;i<2200;++i){
+  if(same.radio.grant.pending&&clockUS>=sameDue)
+   assert(same.radio.grant.grant(sameToken,6,same.radio.duration,clockUS));
+  same.serviceInGate();clockUS+=1000;
+ }
+ assert(same.awTimeline.starts==34&&same.awTimeline.ends==33&&same.radio.reserves==3);
+ // Idle slots can request ahead. A real 20ms grant delay is covered by lead
+ // time and must not cause repeated abort/replacement of a future grant.
+ AirportMtkAwdlInterface lead;init(lead);lead.radio.grant.cancel();
+ for(unsigned i=0;i<lead.state.sequence.count;++i)
+  lead.state.sequence.channels[i]=lead.state.ownSequence.channels[i]=(i%2?44:0);
+ uint8_t leadToken=1;uint64_t leadDue=0;
+ lead.radio.onReserve=[&]{lead.radio.grant.request(++leadToken,44,clockUS);leadDue=clockUS+20000;};
+ for(unsigned i=0;i<520;++i){
+  if(lead.radio.grant.pending&&clockUS>=leadDue)
+   assert(lead.radio.grant.grant(leadToken,44,lead.radio.duration,clockUS));
+  lead.serviceInGate();clockUS+=1000;
+ }
+ assert(lead.awTimeline.starts==4&&lead.awTimeline.ends==3&&lead.radio.reserves==4);
+ // A delayed grant response outlives the target EAW. Respect its actual
+ // pending-response timeout rather than aborting it once every EAW.
+ AirportMtkAwdlInterface slow;init(slow);slow.radio.grant.cancel();
+ for(unsigned i=0;i<slow.state.sequence.count;++i)
+  slow.state.sequence.channels[i]=slow.state.ownSequence.channels[i]=(i%2?44:0);
+ slow.radio.onReserve=[&]{slow.radio.grant.request(7,44,clockUS);};
+ clockUS=1000000+4*mtkawdl::awUs-24000;slow.serviceInGate();assert(slow.radio.reserves==1);
+ clockUS=slow.requestedWindow.end+2000;slow.serviceInGate();
+ assert(slow.radio.reserves==1&&slow.radio.aborts==0&&slow.radio.grant.pending);
  // Tahoe programs mode 1 with a remote synchronization MAC. Accept it, and
  // preserve a pending grant when native refreshes the identical role.
  AirportMtkAwdlInterface mode;init(mode);mode.state.nativeElectionManaged=true;

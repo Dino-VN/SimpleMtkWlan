@@ -18,6 +18,39 @@ inline bool currentWindow(const State &s,uint64_t now,Window &out) {
          uint16_t(s.counter(now)-s.counter(now)%s.presence),s.channel(now),s.presence};
     return true;
 }
+constexpr uint32_t rocLeadUs=25000, maxRocMs=1000;
+// ROC carries its channel configuration. Plan ahead without waiting for a
+// BSS/RLM command at each edge, and keep one grant for adjacent equal channels.
+struct RadioPlan { Window window; uint64_t requestAt; uint32_t durationMs; };
+inline bool planRadio(const State &s,uint64_t now,RadioPlan &out) {
+    Window target={};
+    if(!currentWindow(s,now,target)) return false;
+    if(!target.channel || now-target.start>8000) {
+        for(unsigned i=0;i<s.sequence.count;++i) {
+            if(!currentWindow(s,target.end,target)) return false;
+            if(target.channel) break;
+        }
+    }
+    if(!target.channel) return false;
+    uint64_t at=target.start>rocLeadUs ? target.start-rocLeadUs : 0;
+    if(at<now) at=now;
+    uint64_t end=target.end;
+    for(unsigned i=1;i<s.sequence.count;++i) {
+        Window next={};
+        if(!currentWindow(s,end,next) || next.channel!=target.channel) break;
+        end=next.end;
+        if(end-at>=uint64_t(maxRocMs)*1000) break;
+    }
+    uint64_t duration=(end-at+4000+999)/1000;
+    if(duration>maxRocMs) duration=maxRocMs;
+    out={target,at,static_cast<uint32_t>(duration)}; return true;
+}
+inline bool grantCoversWindow(const Window &w,const Reservation &grant,uint64_t now) {
+    uint64_t at=now>w.start ? now : w.start;
+    uint64_t end=grant.deadline<w.end ? grant.deadline : w.end;
+    return w.channel && grant.canTransmit(w.channel,at) && end>at &&
+        end-at+10*1024>=unsigned(w.presence)*awUs;
+}
 struct Timeline {
     Window active={};
     bool open=false, emitted=false;
