@@ -1290,8 +1290,10 @@ ieee80211_add_hecaps(uint8_t *frm, struct ieee80211com *ic)
     
     /* Check if PPE Threshold should be present */
     if ((ic->ic_he_cap_elem.phy_cap_info[6] &
-         IEEE80211_HE_PHY_CAP6_PPE_THRESHOLD_PRESENT) == 0)
+         IEEE80211_HE_PHY_CAP6_PPE_THRESHOLD_PRESENT) == 0) {
+        orig_pos[1] = (frm - orig_pos) - 2;
         return frm;
+    }
     
     /*
      * Calculate how many PPET16/PPET8 pairs are to come. Algorithm:

@@ -64,6 +64,20 @@ static int cmd_state(io_connect_t c)
     return st.state;
 }
 
+static const char *phy_names[] = { "11a", "11b", "11g", "11n", "11ac", "11ax" };
+
+/* Link details; the SSID is left out so the output can be shared. */
+static void cmd_sta(io_connect_t c)
+{
+    struct ioctl_sta_info st = {0};
+    kern_return_t kr = ioctl_get(c, IOCTL_80211_STA_INFO, &st, sizeof(st));
+    if (kr) { printf("sta: not associated (0x%x)\n", kr); return; }
+    printf("sta: mode=%s channel=%u bw=%u rssi=%d noise=%d mcs=%d rate=%u bssid=%02x:%02x:%02x:%02x:%02x:%02x\n",
+        (unsigned)st.op_mode < 6 ? phy_names[st.op_mode] : "?", st.channel,
+        st.band_width, st.rssi, st.noise, st.cur_mcs, st.rate,
+        st.bssid[0], st.bssid[1], st.bssid[2], st.bssid[3], st.bssid[4], st.bssid[5]);
+}
+
 static void print_cipher(unsigned int c)
 {
     if (c & MTK80211_CIPHER_CCMP) printf("CCMP ");
@@ -248,13 +262,14 @@ static void cmd_join(io_connect_t c, const char *ssid, const char *pass)
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: mtkctl info|state|debug|log|awdl-create|knob <hex>|gap <ms>|dwell <ms|auto>|reset|dump|scan [seconds]|results|join <ssid> [password]\n");
+        fprintf(stderr, "usage: mtkctl info|state|sta|debug|log|awdl-create|knob <hex>|gap <ms>|dwell <ms|auto>|reset|dump|scan [seconds]|results|join <ssid> [password]\n");
         return 2;
     }
     io_connect_t c = open_driver();
     int result = 0;
     if (!strcmp(argv[1], "info")) { cmd_info(c); cmd_state(c); }
     else if (!strcmp(argv[1], "state")) cmd_state(c);
+    else if (!strcmp(argv[1], "sta")) cmd_sta(c);
     else if (!strcmp(argv[1], "scan")) cmd_scan(c, argc > 2 ? atoi(argv[2]) : 8);
     else if (!strcmp(argv[1], "results")) cmd_results(c);
     else if (!strcmp(argv[1], "debug")) cmd_debug(c);

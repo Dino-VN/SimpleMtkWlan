@@ -1373,6 +1373,95 @@ struct sta_rec_state {
 	uint8_t		rsv[1];
 } __packed;
 
+#define	CMD_HE_MCS_BW80			0
+#define	CMD_HE_MCS_BW160		1
+#define	CMD_HE_MCS_BW8080		2
+#define	CMD_HE_MCS_BW_NUM		3
+
+#define	STA_REC_HE			0x0e
+struct sta_rec_he {
+	uint16_t	tag;
+	uint16_t	len;
+	uint32_t	he_cap;
+	uint8_t		t_frame_dur;
+	uint8_t		max_ampdu_exp;
+	uint8_t		bw_set;
+	uint8_t		device_class;
+	uint8_t		dcm_tx_mode;
+	uint8_t		dcm_tx_max_nss;
+	uint8_t		dcm_rx_mode;
+	uint8_t		dcm_rx_max_nss;
+	uint8_t		dcm_max_ru;
+	uint8_t		punc_pream_rx;
+	uint8_t		pkt_ext;
+	uint8_t		rsv1;
+	uint16_t	max_nss_mcs[CMD_HE_MCS_BW_NUM];
+	uint8_t		rsv2[2];
+} __packed;
+
+#define	STA_REC_HE_CAP_HTC			(1U << 0)
+#define	STA_REC_HE_CAP_BQR			(1U << 1)
+#define	STA_REC_HE_CAP_BSR			(1U << 2)
+#define	STA_REC_HE_CAP_OM			(1U << 3)
+#define	STA_REC_HE_CAP_AMSDU_IN_AMPDU		(1U << 4)
+#define	STA_REC_HE_CAP_DUAL_BAND		(1U << 5)
+#define	STA_REC_HE_CAP_LDPC			(1U << 6)
+#define	STA_REC_HE_CAP_TRIG_CQI_FK		(1U << 7)
+#define	STA_REC_HE_CAP_PARTIAL_BW_EXT_RANGE	(1U << 8)
+#define	STA_REC_HE_CAP_LE_EQ_80M_TX_STBC	(1U << 9)
+#define	STA_REC_HE_CAP_LE_EQ_80M_RX_STBC	(1U << 10)
+#define	STA_REC_HE_CAP_GT_80M_TX_STBC		(1U << 11)
+#define	STA_REC_HE_CAP_GT_80M_RX_STBC		(1U << 12)
+#define	STA_REC_HE_CAP_SU_PPDU_1LTF_8US_GI	(1U << 13)
+#define	STA_REC_HE_CAP_SU_MU_PPDU_4LTF_8US_GI	(1U << 14)
+#define	STA_REC_HE_CAP_ER_SU_PPDU_1LTF_8US_GI	(1U << 15)
+#define	STA_REC_HE_CAP_ER_SU_PPDU_4LTF_8US_GI	(1U << 16)
+#define	STA_REC_HE_CAP_NDP_4LTF_3DOT2MS_GI	(1U << 17)
+#define	STA_REC_HE_CAP_BW20_RU242_SUPPORT	(1U << 18)
+#define	STA_REC_HE_CAP_TX_1024QAM_UNDER_RU242	(1U << 19)
+#define	STA_REC_HE_CAP_RX_1024QAM_UNDER_RU242	(1U << 20)
+
+#define	STA_REC_HE_V2			0x19
+struct sta_rec_he_v2 {
+	uint16_t	tag;
+	uint16_t	len;
+	uint8_t		he_mac_cap[6];
+	uint8_t		he_phy_cap[11];
+	uint8_t		pkt_ext;
+	uint16_t	max_nss_mcs[CMD_HE_MCS_BW_NUM];
+} __packed;
+
+/* mt76_connac_bss_basic_tlv phymode bits */
+#define	PHY_MODE_A			(1U << 0)
+#define	PHY_MODE_B			(1U << 1)
+#define	PHY_MODE_G			(1U << 2)
+#define	PHY_MODE_GN			(1U << 3)
+#define	PHY_MODE_AN			(1U << 4)
+#define	PHY_MODE_AC			(1U << 5)
+#define	PHY_MODE_AX_24G			(1U << 6)
+#define	PHY_MODE_AX_5G			(1U << 7)
+
+struct bss_info_uni_he {
+	uint16_t	tag;
+	uint16_t	len;
+	uint16_t	he_rts_thres;
+	uint8_t		he_pe_duration;
+	uint8_t		su_disable;
+	uint16_t	max_nss_mcs[CMD_HE_MCS_BW_NUM];
+	uint8_t		rsv[2];
+} __packed;
+
+struct bss_info_uni_bss_color {
+	uint16_t	tag;
+	uint16_t	len;
+	uint8_t		enable;
+	uint8_t		bss_color;
+	uint8_t		rsv[2];
+} __packed;
+
+#define	DEFAULT_HE_PE_DURATION		4
+#define	DEFAULT_HE_DURATION_RTS_THRES	1023
+
 #define	STA_REC_WTBL			0x0d
 struct sta_rec_wtbl {
 	uint16_t	tag;
