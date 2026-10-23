@@ -42,10 +42,14 @@ The conditional recovery was checked against Linux v6.18
 
 ## Verification
 
-Candidate UUID: `BECB9159-EADF-384A-829F-F695A1AB2003`.
+Candidate UUID: `480E5D5B-33D0-394C-9B64-FDA55AC7A3FD`.
 Output: `build/wifi-wake-recovery/Release/AirportMtkWlan.kext`.
 Unsigned Release, x86_64, macOS Tahoe (`__MAC_26_0`). It includes the preexisting
 local AWDL changes. No installed driver or boot configuration was modified.
+The combined candidate includes `origin/main` commit
+`eb9024b049fb92ce0566d02a84e60824b5c5f981`, including full-power association,
+experimental HE support and `mtkctl sta`. It is merged into the local `awdl`
+branch at the user's request.
 
 Production-function regressions pass under ASan/UBSan:
 
@@ -57,7 +61,9 @@ Production-function regressions pass under ASan/UBSan:
   bounded PM timeout; detachment.
 
 The saved baseline compiles and fails both regressions at assertions. Existing
-AWDL protocol/native-window, HAL, TXWI, TX-free and detach checks pass. The
+AWDL protocol/native-window, HAL, TXWI, TX-free and detach checks pass. After
+merging main, wake, AWDL, scan and association checks pass; the association
+harness includes the new HE dispatch and legacy-color cleanup fields. The
 Release build succeeds. Static checks match 569 AWDL virtual slots and 244
 packet/pool/queue slots against the pinned local Tahoe kernel collection.
 These tests establish source behavior in the harness and compiled ABI layout;

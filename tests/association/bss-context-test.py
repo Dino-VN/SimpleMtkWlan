@@ -5,6 +5,7 @@ source=(base/'SimpleMtkWlan/hal_mwx/MtkMwx.cpp').read_text()
 wire=(base/'SimpleMtkWlan/hal_mwx/if_mwxreg.h').read_text()
 a=source.index('int\nmt7921_mcu_set_associated_bss(');fn=source[a:source.index('\n}\n',a)+3]
 struct=re.search(r'struct mt76_connac_bss_basic_tlv \{.*?\} __packed;',wire,re.S).group()
+phy='\n'.join(re.findall(r'^#define\s+PHY_MODE_.*$',wire,re.M))
 code=r'''
 #include <cstdint>
 #include <cstring>
@@ -24,6 +25,8 @@ code=r'''
 #define IEEE80211_NODE_HT 1
 #define IEEE80211_NODE_VHT 2
 #define IEEE80211_NODE_QOS 4
+#define IEEE80211_NODE_HE 8
+#define IEEE80211_F_HEON 16
 #define MWX_KNOB_NO_QBSS 0x400
 #define EXT_BSSID_START 16
 #define HW_BSSID_0 0
@@ -39,15 +42,18 @@ code=r'''
 #define htole32(x) (x)
 struct ieee80211_channel { int ic_freq; int width; };
 struct ieee80211_node { ieee80211_channel *ni_chan; uint8_t ni_bssid[6]; uint16_t ni_intval; uint8_t ni_dtimperiod; unsigned ni_flags=0; };
-struct ieee80211com { int ic_opmode; ieee80211_node *ic_bss; };
+struct ieee80211com { int ic_opmode; ieee80211_node *ic_bss; unsigned ic_flags=0; };
 struct mwx_vif { uint8_t idx,omac_idx,band_idx,wmm_idx; struct {uint16_t wcid;} vif_mn; };
-struct mwx_softc { ieee80211com sc_ic; mwx_vif sc_vif; struct {uint8_t num_streams,antenna_mask;} sc_capa; unsigned sc_knobs=0;uint8_t sc_bss_bw=0,sc_bss_center=0; };
+struct mwx_softc { ieee80211com sc_ic; mwx_vif sc_vif; struct {uint8_t num_streams,antenna_mask;} sc_capa; unsigned sc_knobs=0;uint8_t sc_bss_bw=0,sc_bss_center=0,sc_bss_he=0; };
 int ieee80211_mhz2ieee(int f,int) {return f==2484?14:f<3000?(f-2407)/5:(f-5000)/5;}
 int mt7921_mcu_chan_bw(ieee80211_channel *c){return c->width;}
 std::vector<std::vector<uint8_t>> sent;
 int fail_at=0;
+std::vector<int> he_updates;
+int he_error=0;
+int mt7921_mcu_set_bss_he(mwx_softc*,ieee80211_node*,int enable){he_updates.push_back(enable);return he_error;}
 int mwx_send_assoc_status(mwx_softc*,int cmd,void *p,int n){assert(cmd==0x20002);auto b=(uint8_t*)p;sent.emplace_back(b,b+n);return int(sent.size())==fail_at?EIO:0;}
-'''+struct+'\n'+fn+r'''
+'''+phy+'\n'+struct+'\n'+fn+r'''
 int main(){
  ieee80211_channel c{5745,0};ieee80211_node n{&c,{0xe8,0x45,0x8b,0x39,0xe0,0xa7},100,3};
  mwx_softc sc{{1,&n},{3,2,0,1,{19}},{2,3}};
@@ -76,6 +82,21 @@ int main(){
  sent.clear();c.ic_freq=2437;assert(!mt7921_mcu_set_associated_bss(&sc,1));assert(sent[0][29]==0x0e);
  sent.clear();sc.sc_knobs=MWX_KNOB_NO_QBSS;assert(!mt7921_mcu_set_associated_bss(&sc,1));assert(sent[0].size()==36);
  sent.clear();sc.sc_ic.ic_opmode=2;assert(mt7921_mcu_set_associated_bss(&sc,1)==0);assert(sent.empty());
+ // Main's HE BSS update must coexist with legacy/VHT associations and clear
+ // the old color when the next AP has no HE. Firmware payload is tested by
+ // the complete driver build; this test checks constructor dispatch/state.
+ sc.sc_ic.ic_opmode=1;sc.sc_knobs=0;sc.sc_ic.ic_flags=IEEE80211_F_HEON;
+ n.ni_flags|=IEEE80211_NODE_HE;
+ for(int freq:{2437,5180}){
+  c.ic_freq=freq;sent.clear();he_updates.clear();sc.sc_bss_he=0;
+  assert(!mt7921_mcu_set_associated_bss(&sc,1));
+  assert(sent.size()==2&&he_updates==std::vector<int>{1}&&sc.sc_bss_he);
+  assert(sent[0][29]==(freq<3000?0x4e:0xb1));
+ }
+ n.ni_flags&=~IEEE80211_NODE_HE;sent.clear();he_updates.clear();
+ assert(!mt7921_mcu_set_associated_bss(&sc,1));assert(he_updates==std::vector<int>{0}&&!sc.sc_bss_he);
+ n.ni_flags|=IEEE80211_NODE_HE;he_error=EIO;sent.clear();he_updates.clear();
+ assert(!mt7921_mcu_set_associated_bss(&sc,1));assert(!sc.sc_bss_he&&he_updates==std::vector<int>{1});
  puts("PASS: real BSS constructor, golden wire packets on 7 channels, QBSS/HT/VHT/bandwidth, disassociation, firmware failures and null guards");
 }
 '''
