@@ -138,7 +138,11 @@ inline bool parseAction(const uint8_t *f, size_t n, Advertisement &out) {
         at+=len;
     }
     if (!sync) return false;
-    if (election && memcmp(a.master,electionMaster,6)) return false;
+    // Sync parameters describe the transmitting peer's clock. Election v2
+    // names the elected root, which can differ during a tree transition.
+    // iOS 26 advertises this while following us. Keep its usable channel
+    // schedule and use the election TLV for root/loop decisions, as OWL does.
+    if (election) memcpy(a.master,electionMaster,6);
     if (separateSequence) {
         if(extra.count!=a.sequence.count || extra.step!=a.sequence.step) return false;
         // The captured PSF advertises legacy channel 151 in sync params but
@@ -799,6 +803,30 @@ inline size_t decodeData(uint8_t *out,size_t capacity,const uint8_t *f,size_t n,
     if(len) seq=view.sequence;
     return len;
 }
+// Reserved software PIDs distinguish AWDL frame classes in MT7921 TXS.
+// WCIDs 15..18 belong exclusively to AWDL. A DMA release is not a TX result.
+constexpr uint8_t txPidUnicast=125, txPidMulticast=126, txPidAction=127;
+struct TxStatusCounters {
+    uint64_t dataAcked=0, dataFailed=0, multicastCompleted=0, multicastFailed=0;
+    uint64_t actionCompleted=0, actionFailed=0;
+    uint32_t lastStatus=0;
+    uint16_t lastSequence=0, lastWcid=0;
+    uint8_t lastPid=0;
+    bool observe(const uint8_t *p,size_t n) {
+        if(!p || n<32) return false;
+        uint32_t status=le32(p), wcid=(le32(p+8)>>16)&0x3ff;
+        if(wcid<15 || wcid>18) return false;
+        uint8_t pid=le32(p+12)>>24;
+        // MT76 accepts only MPDU formats 0/1 here, not PPDU summaries.
+        if(((status>>23)&3)>1 || pid<txPidUnicast || pid>txPidAction) return true;
+        bool failed=status&0x00070000; // queue, RTS, or ACK timeout
+        lastStatus=status; lastSequence=le32(p+4)>>20; lastWcid=wcid; lastPid=pid;
+        if(pid==txPidUnicast) { if(failed) ++dataFailed; else ++dataAcked; }
+        else if(pid==txPidMulticast) { if(failed) ++multicastFailed; else ++multicastCompleted; }
+        else { if(failed) ++actionFailed; else ++actionCompleted; }
+        return true;
+    }
+};
 // A matching, unexpired firmware grant is mandatory before any transmission.
 enum class RocResult : uint8_t {
     Accepted, Malformed, NoGrant, WrongBss, FirmwareStatus, WrongType,

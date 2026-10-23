@@ -2,10 +2,12 @@
 """Execute production TXWI builders to verify AWDL OFDM and native context."""
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
 root = Path(__file__).resolve().parents[2]
-source = (root / 'SimpleMtkWlan/hal_mwx/MtkMwx.cpp').read_text()
+source = (Path(sys.argv[1]) if len(sys.argv) > 1 else
+          root / 'SimpleMtkWlan/hal_mwx/MtkMwx.cpp').read_text()
 
 def function(signature):
     start = source.index(signature)
@@ -57,7 +59,7 @@ size_t mbuf_pkthdr_len(mbuf*m){return m->len;}
 bool ieee80211_has_qos(ieee80211_frame*f){return (f->i_fc[0]&0x8c)==0x88;}
 unsigned ieee80211_get_hdrlen(ieee80211_frame*f){return ieee80211_has_qos(f)?26:24;}
 unsigned ieee80211_get_qos(ieee80211_frame*f){return ((uint8_t*)f)[24];}
-bool ratecheck(timeval*,const timeval*){return true;}
+unsigned rateChecks=0;bool ratecheck(timeval*,const timeval*){++rateChecks;return true;}
 uint32_t mt7921_mac_tx_rate_val(mwx_softc*){return 0;}
 '''
 start = source.index('const struct mwx_rate {')
@@ -92,14 +94,34 @@ int main(){
   assert(bool(tx.txwi[3]&MT_TXD3_NO_ACK)==bool(multicast));
   assert(!(tx.txwi[3]&MT_TXD3_PROTECT_FRAME));
   assert(!(tx.txwi[7]&MT_TXD7_HW_AMSDU));
+  assert((tx.txwi[5]&MT_TXD5_PID)==(multicast?mtkawdl::txPidMulticast:mtkawdl::txPidUnicast));
+  assert(tx.txwi[5]&MT_TXD5_TX_STATUS_HOST);assert(rateChecks==0);
   assert(((tx.txwi[0]&MT_TXD0_Q_IDX_MASK)>>25)==(qos?7U:5U));
+ }
+ // MT7921 has MT_DRV_HW_MGMT_TXQ. MT76 routes off-channel management
+ // through MT_TXQ_PSD/ALTX rather than the discovery BSS's WMM queues.
+ // Exercise both PSF/MIF subtypes and broadcast/unicast identities.
+ for(unsigned mode:{0U,3U})for(unsigned multicast:{0U,1U}) {
+  mbuf action{};action.len=60;action.bytes[0]=0xd0;
+  action.bytes[4]=multicast?1:2;action.bytes[30]=mode;
+  auto*node=multicast?&sc.sc_awdl_vif.vif_mn:&sc.sc_awdl_peers[1];
+  mt76_txwi descriptor{};mt7921_mac_write_txwi(&sc,&action,&node->ni,&descriptor);
+  assert(((descriptor.txwi[0]&MT_TXD0_Q_IDX_MASK)>>25)==MT_LMAC_ALTX0);
+  assert((descriptor.txwi[0]&MT_TXD0_PKT_FMT)==MT_TX_TYPE_CT);
+  assert((descriptor.txwi[1]&MT_TXD1_OWN_MAC_MASK)==(1U<<24));
+  assert((descriptor.txwi[1]&MT_TXD1_WLAN_IDX_MASK)==node->wcid);
+  assert(bool(descriptor.txwi[3]&MT_TXD3_NO_ACK)==bool(multicast));
+  assert((descriptor.txwi[5]&MT_TXD5_PID)==mtkawdl::txPidAction);
+  assert(descriptor.txwi[5]&MT_TXD5_TX_STATUS_HOST);assert(rateChecks==0);
  }
  // Infrastructure still uses its own context and configured RA behavior.
  sc.sc_knobs=MWX_KNOB_DATA_RA;mbuf m{};m.len=60;m.bytes[0]=8;m.bytes[4]=2;
  mt76_txwi tx{};mt7921_mac_write_txwi(&sc,&m,&sc.sc_vif.vif_mn.ni,&tx);
  assert(!(tx.txwi[2]&MT_TXD2_FIX_RATE));assert(!(tx.txwi[1]&MT_TXD1_OWN_MAC_MASK));
  assert((tx.txwi[1]&MT_TXD1_WLAN_IDX_MASK)==4);
- puts("PASS production TXWI: 24 AWDL configurations use 6Mbps OFDM, full fixed-rate setup, WCID/OMAC/WMM, supplied sequence, unicast ACK/multicast no-ACK; infrastructure RA preserved.");
+ m.bytes[0]=0xd0;tx={};mt7921_mac_write_txwi(&sc,&m,&sc.sc_vif.vif_mn.ni,&tx);
+ assert(((tx.txwi[0]&MT_TXD0_Q_IDX_MASK)>>25)==3);
+ puts("PASS production TXWI: AWDL data keeps WMM/6Mbps/sequence/ACK; four PSF/MIF management cases use MT76 ROC ALTX; infrastructure RA and management queue preserved.");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='mtk-awdl-txwi-') as directory:

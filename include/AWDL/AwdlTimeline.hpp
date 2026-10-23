@@ -18,6 +18,18 @@ inline bool currentWindow(const State &s,uint64_t now,Window &out) {
          uint16_t(s.counter(now)-s.counter(now)%s.presence),s.channel(now),s.presence};
     return true;
 }
+// AWDL multicast rendezvous uses EAW slots 0 and 10 in the 16-slot cycle.
+// Preserve the packet through other windows; sending an mDNS query on an
+// arbitrary discovery channel does not reach the peers listening for it.
+inline bool multicastReady(const State &s,uint64_t now) {
+    Window w={};
+    if(!currentWindow(s,now,w) || !w.channel) return false;
+    unsigned slot=(s.counter(now)/s.presence)%slots;
+    if(slot!=0 && slot!=10) return false;
+    uint64_t guard=16*1024;
+    if(guard>(w.end-w.start)/4) guard=(w.end-w.start)/4;
+    return now-w.start>=guard && w.end-now>=guard;
+}
 // One MCU queue admission can wait 30*100ms, then ROC has a one-second
 // response budget. Add one complete local/known-destination channel cycle
 // and the scheduler's 8ms edge margin. Snapshot this budget on enqueue:
@@ -44,11 +56,60 @@ inline uint32_t dataQueueLifetimeUs(const State &s,const uint8_t *destination) {
 // arbitration before the next EAW. A live EAW is still closed only within
 // native's duration tolerance; this lead never fabricates an early AW-start.
 constexpr uint32_t rocLeadUs=55000;
+// Keep a bounded history of actual accepted ROC response/preparation delays.
+// A boot-time outlier must not permanently skip nearby AWs after firmware
+// recovers. Repeated polling of the same grant is not a timing observation.
+struct RocLeadTiming {
+    uint32_t samples[8]={}, leadUs=rocLeadUs;
+    unsigned count=0, next=0;
+    uint64_t updates=0, decreases=0;
+    uint32_t observe(uint32_t responseUs,uint64_t preparationUs) {
+        uint64_t need=uint64_t(responseUs)+preparationUs+8000;
+        if(need>rocResponseTimeoutUs) need=rocResponseTimeoutUs;
+        if(need<rocLeadUs) need=rocLeadUs;
+        samples[next]=static_cast<uint32_t>(need); next=(next+1)%8;
+        if(count<8) ++count;
+        uint32_t value=rocLeadUs;
+        for(unsigned i=0;i<count;++i) if(samples[i]>value) value=samples[i];
+        if(value<leadUs) ++decreases;
+        leadUs=value; ++updates; return value;
+    }
+};
+// Arbitration differs by destination channel (for example, ~133ms on 6
+// and ~12ms on 149). Keep bounded independent histories so a slow channel
+// does not hide a reachable AW on a fast channel. An unseen/evicted channel
+// uses the global estimate until its first accepted grant is observed.
+// Age a channel out after eight newer grants on other channels, matching
+// the global history's horizon. Otherwise one old startup spike can prevent
+// revisiting that channel forever, so its estimate can never recover.
+struct RocChannelTiming {
+    struct Entry { uint8_t channel=0; uint64_t observed=0; RocLeadTiming timing; } entries[slots];
+    unsigned next=0;
+    uint64_t observations=0;
+    uint32_t lead(uint8_t channel,uint32_t fallback=rocLeadUs) const {
+        for(const auto &entry:entries)
+            if(entry.channel==channel && entry.timing.count && observations-entry.observed<8)
+                return entry.timing.leadUs;
+        return fallback;
+    }
+    void observe(uint8_t channel,uint32_t responseUs,uint64_t preparationUs) {
+        if(!channel || channel>165) return;
+        Entry *found=nullptr;
+        for(auto &entry:entries) if(entry.channel==channel) { found=&entry; break; }
+        if(!found) {
+            found=&entries[next]; next=(next+1)%slots;
+            *found=Entry{}; found->channel=channel;
+        }
+        if(observations-found->observed>=8) found->timing=RocLeadTiming{};
+        found->observed=++observations;
+        found->timing.observe(responseUs,preparationUs);
+    }
+};
 // Prepare the BSS and ROC before the edge, and keep one grant for adjacent
 // equal channels. A grant alone never changes the announced schedule.
 struct RadioPlan { Window window; uint64_t requestAt; uint32_t durationMs; };
 inline bool planRadio(const State &s,uint64_t now,RadioPlan &out,uint32_t leadUs=rocLeadUs,
-                      bool skipCurrent=false) {
+                      bool skipCurrent=false,const RocChannelTiming *timing=nullptr) {
     Window target={};
     if(!currentWindow(s,now,target)) return false;
     if(skipCurrent || !target.channel || now-target.start>8000) {
@@ -62,36 +123,41 @@ inline bool planRadio(const State &s,uint64_t now,RadioPlan &out,uint32_t leadUs
     // slot. Choose a reachable future edge in the same real clock instead of
     // repeatedly receiving grants after their first target has already ended.
     // Initial/default lead retains the fast-response startup behavior.
-    uint64_t ready=now+leadUs;
     // The measured lead includes an 8ms preparation margin. A timer arriving
     // within that margin must retain its already reachable sparse target.
-    if(leadUs>rocLeadUs && leadUs>unsigned(s.presence)*awUs+8000 && target.start+8000<ready) {
-        if(!currentWindow(s,ready,target)) return false;
-        if(target.start+8000<ready || !target.channel) {
-            for(unsigned i=0;i<s.sequence.count;++i) {
-                if(!currentWindow(s,target.end,target)) return false;
-                if(target.channel) break;
-            }
-        }
-        if(!target.channel) return false;
+    // Examine each candidate with its own channel's latency. Jumping to
+    // now+the first channel's lead also skips faster intervening channels.
+    unsigned budget=rocResponseTimeoutUs/(unsigned(s.presence)*awUs)+s.sequence.count+2;
+    uint32_t selectedLead=leadUs;
+    for(;;) {
+        selectedLead=timing ? timing->lead(target.channel,leadUs) : leadUs;
+        if(target.channel && !(selectedLead>rocLeadUs &&
+           selectedLead>unsigned(s.presence)*awUs+8000 &&
+           target.start+8000<now+selectedLead)) break;
+        if(!budget-- || !currentWindow(s,target.end,target)) return false;
     }
-    uint64_t at=target.start>leadUs ? target.start-leadUs : 0;
+    uint64_t at=target.start>selectedLead ? target.start-selectedLead : 0;
     if(at<now) at=now;
-    uint64_t end=target.end;
+    uint64_t end=target.end, cursor=end;
     for(unsigned i=1;i<s.sequence.count;++i) {
         Window next={};
-        if(!currentWindow(s,end,next) || next.channel!=target.channel) break;
-        end=next.end;
-        if(end-at>=uint64_t(maxRocMs)*1000) break;
+        if(!currentWindow(s,cursor,next) || (next.channel && next.channel!=target.channel)) break;
+        // An idle slot promises no AW, but need not tear down a radio grant
+        // between same-channel windows. Never extend into trailing idle time.
+        cursor=next.end;
+        if(next.channel==target.channel) end=next.end;
+        if(cursor-at>=uint64_t(maxRocMs)*1000) break;
     }
     uint64_t duration=(end-at+4000+999)/1000;
     if(duration>maxRocMs) duration=maxRocMs;
     out={target,at,static_cast<uint32_t>(duration)}; return true;
 }
 inline bool grantCoversWindow(const Window &w,const Reservation &grant,uint64_t now) {
-    uint64_t at=now>w.start ? now : w.start;
+    uint64_t at=grant.grantObservedAt>w.start ? grant.grantObservedAt : w.start;
+    uint64_t check=now>w.start ? now : w.start;
     uint64_t end=grant.deadline<w.end ? grant.deadline : w.end;
-    return w.channel && grant.canTransmit(w.channel,at) && end>at &&
+    return w.channel && grant.grantObservedAt && grant.grantObservedAt<=check &&
+        grant.canTransmit(w.channel,check) && end>at &&
         end-at+10*1024>=unsigned(w.presence)*awUs;
 }
 // Keep the original future reservation when an early grant arrives. Replanning
@@ -136,10 +202,14 @@ struct Timeline {
         if(open || !w.channel || now<w.start || now>=w.end || now-w.start>8000 ||
            !grant.canTransmit(w.channel,now) || !grant.grantObservedAt ||
            grant.grantObservedAt>now) { ++late; return false; }
+        // The radio is available from the accepted grant, independently of
+        // timer delivery. A prepared grant covers the scheduled edge; a late
+        // grant starts only at its actual observation, never before RF exists.
+        uint64_t start=grant.grantObservedAt>w.start ? grant.grantObservedAt : w.start;
         uint64_t end=grant.deadline<w.end ? grant.deadline : w.end;
         // Native sanityCheckAWEnd allows +/-10 TU, not an arbitrary partial
         // dwell. Never announce a 32ms grant as a complete 64TU native AW.
-        if(end-now+10*1024<unsigned(w.presence)*awUs) { ++shortGrants; return false; }
+        if(end-start+10*1024<unsigned(w.presence)*awUs) { ++shortGrants; return false; }
         // Early preparation closes within native's duration tolerance. A
         // control/clock change must not announce the same physical EAW again.
         if(emitted && now<active.end) return false;
@@ -155,7 +225,7 @@ struct Timeline {
         role=nativeRole; token=grant.token; grantObservedAt=grant.grantObservedAt;
         scheduleRecorded=radioSchedule!=nullptr;
         if(radioSchedule) schedule=*radioSchedule;
-        lastStart=now; lastCounter=w.counter; lastPresence=w.presence; ++starts;
+        lastStart=start; lastCounter=w.counter; lastPresence=w.presence; ++starts;
         memcpy(sync,parent,6); memcpy(root,master,6);
         memcpy(lastSync,parent,6); memcpy(lastRoot,master,6); return true;
     }

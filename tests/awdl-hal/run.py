@@ -1,8 +1,8 @@
 """Execute actual HAL builders with mocked firmware waits, including teardown injection."""
 from pathlib import Path
-import re, subprocess, tempfile
+import re, subprocess, sys, tempfile
 root=Path(__file__).resolve().parents[2]
-s=(root/'SimpleMtkWlan/hal_mwx/MtkMwx.cpp').read_text()
+s=(Path(sys.argv[1]) if len(sys.argv)>1 else root/'SimpleMtkWlan/hal_mwx/MtkMwx.cpp').read_text()
 w=(root/'SimpleMtkWlan/hal_mwx/if_mwxreg.h').read_text()
 def function(signature):
     a=s.index(signature); return s[a:s.index('\n}\n',a)+3]
@@ -81,6 +81,8 @@ struct mwx_softc {
  uint64_t sc_awdl_roc_submitted=0,sc_awdl_roc_send_failed=0,sc_awdl_roc_scan_blocked=0,sc_awdl_roc_busy_blocked=0;
  uint64_t sc_awdl_roc_events=0,sc_awdl_roc_grants=0,sc_awdl_roc_rejected=0,
  sc_awdl_roc_grant_delay_us=0,sc_awdl_roc_max_grant_delay_us=0;
+ uint64_t sc_awdl_roc_command_results=0,sc_awdl_roc_command_failed=0,sc_awdl_roc_command_malformed=0,
+ sc_awdl_roc_command_result_us=0;uint32_t sc_awdl_roc_command_status=0;
  uint64_t sc_awdl_roc_timeouts=0;
  bool sc_awdl_roc_abort_pending=false;uint8_t sc_awdl_roc_abort_token=0;
  uint64_t sc_awdl_roc_abort_submitted=0,sc_awdl_roc_abort_failed=0,sc_awdl_roc_abort_retry_at=0;
@@ -91,9 +93,9 @@ struct mwx_softc {
  uint64_t sc_awdl_roc_last_event_us=0,sc_awdl_roc_last_response_us=0;
  uint64_t sc_awdl_tx_submitted=0,sc_awdl_tx_bad_frame=0,sc_awdl_tx_no_grant=0,sc_awdl_tx_busy=0,
  sc_awdl_tx_no_peer=0,sc_awdl_tx_backpressure=0,sc_awdl_tx_copy_failed=0,sc_awdl_tx_dma_failed=0;
- int sc_awdl_tx_errno=0;
+ int sc_awdl_tx_errno=0;mtkawdl::TxStatusCounters sc_awdl_tx_status;
  bool sc_awdl_enabled,sc_awdl_configured,sc_awdl_filter_active;uint32_t sc_awdl_filter;
- uint32_t sc_flags=0;int sc_scan_task=0;
+ uint32_t sc_flags=0;int sc_scan_task=0,sc_scan_to=0;bool sc_awdl_scan_suspended=false;
  IOLock*sc_awdl_lock;uint32_t sc_awdl_epoch;bool sc_awdl_busy,sc_awdl_stopping;unsigned sc_awdl_calls;
  uint8_t sc_awdl_channel;uint64_t sc_awdl_token_used[256];
  bool sc_detaching,sc_resetting;struct {uint8_t num_streams,antenna_mask;}sc_capa;
@@ -148,8 +150,10 @@ mbuf*mwx_fill_sta_req_hdr(mbuf*,mwx_vif*,uint8_t,uint16_t,uint16_t);
 int mwx_mcu_send_mbuf(mwx_softc*sc,int cmd,mbuf*m,int*seq){*seq=9;int rv=capture(sc,cmd,m->bytes,m->len);delete m;return rv;}
 int mwx_mcu_wait_resp_int(mwx_softc*sc,int,int,uint32_t*status){assert(!sc->sc_awdl_lock->locked);if(on_wait)on_wait(sc);*status=fw_status?fw_status:reply_status;return 0;}
 int scan_cancel_status=0,scan_cancels=0,scan_tasks=0,systq=0;
-int mt7921_mcu_hw_scan_cancel(mwx_softc*){++scan_cancels;return scan_cancel_status;}
+std::function<void(mwx_softc*)> on_scan_cancel;
+int mt7921_mcu_hw_scan_cancel(mwx_softc*s){++scan_cancels;if(on_scan_cancel)on_scan_cancel(s);if(!scan_cancel_status)s->sc_flags&=~(MWX_FLAG_SCANNING|MWX_FLAG_BGSCAN);return scan_cancel_status;}
 void task_add(int,int*){++scan_tasks;}
+void timeout_del(int*){}
 class MtkMwx {public:mwx_softc *com;std::map<std::string,uint64_t> numbers{};std::map<std::string,std::string> strings{};MtkMwx *mwxController(){return this;}void setProperty(const char*k,const char*v){strings[k]=v;}void setProperty(const char*k,uint64_t v,unsigned){numbers[k]=v;}void setProperty(const char*k,bool v){numbers[k]=v;}void awdlPublishDiagnostics();bool awdlInterfaceReady();bool awdlChannelAllowed(uint8_t);void awdlAbort();IOReturn awdlPrepareChannel(uint8_t);IOReturn awdlEnable(const uint8_t*,bool);IOReturn awdlReserve(uint8_t,uint32_t);bool awdlCanTransmit(uint8_t);IOReturn awdlPeer(const uint8_t*,bool);IOReturn awdlTransmit(mbuf_t,uint8_t);IOReturn awdlTryTransmit(mbuf_t*,uint8_t);};
 '''+structs+r'''
 mbuf*mwx_fill_sta_req_hdr(mbuf*m,mwx_vif*v,uint8_t omac,uint16_t wcid,uint16_t count){auto*p=(sta_req_hdr*)m->bytes;p->bss_idx=v->idx;p->wlan_idx_lo=wcid;p->wlan_idx_hi=wcid>>8;p->tlv_num=count;p->is_tlv_append=1;p->muar_idx=omac;return m;}
@@ -157,7 +161,7 @@ mbuf*mwx_fill_sta_req_hdr(mbuf*m,mwx_vif*v,uint8_t omac,uint16_t wcid,uint16_t c
 IOLock lock;
 mwx_softc make(){mwx_softc sc{};sc.sc_awdl_lock=&lock;sc.sc_ic.ic_if.if_flags=1;sc.sc_capa={2,3};sc.sc_awdl_vif.idx=sc.sc_awdl_vif.omac_idx=1;sc.sc_awdl_vif.vif_mn.wcid=18;sc.sc_awdl_enabled=true;
  for(int ch:{6,44,149}){sc.sc_ic.ic_channels[ch].ic_freq=ch<=14?2407+ch*5:5000+ch*5;sc.sc_ic.ic_channels[ch].ic_flags=1;sc.sc_ic.ic_chan_active[ch/8]|=1U<<(ch%8);sc.sc_ic.ic_chan_avail[ch/8]|=1U<<(ch%8);}return sc;}
-void reset(){wire.clear();commands.clear();calls=fail_at=fw_status=0;model=false;memset(owned,0,sizeof(owned));reply_status=0;alloc_fail=false;on_wait=nullptr;on_sleep=nullptr;lock.locked=false;clock_us=100000;scan_cancel_status=scan_cancels=scan_tasks=0;}
+void reset(){wire.clear();commands.clear();calls=fail_at=fw_status=0;model=false;memset(owned,0,sizeof(owned));reply_status=0;alloc_fail=false;on_wait=nullptr;on_sleep=nullptr;on_scan_cancel=nullptr;lock.locked=false;clock_us=100000;scan_cancel_status=scan_cancels=scan_tasks=0;}
 int main(){
  // Registration readiness is independent of AP state and secondary BSS
  // activation/command ownership, but rejects early boot/power/reset/detach.
@@ -258,13 +262,12 @@ int main(){
  assert(hal.strings["MTKAWDLROCState"]=="abort-pending"&&hal.numbers["MTKAWDLROCAbortPending"]);
  assert(hal.numbers["MTKAWDLROCAbortToken"]==7&&hal.numbers["MTKAWDLROCAbortStatus"]==EIO);
  assert(hal.numbers["MTKAWDLROCQueueDelayUS"]==1200000);
- // RLM must configure the secondary BSS before the exact ROC acquire packet.
+ // MT76 P2P discovery has no persistent channel context. Initial ROC is
+ // self-contained and must not turn that device into an active RLM BSS.
  for(int ch:{6,44,149}){
   reset();sc=make();assert(hal.awdlReserve(ch,300)==0);
-  assert(commands.size()==2&&commands[0]==MCU_UNI_CMD_BSS_INFO_UPDATE&&commands[1]==0x00020027);
-  const auto&rlm=wire[0];assert(rlm.size()==20&&rlm[0]==1&&rlm[8]==ch&&rlm[9]==ch&&rlm[17]==(ch<=14?0:1));
-  assert(sc.sc_awdl_channel==ch);
-  const auto&roc=wire[1];
+  assert(commands.size()==1&&commands[0]==0x00020027&&!sc.sc_awdl_channel);
+  const auto&roc=wire[0];
   assert(roc.size()==28&&roc[8]==1&&roc[10]==ch&&roc[12]==(ch<=14?1:2));
   assert(roc[14]==ch&&roc[17]==ch&&roc[19]==1&&mtkawdl::le32(roc.data()+20)==300);
   assert(!hal.awdlCanTransmit(ch));
@@ -272,8 +275,7 @@ int main(){
   assert(sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,ch,300,clock_us));
   assert(hal.awdlCanTransmit(ch));clock_us+=300001;assert(!hal.awdlCanTransmit(ch));
  }
- // Initial RLM stays stable: temporary switches use the exact ROC channel
- // without a synchronous BSS wait at the next AW boundary.
+ // Temporary switches use the exact ROC channel without a BSS wait.
  reset();sc=make();sc.sc_awdl_channel=6;
  assert(hal.awdlReserve(6,70)==0&&commands.size()==1&&commands[0]==0x20027);
  assert(sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,6,70,clock_us));
@@ -291,14 +293,15 @@ int main(){
  mtkawdl::put32(switched.data()+20,70);clock_us+=3000;
  mwx_awdl_roc_event(&sc,switched.data(),switched.size(),clock_us);
  assert(hal.awdlCanTransmit(149)&&!hal.awdlCanTransmit(6)&&sc.sc_awdl_channel==6);
- // Failed/stale RLM must not request ROC or publish a configured channel.
+ // Even the first acquire must not enter the BSS wait callback. With a
+ // failing BSS reply configured, the raw ROC still awaits its own grant.
  reset();sc=make();fw_status=7;
- assert(hal.awdlReserve(44,70)==kIOReturnIOError&&commands.size()==1&&!sc.sc_awdl_channel&&!sc.sc_awdl_roc.pending);
+ assert(hal.awdlReserve(44,70)==0&&commands.size()==1&&commands[0]==0x20027&&!sc.sc_awdl_channel&&sc.sc_awdl_roc.pending);
  reset();sc=make();on_wait=[](mwx_softc*s){clock_us+=45000;++s->sc_awdl_epoch;s->sc_awdl_stopping=true;};
  assert(hal.awdlReserve(44,70)==kIOReturnAborted&&commands.size()==1&&!sc.sc_awdl_channel&&!sc.sc_awdl_roc.pending);
- // The request timeout starts after the synchronous RLM response.
+ // Initial ROC never incurs the synchronous RLM response delay.
  reset();sc=make();on_wait=[](mwx_softc*){if(commands.back()==MCU_UNI_CMD_BSS_INFO_UPDATE)clock_us+=45000;};
- assert(hal.awdlReserve(44,70)==0&&sc.sc_awdl_roc.requestedAt==145000&&sc.sc_awdl_roc.deadline==145000+mtkawdl::rocResponseTimeoutUs);
+ assert(hal.awdlReserve(44,70)==0&&clock_us==100000&&sc.sc_awdl_roc.requestedAt==100000&&sc.sc_awdl_roc.deadline==100000+mtkawdl::rocResponseTimeoutUs);
  // An unanswered request expires once. Deadline and pending grant stay
  // distinct from physical dwell; aborting an already cleared token is idle.
  clock_us=sc.sc_awdl_roc.deadline;hal.awdlAbort();assert(sc.sc_awdl_roc_timeouts==1&&!sc.sc_awdl_roc.pending);
@@ -364,8 +367,33 @@ int main(){
  assert(!sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,6,1101,clock_us));
  assert(sc.sc_awdl_roc.grant(sc.sc_awdl_roc.token,6,1100,clock_us));
 
- reset();sc=make();assert(hal.awdlReserve(6,0)==kIOReturnBadArgument&&commands.empty());assert(hal.awdlReserve(6,mtkawdl::maxRocMs+1)==kIOReturnBadArgument);sc.sc_ic.ic_state=IEEE80211_S_SCAN;assert(hal.awdlReserve(6,30)==kIOReturnNotReady&&sc.sc_awdl_roc_scan_blocked==1&&sc.sc_awdl_roc_submitted==0);
- assert(scan_cancels==1&&scan_tasks==1);
+ reset();sc=make();sc.sc_ic.ic_state=IEEE80211_S_SCAN;sc.sc_flags=MWX_FLAG_SCANNING;
+ assert(hal.awdlReserve(6,0)==kIOReturnBadArgument&&commands.empty());
+ assert(hal.awdlReserve(6,mtkawdl::maxRocMs+1)==kIOReturnBadArgument);
+ assert(hal.awdlReserve(0,30)==kIOReturnBadArgument);
+ assert(!scan_cancels&&!sc.sc_awdl_scan_suspended&&sc.sc_flags==MWX_FLAG_SCANNING);
+ sc.sc_awdl_busy=true;assert(hal.awdlReserve(6,30)==kIOReturnNotReady&&!scan_cancels);sc.sc_awdl_busy=false;
+ assert(hal.awdlReserve(6,30)==kIOReturnNotReady&&sc.sc_awdl_roc_scan_blocked==1&&sc.sc_awdl_roc_submitted==0);
+ assert(scan_cancels==1&&scan_tasks==0&&sc.sc_awdl_scan_suspended);
+ // Logical SCAN no longer restarts/cancels the radio after its one cancel.
+ assert(hal.awdlReserve(6,70)==0&&scan_cancels==1&&scan_tasks==0);
+ assert(sc.sc_awdl_roc.pending);
+ assert(hal.awdlEnable(nullptr,false)==0&&!sc.sc_awdl_scan_suspended&&scan_tasks==1);
+ assert(hal.awdlEnable(nullptr,false)==0&&scan_tasks==1);
+ // Background scan recovery also happens once, without restarting on stop/reset.
+ for(unsigned lifecycle=0;lifecycle<3;++lifecycle) {
+  reset();sc=make();sc.sc_ic.ic_flags=IEEE80211_F_BGSCAN;sc.sc_awdl_scan_suspended=true;
+  if(lifecycle==1)sc.sc_ic.ic_if.if_flags=0;
+  if(lifecycle==2)sc.sc_resetting=true;
+  assert(hal.awdlEnable(nullptr,false)==0&&!sc.sc_awdl_scan_suspended);
+  assert(scan_tasks==(lifecycle==0?1:0));
+ }
+ // A reset while scan cancellation releases the command gate invalidates ROC.
+ reset();sc=make();sc.sc_flags=MWX_FLAG_SCANNING;
+ on_scan_cancel=[](mwx_softc*s){++s->sc_awdl_epoch;s->sc_awdl_stopping=true;};
+ assert(hal.awdlReserve(6,30)==kIOReturnAborted&&scan_cancels==1);
+ assert(!sc.sc_awdl_scan_suspended&&!sc.sc_awdl_roc.pending&&!sc.sc_awdl_busy&&!scan_tasks&&commands.empty());
+ reset();sc=make();
  sc.sc_ic.ic_state=0;sc.sc_flags=MWX_FLAG_SCANNING|MWX_FLAG_BGSCAN;
  scan_cancel_status=5;assert(hal.awdlReserve(6,70)==kIOReturnNotReady&&sc.sc_flags);
  scan_cancel_status=0;assert(hal.awdlReserve(6,70)==kIOReturnNotReady&&!sc.sc_flags);

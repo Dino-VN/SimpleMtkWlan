@@ -15,6 +15,7 @@
 #include "AirportMtkSkywalkInterface.hpp"
 #include "MtkPCIEDeviceWrapper.hpp"
 #include "MtkPCIe.hpp"
+#include "hal_mwx/MtkMwx.hpp"
 
 #define super IO80211Controller
 OSDefineMetaClassAndStructors(AirportMtkWlan, IO80211Controller);
@@ -1405,6 +1406,11 @@ void AirportMtkWlan::setPowerStateOff()
     XYLog("%s\n", __FUNCTION__);
     pmPowerState = kPowerStateOff;
     disableAdapter(bsdInterface);
+    if (auto *hal = OSDynamicCast(MtkMwx, fHalService)) {
+        IOReturn status = hal->waitPowerTransition();
+        setProperty("MTKSleepStopStatus", static_cast<uint64_t>(status), 32);
+        IOLog("AirportMtkWlan: sleep HAL stop status=0x%x\n", status);
+    }
     pmPolicyMaker->acknowledgeSetPowerState();
 }
 
@@ -1412,6 +1418,15 @@ void AirportMtkWlan::setPowerStateOn()
 {
     XYLog("%s\n", __FUNCTION__);
     pmPowerState = kPowerStateOn;
+    if (power_state && bsdInterface && fHalService) {
+        IOReturn status = enableAdapter(bsdInterface);
+        if (status == kIOReturnSuccess) {
+            if (auto *hal = OSDynamicCast(MtkMwx, fHalService))
+                status = hal->waitPowerTransition();
+        }
+        setProperty("MTKWakeStartStatus", static_cast<uint64_t>(status), 32);
+        IOLog("AirportMtkWlan: wake HAL start status=0x%x\n", status);
+    }
     pmPolicyMaker->acknowledgeSetPowerState();
 }
 

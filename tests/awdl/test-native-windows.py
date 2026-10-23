@@ -36,10 +36,10 @@ struct Timer{unsigned us=0;void setTimeoutMS(unsigned n){us=n*1000;}
 struct Packet{std::vector<uint8_t> bytes;};using mbuf_t=Packet*;
 void mbuf_freem(mbuf_t m){delete m;}void*mbuf_data(mbuf_t m){return m->bytes.data();}
 struct Hal{
- bool on=true;mtkawdl::Reservation grant{};unsigned reserves=0,aborts=0,transmits=0;
+ bool on=true,thirdChannel=false;mtkawdl::Reservation grant{};unsigned reserves=0,aborts=0,transmits=0;
  uint8_t requested=0,preparedChannel=0;unsigned prepares=0;
  uint32_t duration=0;std::function<void()> onReserve,onPrepare;std::function<void(bool)> onPeer;
- IOReturn awdlPrepareChannel(unsigned c){++prepares;preparedChannel=c;if(onPrepare)onPrepare();return 0;}bool awdlIsEnabled(){return on;}bool awdlChannelAllowed(unsigned c){return c==6||c==44;}
+ IOReturn awdlPrepareChannel(unsigned c){++prepares;preparedChannel=c;if(onPrepare)onPrepare();return 0;}bool awdlIsEnabled(){return on;}bool awdlChannelAllowed(unsigned c){return c==6||c==44||(thirdChannel&&c==149);}
  bool awdlGrantSnapshot(mtkawdl::Reservation &out){out=grant;return on;}
  bool awdlCanTransmit(unsigned c){return grant.canTransmit(c,clockUS);}
  void awdlAbort(){++aborts;grant.cancel();}
@@ -68,7 +68,8 @@ struct AirportMtkAwdlInterface{
  uint64_t serviceTicks=0,reserveAttempts=0,grantObservations=0,awStartNotifications=0,
  nextAction=0,actionSubmitted=0,actionFailed=0,miStart=0,miSubmitted=0,miFailed=0;
  uint64_t reserveWaitUS=0,reserveMaxWaitUS=0,reserveInvalidations=0;uint32_t reserveInvalidReason=0;
- uint32_t reserveLeadUS=mtkawdl::rocLeadUs;uint64_t grantLatencyObservedAt=0;
+ uint32_t reserveLeadUS=mtkawdl::rocLeadUs;mtkawdl::RocLeadTiming reserveTiming;uint64_t grantLatencyObservedAt=0;
+ mtkawdl::RocChannelTiming reserveChannelTiming;
  struct{unsigned mode=3;}afMode;apple80211_awdl_sync_params syncParams{1,16,16,16,440,0};
  apple80211_awdl_sync_channel_sequence channelSequence{};
  apple80211_awdl_presence_mode presence{};
@@ -122,13 +123,147 @@ const uint8_t local[]={2,1,2,3,4,5},peer[]={2,1,2,3,4,6};
 void init(AirportMtkAwdlInterface&d){clockUS=1000000;d.state.init(local,clockUS);
  d.radio.give(1,6,70);}
 int main(){
+ // Keep latency isolated while it is fresh, and age stale channel history
+ // with the global eight-grant horizon so a startup outlier can recover.
+ mtkawdl::RocChannelTiming isolated;
+ isolated.observe(6,133000,0);isolated.observe(149,12000,0);
+ assert(isolated.lead(6)==141000&&isolated.lead(149)==mtkawdl::rocLeadUs);
+ assert(isolated.lead(44,141000)==141000);
+ mtkawdl::State choose;choose.init(local,1000000);
+ memset(choose.sequence.channels,0,16);choose.sequence.channels[1]=6;choose.sequence.channels[2]=149;
+ mtkawdl::RadioPlan chosen{};
+ assert(mtkawdl::planRadio(choose,1050000,chosen,141000,false,&isolated));
+ assert(chosen.window.channel==149&&chosen.window.counter==8);
+ for(unsigned i=0;i<7;++i)isolated.observe(149,12000,0);
+ assert(isolated.lead(6,55000)==55000);
+ isolated.observe(6,12000,0);assert(isolated.lead(6)==55000);
+ isolated.observe(149,500000,1000);
+ assert(isolated.lead(149)==509000&&isolated.lead(6)==55000);
+ // Bounded cache replacement must fall back, never reuse another channel's
+ // estimate; invalid channel samples cannot evict useful history.
+ auto observations=isolated.observations;
+ isolated.observe(0,900000,0);isolated.observe(166,900000,0);
+ assert(isolated.observations==observations);
+ for(unsigned c=1;c<=17;++c)isolated.observe(c,20000+c,0);
+ assert(isolated.lead(149,123000)==123000);
+
+ // Replay the 2026-10-23 discovery build's real sparse channel sequence.
+ // Channel 6 grants took about 133ms; channel 149 normally took 12ms.
+ // A slow channel must not push a reachable home-channel AW out of view.
+ // Observe actual grants to train the estimator, then require every
+ // non-idle AW after startup, with real RF coverage and native tolerances.
+ AirportMtkAwdlInterface channelTiming;init(channelTiming);
+ channelTiming.radio.grant.cancel();channelTiming.radio.thirdChannel=true;
+ const uint8_t measuredChannels[16]={149,0,149,0,0,0,0,0,6,0,149,0,0,0,0,0};
+ memcpy(channelTiming.state.sequence.channels,measuredChannels,16);
+ channelTiming.state.ownSequence=channelTiming.state.sequence;
+ const uint64_t measuredEpoch=clockUS,measuredCycle=16*4*uint64_t(mtkawdl::awUs);
+ uint64_t measuredDue=0,measuredStop=clockUS+10*measuredCycle;
+ uint8_t measuredToken=1;
+ channelTiming.radio.onReserve=[&]{
+  channelTiming.radio.grant.request(++measuredToken,channelTiming.radio.requested,clockUS);
+  const unsigned homeDelays[]={11398,11855,12061,31582};
+  measuredDue=clockUS+(channelTiming.radio.requested==6?133185:homeDelays[channelTiming.radio.reserves%4]);
+ };
+ channelTiming.onStart=[&]{
+  assert(channelTiming.radio.grant.canTransmit(channelTiming.awTimeline.active.channel,clockUS));
+  assert(channelTiming.awTimeline.lastStart>=channelTiming.radio.grant.grantObservedAt);
+ };
+ while(clockUS<measuredStop) {
+  if(channelTiming.radio.grant.pending&&clockUS>=measuredDue)
+   assert(channelTiming.radio.grant.grant(measuredToken,channelTiming.radio.requested,channelTiming.radio.duration,clockUS));
+  channelTiming.serviceInGate();assert(channelTiming.t.us);clockUS+=channelTiming.t.us+250;
+ }
+ unsigned measuredStarts=0,measuredMissing=0;uint32_t measuredStart=0;
+ for(const auto &event:channelTiming.events) {
+  if(event.id==41) {
+   measuredStart=mtkawdl::be32(event.bytes.data()+20);
+   uint16_t counter=mtkawdl::le32(event.bytes.data());
+   assert(mtkawdl::le32(event.bytes.data()+28)==measuredChannels[(counter/4)%16]);
+   int64_t phase=int64_t(measuredStart)-int64_t(measuredEpoch+uint64_t(counter)*mtkawdl::awUs);
+   assert(phase>=0&&phase<=5*1024);
+   if(counter>=2*64)++measuredStarts;
+  } else {
+   unsigned duration=uint32_t(mtkawdl::be32(event.bytes.data()+4)-measuredStart)/1024;
+   assert(duration>=54&&duration<=74);
+  }
+ }
+ for(unsigned slot=2*16;slot<10*16;++slot)if(measuredChannels[slot%16]) {
+  bool found=false;
+  for(const auto &event:channelTiming.events)
+   if(event.id==41&&mtkawdl::le32(event.bytes.data())==slot*4)found=true;
+  if(!found)++measuredMissing;
+ }
+ fprintf(stderr,"measured 6/149 replay: starts=%u missing=%u after startup\n",measuredStarts,measuredMissing);
+ assert(measuredStarts==32&&measuredMissing==0);
+
+ // A prepared radio grant covers the edge even if host dispatch alternates
+ // between on-time and 7.9ms late. Native's firmware spacing tolerance is
+ // only 5TU; verify wire times, RF coverage and host delivery separately.
+ AirportMtkAwdlInterface jittered;init(jittered);jittered.afMode.mode=0;
+ jittered.state.baseCounter=65532;
+ const uint64_t jitterEpoch=(uint64_t(1)<<32)-4*mtkawdl::awUs-4000;
+ jittered.state.init(local,jitterEpoch);jittered.state.baseCounter=65532;
+ for(unsigned i=0;i<42;++i) {
+  uint64_t edge=jitterEpoch+i*4*uint64_t(mtkawdl::awUs);
+  clockUS=edge-1000;jittered.radio.give(i+1,6,70);
+  clockUS=edge+(i%2?7900:0);jittered.serviceInGate();
+  assert(jittered.awTimeline.open&&jittered.awTimeline.lastStart==edge);
+  assert(mtkawdl::be32(jittered.events.back().bytes.data()+20)==uint32_t(edge));
+  assert(jittered.awTimeline.grantObservedAt<=edge&&clockUS-edge<=10000);
+  clockUS=edge+4*mtkawdl::awUs;jittered.serviceInGate();
+  assert(mtkawdl::be32(jittered.events.back().bytes.data()+4)==uint32_t(clockUS));
+ }
+ assert(jittered.awTimeline.starts==42&&jittered.awTimeline.ends==42);
+ // A grant arriving after the edge cannot backdate RF availability. A
+ // shortened grant's duration uses that RF edge, independently of delivery.
+ AirportMtkAwdlInterface actualLate;init(actualLate);
+ clockUS+=3000;actualLate.radio.give(2,6,56);clockUS+=4000;
+ actualLate.serviceInGate();assert(actualLate.awTimeline.lastStart==1003000);
+ assert(mtkawdl::be32(actualLate.events.back().bytes.data()+20)==1003000);
+ clockUS=actualLate.awTimeline.radioEnd;actualLate.serviceInGate();
+ assert(actualLate.events.size()==2);
+ assert((mtkawdl::be32(actualLate.events[1].bytes.data()+4)-1003000)/1024>=54);
+ mtkawdl::RocLeadTiming history;
+ assert(history.observe(984947,0)==992947);
+ for(unsigned i=0;i<7;++i)assert(history.observe(19261,0)==992947);
+ assert(history.observe(19261,0)==mtkawdl::rocLeadUs&&history.decreases==1);
+ assert(history.observe(500000,5000)==513000);
+ // Replay the observed dense three-channel shape: one 984.947ms response
+ // followed by 19.261ms responses. A single old spike must not permanently
+ // move every later ROC target almost one second into the future.
+ AirportMtkAwdlInterface recovered;init(recovered);recovered.radio.grant.cancel();
+ recovered.radio.thirdChannel=true;
+ const uint8_t observedChannels[16]={6,6,6,6,6,6,44,44,149,6,6,6,6,6,44,44};
+ memcpy(recovered.state.sequence.channels,observedChannels,16);
+ recovered.state.ownSequence=recovered.state.sequence;
+ uint64_t recoveredAt=clockUS,recoveredDue=0,recoveredStop=clockUS+40000000;
+ uint8_t recoveredToken=1;
+ recovered.radio.onReserve=[&]{recovered.radio.grant.request(++recoveredToken,recovered.radio.requested,clockUS);
+  recoveredDue=clockUS+(recovered.radio.reserves==1?984947:19261);};
+ while(clockUS<recoveredStop) {
+  if(recovered.radio.grant.pending&&clockUS>=recoveredDue)
+   assert(recovered.radio.grant.grant(recoveredToken,recovered.radio.requested,recovered.radio.duration,clockUS));
+  recovered.serviceInGate();assert(recovered.t.us);clockUS+=recovered.t.us+250;
+ }
+ unsigned recoveredSkips=0,recoveredStarts=0;uint16_t recoveredPrevious=0;
+ for(const auto &event:recovered.events)if(event.id==41) {
+  uint16_t counter=mtkawdl::le32(event.bytes.data());
+  if(recoveredStarts)recoveredSkips+=uint16_t(counter-recoveredPrevious)/4-1;
+  recoveredPrevious=counter;++recoveredStarts;
+ }
+ fprintf(stderr,"observed schedule recovery: elapsed=%llu lead=%u starts=%u skipped=%u reserves=%u\n",
+  (unsigned long long)(clockUS-recoveredAt),recovered.reserveLeadUS,recoveredStarts,recoveredSkips,recovered.radio.reserves);
+ assert(recovered.reserveLeadUS==mtkawdl::rocLeadUs);
+ assert(recoveredStarts>=300&&recoveredSkips<300);
+ assert(recovered.reserveTiming.updates<=recovered.radio.reserves);
  // Wire offsets are checked independently, including BE timestamp rollover.
  AirportMtkAwdlInterface d;init(d);d.state.baseCounter=65532;
  clockUS+=1000;d.serviceInGate();assert(d.events.size()==1&&d.events[0].id==41);
  const auto&b=d.events[0].bytes;assert(b.size()==36);
  assert(mtkawdl::le32(b.data())==65532&&mtkawdl::le32(b.data()+4)==1);
  assert(!memcmp(b.data()+8,local,6)&&!memcmp(b.data()+14,local,6));
- assert(mtkawdl::be32(b.data()+20)==clockUS&&mtkawdl::le32(b.data()+28)==6);
+ assert(mtkawdl::be32(b.data()+20)==1000000&&mtkawdl::le32(b.data()+28)==6);
  uint64_t end=d.awTimeline.radioEnd;clockUS=end+25000;d.serviceInGate();
  assert(d.events.size()==2&&d.events[1].id==43&&d.events[1].bytes.size()==40);
  assert(mtkawdl::be32(d.events[1].bytes.data()+4)==end);
@@ -259,7 +394,7 @@ int main(){
    assert(lead.radio.grant.grant(leadToken,44,lead.radio.duration,clockUS));
   lead.serviceInGate();clockUS+=1000;
  }
- assert(lead.awTimeline.starts==4&&lead.awTimeline.ends==3&&lead.radio.reserves==4);
+ assert(lead.awTimeline.starts==4&&lead.awTimeline.ends==3&&lead.radio.reserves==1);
 
  // A live grant ending in the idle gap cannot cover the next same-channel
  // AW. Renew at its preparation edge instead of waiting for old expiry.
@@ -397,7 +532,13 @@ int main(){
  uint8_t holdData[24]{};holdData[4]=1;
  holdover.queue[0]=holdover.makeFrame(holdData,sizeof(holdData));
  holdover.queueHead=0;holdover.queueTime[0]=clockUS;holdover.queueDeadline[0]=clockUS+mtkawdl::dataQueueLifetimeUs(holdover.state,(const uint8_t*)mbuf_data(holdover.queue[0])+4);holdover.queueCount=1;
- assert(holdover.radio.awdlCanTransmit(6));holdover.serviceInGate();
+ assert(holdover.radio.awdlCanTransmit(6));
+ uint64_t rendezvousLimit=clockUS+16*4*mtkawdl::awUs;
+ while(holdover.queueCount&&clockUS<rendezvousLimit) {
+  if(holdover.radio.grant.pending&&clockUS>=dueHoldover)
+   assert(holdover.radio.grant.grant(holdoverToken,6,holdover.radio.duration,clockUS));
+  holdover.serviceInGate();if(holdover.queueCount)clockUS+=holdover.t.us+250;
+ }
  assert(!holdover.queueCount&&holdover.dataTxSubmitted==1&&!lost.used);
  // The selected source returns with a small phase offset. Resume bounded
  // tracking without adopting a new AW counter after the holdover.
@@ -551,7 +692,14 @@ int main(){
  clockUS=1000000+4*mtkawdl::awUs-24000;partial.serviceInGate();
  clockUS+=1000;assert(partial.radio.grant.grant(8,44,50,clockUS));
  clockUS=partial.requestedWindow.start+9000;
- uint8_t multicast[24]{};multicast[4]=1;
+ // This is unicast: multicast waits for rendezvous slots, independently
+ // of whether a clipped grant could physically carry the packet.
+ uint8_t multicast[24]{};memcpy(multicast+4,peer,6);
+ partial.dataPeers.setCached(peer,true,clockUS);
+ auto &partialPeer=partial.state.peers[0];partialPeer.used=true;
+ partialPeer.seen=partialPeer.epoch=clockUS;memcpy(partialPeer.mac,peer,6);
+ partialPeer.advertisement.sequence=partial.state.sequence;
+ for(auto &c:partialPeer.advertisement.sequence.channels)c=44;
  partial.queue[0]=partial.makeFrame(multicast,sizeof(multicast));
  partial.queueTime[0]=clockUS;partial.queueDeadline[0]=clockUS+mtkawdl::dataQueueLifetimeUs(partial.state,(const uint8_t*)mbuf_data(partial.queue[0])+4);partial.queueCount=1;partial.serviceInGate();
  assert(partial.events.empty()&&partial.radio.reserves==1&&partial.radio.transmits==1&&!partial.queueCount);
@@ -904,7 +1052,10 @@ int main(){
   run.state.init(local,543337395);
   const uint8_t channels[16]={44,0,6,0,0,0,0,0,6,0,6,0,0,0,0,0};
   memcpy(run.state.sequence.channels,channels,16);run.state.ownSequence=run.state.sequence;
-  run.reserveLeadUS=1000000;
+  run.reserveLeadUS=run.reserveTiming.observe(992000,0);
+  // This fixture intentionally retains the original one-second estimate
+  // to isolate reservation identity/coverage from latency adaptation.
+  run.reserveChannelTiming.observe(6,992000,0);
   run.radio.onReserve=[&run]{run.radio.grant.request(run.radio.grant.token+1,run.radio.requested,clockUS);};
   run.serviceInGate();assert(run.radio.reserves==1&&run.radio.requested==6);
   assert(run.requestedWindow.start==544910259&&run.requestedWindow.end==544975795);
@@ -941,6 +1092,18 @@ int main(){
  AirportMtkAwdlInterface expiresEarly;prepareEarlyGrant(expiresEarly,100);
  clockUS=544434567;expiresEarly.serviceInGate();
  assert(expiresEarly.radio.reserves==2&&expiresEarly.events.empty());
+ AirportMtkAwdlInterface expiresWithNewLead;prepareEarlyGrant(expiresWithNewLead,100);
+ expiresWithNewLead.reserveChannelTiming=mtkawdl::RocChannelTiming{};
+ expiresWithNewLead.reserveChannelTiming.observe(6,458055,0);
+ clockUS=544434567;expiresWithNewLead.serviceInGate();
+ // The channel-specific 458ms sample can move preparation later than the
+ // old global 992ms estimate. Allow that real preparation edge, but require
+ // renewal after the old grant expires and before the reserved AW begins.
+ while(expiresWithNewLead.radio.reserves==1&&clockUS<544460000) {
+  assert(expiresWithNewLead.t.us);clockUS+=expiresWithNewLead.t.us;expiresWithNewLead.serviceInGate();
+ }
+ assert(expiresWithNewLead.radio.reserves==2&&expiresWithNewLead.events.empty());
+ assert(expiresWithNewLead.requestedWindow.start==544910259);
  // Do not retain a reservation whose original channel/counter coordinates
  // no longer belong to the current schedule, even if RF coverage is long.
  AirportMtkAwdlInterface changedTarget;prepareEarlyGrant(changedTarget,1070);

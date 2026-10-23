@@ -415,6 +415,9 @@ struct mwx_softc {
     bool sc_awdl_station_pending[4];
     mtkawdl::Reservation sc_awdl_roc;
     uint64_t sc_awdl_roc_events, sc_awdl_roc_grants, sc_awdl_roc_rejected;
+    uint64_t sc_awdl_roc_command_results, sc_awdl_roc_command_failed, sc_awdl_roc_command_malformed;
+    uint64_t sc_awdl_roc_command_result_us;
+    uint32_t sc_awdl_roc_command_status;
     uint64_t sc_awdl_roc_grant_delay_us, sc_awdl_roc_max_grant_delay_us;
     uint64_t sc_awdl_roc_submitted, sc_awdl_roc_send_failed;
     uint64_t sc_awdl_roc_scan_blocked, sc_awdl_roc_busy_blocked;
@@ -431,11 +434,13 @@ struct mwx_softc {
     uint64_t sc_awdl_tx_submitted, sc_awdl_tx_bad_frame, sc_awdl_tx_no_grant;
     uint64_t sc_awdl_tx_busy, sc_awdl_tx_no_peer, sc_awdl_tx_backpressure;
     uint64_t sc_awdl_tx_copy_failed, sc_awdl_tx_dma_failed;
+    mtkawdl::TxStatusCounters sc_awdl_tx_status;
     int sc_awdl_tx_errno;
     void *sc_awdl_context;
     MtkMwx::AwdlReceive sc_awdl_receive;
     uint8_t sc_awdl_address[6];
     bool sc_awdl_enabled, sc_awdl_configured, sc_awdl_filter_active;
+    bool sc_awdl_scan_suspended;
     uint32_t sc_awdl_filter;
     IOLock *sc_awdl_lock;
     uint32_t sc_awdl_epoch;
@@ -476,7 +481,8 @@ struct mwx_softc {
 #ifdef AIRPORT
 	struct task		sc_power_task;
 	volatile SInt32		sc_power_req;	/* bumped by every enable/disable */
-	SInt32			sc_power_done;	/* last request the task served */
+	volatile SInt32		sc_power_done;	/* last request the task served */
+	int			sc_power_result;
 #endif
 	CTimeout		*sc_reset_to;
 	CTimeout		*sc_scan_to;
@@ -755,6 +761,7 @@ int	mwx_buf_fill(struct mwx_softc *, struct mwx_queue_data *,
 int	mwx_queue_fill(struct mwx_softc *, struct mwx_queue *);
 int	mwx_dma_alloc(struct mwx_softc *);
 int	mwx_dma_reset(struct mwx_softc *, int);
+static int mwx_dma_reinit_cond(struct mwx_softc *);
 void	mwx_dma_free(struct mwx_softc *);
 int	mwx_dma_tx_enqueue(struct mwx_softc *, struct mwx_queue *,
 	    struct mbuf *);
@@ -1027,8 +1034,14 @@ mwx_init_running(struct ifnet *ifp)
 
 	MWX_DEV_LOG(sc, "init start opmode=%d flags=0x%x ic_state=%d\n",
 	    ic->ic_opmode, ifp->if_flags, ic->ic_state);
-	if ((rv = mwx_mcu_drv_pmctrl(sc)) != 0)
+	if ((rv = mwx_mcu_drv_pmctrl(sc)) != 0) {
 		MWX_DEV_LOG(sc, "init driver own failed error=%d\n", rv);
+		return rv;
+	}
+	if ((rv = mwx_dma_reinit_cond(sc)) != 0) {
+		MWX_DEV_LOG(sc, "init DMA recovery failed error=%d\n", rv);
+		return rv;
+	}
 	rv = mwx_mcu_set_deep_sleep(sc, 0);
 	if (rv)
 		MWX_DEV_LOG(sc, "init disable deep sleep returned %d\n", rv);
@@ -1439,6 +1452,7 @@ mwx_scan(struct mwx_softc *sc)
 		printf("%s: could not initiate scan\n", DEVNAME(sc));
 		return rv;
 	}
+    if(sc->sc_awdl_scan_suspended) return 0;
 	sc->sc_scan_requests++;
 	/* End the scan ourselves if the firmware never reports SCAN_DONE. */
 	timeout_add_sec(&sc->sc_scan_to, 12);
@@ -1610,6 +1624,7 @@ mwx_bgscan(struct ieee80211com *ic)
 		printf("%s: could not initiate scan\n", DEVNAME(sc));
 		return err;
 	}
+    if(sc->sc_awdl_scan_suspended) return 0;
 
 	sc->sc_flags |= MWX_FLAG_BGSCAN;
 	sc->sc_scan_requests++;
@@ -2539,14 +2554,28 @@ mwx_power_task(void *arg)
 	req = sc->sc_power_req;
 	OSSynchronizeIO();
 	if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) != IFF_UP) {
+		sc->sc_power_result = 0;
+		OSSynchronizeIO();
 		sc->sc_power_done = req;
 		return;
 	}
 	rv = mwx_init(ifp);
-	sc->sc_power_done = req;
+	if (rv != 0 && !sc->sc_detaching && (ifp->if_flags & IFF_UP)) {
+		/* One bounded firmware reload for this enable request. A failed
+		 * wake must not leave subsequent enables using dead MCU state.
+		 */
+		MWX_DEV_LOG(sc, "power task restart failed=%d; reload firmware\n", rv);
+		task_del(sc->sc_nswq, &sc->sc_reset_task);
+		timeout_del(&sc->sc_reset_to);
+		mwx_fullreset_task(sc);
+		rv = (ifp->if_flags & IFF_RUNNING) ? 0 : EIO;
+	}
+	sc->sc_power_result = rv;
 	MWX_DEV_LOG(sc, "power task init=%d flags=0x%x\n", rv, ifp->if_flags);
 	if (rv != 0)
 		ifp->if_flags &= ~IFF_UP;
+	OSSynchronizeIO();
+	sc->sc_power_done = req;
 }
 #endif
 
@@ -2897,6 +2926,7 @@ mwx_queue_reset(struct mwx_softc *sc, struct mwx_queue *q)
 	/* free buffers */
 	for (i = 0; i < q->mq_count; i++) {
 		md = &q->mq_data[i];
+		md->md_txwi = NULL;
 		if (md->md_mbuf != NULL) {
 			bus_dmamap_sync(sc->sc_dmat, md->md_map, 0,
 			    md->md_map->dm_mapsize,
@@ -3045,7 +3075,13 @@ mwx_dma_reset(struct mwx_softc *sc, int fullreset)
 	mwx_queue_reset(sc, &sc->sc_rxmcuq);
 	mwx_queue_reset(sc, &sc->sc_rxfwdlq);
 
-	/* TDOD mt76_tx_status_check */
+	/* Reset rings no longer refer to old TXP tokens. Reclaim them for
+	 * both conditional wake recovery and a complete firmware reload.
+	 */
+	IOLockLock(mwx_txq_lock);
+	for (u_int i = 0; i < sc->sc_txwi.mt_count; i++)
+		mwx_txwi_put(sc, &sc->sc_txwi.mt_data[i]);
+	IOLockUnlock(mwx_txq_lock);
 
 	/* refill RX queues */
 	if ((rv = mwx_queue_fill(sc, &sc->sc_rxq)) != 0 ||
@@ -3057,6 +3093,48 @@ mwx_dma_reset(struct mwx_softc *sc, int fullreset)
 	mwx_dma_enable(sc);
 
 	return 0;
+}
+
+/* Firmware clears NEED_REINIT when deep sleep loses the WFDMA context.
+ * Recover the host rings before sending any wake-up MCU command, as in
+ * mt792x_wpdma_reinit_cond. This is only called for a stopped interface;
+ * initial attach has not allocated the rings and must not enter here.
+ */
+static IOReturn
+mwx_dma_reinit_gated(OSObject *, void *arg, void *, void *, void *)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+	int rv = 0;
+
+	/* Masking hardware alone does not drain an already queued interrupt.
+	 * The gate excludes its RX callback while buffers are reclaimed. No
+	 * MCU command or response wait is performed with this gate held.
+	 */
+	if (!(mwx_read(sc, MT_WFDMA_DUMMY_CR) & MT_WFDMA_NEED_REINIT)) {
+		MWX_DEV_LOG(sc, "DMA wake recovery start dummy=0x%08x\n",
+		    mwx_read(sc, MT_WFDMA_DUMMY_CR));
+		mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, 0);
+		mwx_write(sc, MT_PCIE_MAC_INT_ENABLE, 0);
+		rv = mwx_dma_reset(sc, 0);
+		MWX_DEV_LOG(sc, "DMA wake recovery done error=%d\n", rv);
+	}
+	return rv;
+}
+
+static int
+mwx_dma_reinit_cond(struct mwx_softc *sc)
+{
+	pci_intr_handle_t ih = (pci_intr_handle_t)sc->sc_ih;
+	if (mwx_read(sc, MT_WFDMA_DUMMY_CR) & MT_WFDMA_NEED_REINIT)
+		return 0;
+	if (sc->sc_ic.ic_if.if_flags & IFF_RUNNING)
+		return EBUSY;
+	if (!ih || !ih->workloop || !sc->sc_txq.mq_map ||
+	    !sc->sc_txmcuq.mq_map || !sc->sc_txfwdlq.mq_map ||
+	    !sc->sc_rxq.mq_map || !sc->sc_rxmcuq.mq_map ||
+	    !sc->sc_rxfwdlq.mq_map)
+		return ENXIO;
+	return ih->workloop->runAction(mwx_dma_reinit_gated, ih, sc);
 }
 
 void
@@ -3629,7 +3707,11 @@ mwx_mcu_send_mbuf(struct mwx_softc *sc, uint32_t cmd, struct mbuf *m, int *seqp)
 	if (cmd & MCU_CMD_FIELD_UNI) {
 		uni_txd = (struct mwx_uni_txd *)txd;
 		uni_txd->len = htole16(tot_len - sizeof(uni_txd->txd));
-		uni_txd->option = seqp ? MCU_CMD_UNI_EXT_ACK : (MCU_CMD_UNI | MCU_CMD_QUERY);
+		// Linux connac2 requests an ACK for ROC acquire/abort even when
+		// remain-on-channel waits only for the separate unsolicited grant.
+		// Request that same wire contract without adding a synchronous wait.
+		uni_txd->option = (seqp || mcu_cmd == 0x27) ? MCU_CMD_UNI_EXT_ACK :
+		    (MCU_CMD_UNI | MCU_CMD_QUERY);
 		uni_txd->cid = htole16(mcu_cmd);
 		uni_txd->s2d_index = CMD_S2D_IDX_H2N;
 		uni_txd->pkt_type = MCU_PKT_ID;
@@ -3761,6 +3843,26 @@ static void mwx_awdl_roc_event(mwx_softc *sc,const uint8_t *p,size_t n,uint64_t 
     IOLockUnlock(sc->sc_awdl_lock);
 }
 
+// Asynchronous ROC command acknowledgements are not radio grants. Consume
+// them by CID before the generic sequence-indexed waiter path: a delayed ROC
+// ACK must not complete a later BSS/STA command using the same four-bit seq.
+static bool mwx_awdl_roc_command_result(mwx_softc *sc,const uint8_t *p,size_t n,uint64_t now)
+{
+    if(!n || p[0]!=0x27) return false;
+    if(sc->sc_awdl_lock) {
+        IOLockLock(sc->sc_awdl_lock);
+        if(n<sizeof(mt7921_mcu_uni_event)) ++sc->sc_awdl_roc_command_malformed;
+        else {
+            ++sc->sc_awdl_roc_command_results;
+            sc->sc_awdl_roc_command_status=mtkawdl::le32(p+4);
+            sc->sc_awdl_roc_command_result_us=now;
+            if(sc->sc_awdl_roc_command_status) ++sc->sc_awdl_roc_command_failed;
+        }
+        IOLockUnlock(sc->sc_awdl_lock);
+    }
+    return true;
+}
+
 void
 mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 {
@@ -3800,6 +3902,13 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
         uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
         mwx_awdl_roc_event(sc,mtod(m,const uint8_t *),mbuf_len(m),ns/1000);
         m_freem(m); return;
+    }
+    if (rxd_eid == MCU_UNI_EVENT_RESULT && (rxd_option & MCU_UNI_CMD_EVENT) &&
+        !(rxd_option & MCU_UNI_CMD_UNSOLICITED_EVENT)) {
+        uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+        if(mwx_awdl_roc_command_result(sc,mtod(m,const uint8_t *),mbuf_len(m),ns/1000)) {
+            m_freem(m); return;
+        }
     }
 
 	switch (rxd_eid) {
@@ -5007,7 +5116,9 @@ mt7921_mcu_tx_done_event(struct mwx_softc *sc, struct mbuf *m)
 	if (mbuf_len(m) < sizeof(*event))
 		return;
 	event = mtod(m, struct mt7921_mcu_tx_done_event *);
-	// TODO mt7921_mac_add_txs(dev, event->txs);
+	uint32_t txs[8]={};
+	memcpy(txs,event->txs,sizeof(event->txs));
+	mt7921_mac_add_txs(sc, txs);
 }
 
 /*
@@ -5018,13 +5129,16 @@ mt7921_mcu_tx_done_event(struct mwx_softc *sc, struct mbuf *m)
 void
 mt7921_mac_add_txs(struct mwx_softc *sc, const uint32_t *txs_data)
 {
+	if (sc->sc_awdl_tx_status.observe(reinterpret_cast<const uint8_t *>(txs_data),32))
+		return;
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ieee80211_node *ni = ic->ic_bss;
 	uint32_t txs = le32toh(txs_data[0]);
 	uint32_t pid = le32toh(txs_data[3]) >> 24;
 	uint32_t rate, mode, mcs, nss;
 
-	if (pid < MT_PACKET_ID_FIRST || ni == NULL ||
+	if (((txs >> 23) & 3) > 1 || pid < MT_PACKET_ID_FIRST || ni == NULL ||
+	    ((le32toh(txs_data[2]) >> 16) & 0x3ff) != ((struct mwx_node *)ni)->wcid ||
 	    ic->ic_state != IEEE80211_S_RUN ||
 	    (txs & 0x00070000) != 0)		/* MT_TXS0_ACK_ERROR_MASK */
 		return;
@@ -5062,6 +5176,15 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	int rv;
 	uint8_t nchan, n_2g = 0, n_5g = 0;
 	uint16_t dwell;
+
+    // One radio cannot scan while honoring an AWDL reservation. Keep the
+    // logical scan pending and finish it when AWDL releases the radio. Do
+    // not repeatedly cancel/end/restart a foreground scan each timer tick.
+    if(sc->sc_awdl_enabled) {
+        sc->sc_awdl_scan_suspended=true;
+        return 0;
+    }
+    sc->sc_awdl_scan_suspended=false;
 
 	m = mwx_mcu_alloc_msg(sizeof(*req));
 	if (m == NULL)
@@ -5370,6 +5493,13 @@ mt7921_mcu_scan_event(struct mwx_softc *sc, struct mbuf *m)
 	struct mt76_connac_hw_scan_done *event;
 	uint32_t probe_sum = 0, mdrdy_sum = 0;
 	int i, nodes_before;
+
+    // A canceled scan's delayed completion must not cancel a newer scan or
+    // restart scanning while AWDL owns the radio.
+    if(sc->sc_awdl_scan_suspended || !(sc->sc_flags & MWX_FLAG_SCANNING) ||
+       mbuf_len(m)<sizeof(*event)) return;
+    event=mtod(m,struct mt76_connac_hw_scan_done *);
+    if(event->seq_num!=sc->sc_scan_seq_num) return;
 
 	sc->sc_scan_done_count++;
 	timeout_del(&sc->sc_scan_to);
@@ -5884,13 +6014,13 @@ mt7921_mcu_uni_add_dev(struct mwx_softc *sc, struct mwx_vif *mvif,
 
 	if (mvif == &sc->sc_awdl_vif) {
         // MT7921 firmware rejects the IBSS BSS (0xc00000bb on this card).
-        // A P2P GO context supplies the separate raw-frame transport; the
-        // host AWDL scheduler provides action frames rather than GO beacons.
+        // Match MT76's NL80211_IFTYPE_P2P_DEVICE constructor: AP|P2P
+        // identifies a discovery device while conn_state=1 leaves it
+        // disconnected. Setting conn_state=0 plus a BSSID/PHY configuration
+        // is the separate uni_add_bss/start_ap path for a connected GO.
+        // AWDL has no GO beacon or persistent channel; its radio ownership
+        // comes exclusively from the self-contained ROC request/grant.
         basic_req.basic.conn_type = htole32(STA_TYPE_AP | NETWORK_P2P);
-        memcpy(basic_req.basic.bssid, mtkawdl::bssid, 6);
-        basic_req.basic.conn_state = 0;
-        basic_req.basic.phymode = (1U << 1) | (1U << 2);
-        basic_req.basic.nonht_basic_phy = htole16(PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP);
     } else switch (sc->sc_ic.ic_opmode) {
 	case IEEE80211_M_MONITOR:
 #ifndef IEEE80211_STA_ONLY
@@ -6788,17 +6918,26 @@ mt7921_mac_write_txwi(struct mwx_softc *sc, struct mbuf *m,
 	 * second; it carries the rate the firmware rate control picked.
 	 * Asking on every frame doubled the RX ring traffic for nothing.
 	 */
-	if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA &&
-	    !IEEE80211_IS_MULTICAST(wh->i_addr1) &&
-	    ratecheck(&sc->sc_txs_last, &txs_interval))
-		pid = MT_PACKET_ID_FIRST;
     const bool awdl = ni == &sc->sc_awdl_vif.vif_mn.ni ||
         ni == &sc->sc_awdl_peers[0].ni || ni == &sc->sc_awdl_peers[1].ni ||
         ni == &sc->sc_awdl_peers[2].ni;
+	if (!awdl && (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA &&
+	    !IEEE80211_IS_MULTICAST(wh->i_addr1) &&
+	    ratecheck(&sc->sc_txs_last, &txs_interval))
+		pid = MT_PACKET_ID_FIRST;
+    if(awdl) pid=(wh->i_fc[0]&IEEE80211_FC0_TYPE_MASK)==IEEE80211_FC0_TYPE_DATA ?
+        (IEEE80211_IS_MULTICAST(wh->i_addr1) ? mtkawdl::txPidMulticast : mtkawdl::txPidUnicast) :
+        mtkawdl::txPidAction;
     const mwx_vif *vif = awdl ? &sc->sc_awdl_vif : &sc->sc_vif;
 	omac_idx = vif->omac_idx << MT_TXD1_OWN_MAC_SHIFT;
 	wmm_idx = vif->wmm_idx;
 	band_idx = vif->band_idx;
+    // MT7921 uses MT_DRV_HW_MGMT_TXQ. MT76's off-channel management
+    // path selects PSD -> ALTX for PSF/MIF action frames, independently
+    // of the discovery BSS's normal WMM data queues. AWDL data retains
+    // its QoS queue and all TX still requires a matching ROC grant.
+    if(awdl && (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK)==IEEE80211_FC0_TYPE_MGT)
+        qid=MT_TXQ_PSD;
 
 	if (qid >= MT_TXQ_PSD) {
 		p_fmt = MT_TX_TYPE_CT;
@@ -7814,6 +7953,31 @@ MtkMwx::mwxWakeup(void *ident)
 	wakeupOn(ident);
     // Wake native commandSleep and the ordinary HAL msleep callers.
     if(getMainCommandGate()) getMainCommandGate()->commandWakeup(ident,false);
+}
+
+IOReturn
+MtkMwx::waitPowerTransition()
+{
+#ifdef AIRPORT
+	if (!com || com->sc_detaching)
+		return kIOReturnNotAttached;
+	/* commandSleep drops a caller's gate so the task and its MCU replies
+	 * can progress. Bound this wait below the PM acknowledgement budget.
+	 */
+	SInt32 requested = com->sc_power_req;
+	for (unsigned i = 0; i < 400; i++) {
+		OSSynchronizeIO();
+		if (com->sc_power_done == requested) {
+			return com->sc_power_result ? kIOReturnIOError : kIOReturnSuccess;
+		}
+		mwxSleepNsec(com, 0, "mwx-power", MSEC_TO_NSEC(10));
+		if (com->sc_detaching)
+			return kIOReturnNotAttached;
+	}
+	return kIOReturnTimeout;
+#else
+	return kIOReturnSuccess;
+#endif
 }
 
 const char *
@@ -8835,6 +8999,12 @@ IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable)
         }
         if(running && !sc->sc_detaching && !sc->sc_resetting) sc->sc_awdl_stopping=false;
         IOLockUnlock(sc->sc_awdl_lock);
+        if(sc->sc_awdl_scan_suspended) {
+            sc->sc_awdl_scan_suspended=false;
+            if(running && !sc->sc_detaching && !sc->sc_resetting &&
+               (sc->sc_ic.ic_state==IEEE80211_S_SCAN || (sc->sc_ic.ic_flags&IEEE80211_F_BGSCAN)))
+                task_add(systq,&sc->sc_scan_task);
+        }
         return rv ? kIOReturnIOError : kIOReturnSuccess;
     }
     if (!address || !mtkawdl::unicast(address)) return kIOReturnBadArgument;
@@ -8957,24 +9127,21 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
     if(!call.valid()) return kIOReturnNotReady;
     if(!com || !com->sc_awdl_enabled || com->sc_resetting || com->sc_detaching)
         return kIOReturnNotReady;
-    if(com->sc_ic.ic_state==IEEE80211_S_SCAN ||
-       (com->sc_ic.ic_flags & IEEE80211_F_BGSCAN) ||
-       (com->sc_flags & (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN))) {
-        // Native AWDL real-time mode expects the infrastructure scan to yield
-        // before the first ROC. Abort the active firmware scan instead of
-        // returning NotReady forever while the scheduler spins every 2 ms.
-        int scanRv=mt7921_mcu_hw_scan_cancel(com);
-        if(scanRv) { ++com->sc_awdl_roc_scan_blocked; return kIOReturnNotReady; }
-        com->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
-        com->sc_ic.ic_flags &= ~IEEE80211_F_BGSCAN;
-        if(com->sc_ic.ic_state==IEEE80211_S_SCAN)
-            task_add(systq,&com->sc_scan_task);
-        ++com->sc_awdl_roc_scan_blocked;
-        return kIOReturnNotReady;
-    }
     if(!awdlChannelAllowed(channel) || !durationMs || durationMs>mtkawdl::maxRocMs) return kIOReturnBadArgument;
     MwxAwdlOperation operation(com);
     if(!operation.valid()) { ++com->sc_awdl_roc_busy_blocked; return kIOReturnNotReady; }
+    if(com->sc_flags & (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN)) {
+        // Cancel only an actual firmware scan. The logical SCAN/BGSCAN
+        // state remains pending until disable; it must not block every ROC.
+        int scanRv=mt7921_mcu_hw_scan_cancel(com);
+        if(!operation.valid()) return kIOReturnAborted;
+        if(scanRv) { ++com->sc_awdl_roc_scan_blocked; return kIOReturnNotReady; }
+        com->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
+        timeout_del(&com->sc_scan_to);
+        com->sc_awdl_scan_suspended=true;
+        ++com->sc_awdl_roc_scan_blocked;
+        return kIOReturnNotReady;
+    }
     IOLockLock(com->sc_awdl_lock);
     bool retryLater=com->sc_awdl_roc_abort_pending && mwx_awdl_now()<com->sc_awdl_roc_abort_retry_at;
     IOLockUnlock(com->sc_awdl_lock);
@@ -8982,16 +9149,11 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
     int abortRv=mwx_awdl_abort(com);
     if(!operation.valid()) return kIOReturnAborted;
     if(abortRv) return kIOReturnIOError;
-    // Initialize the secondary BSS RLM once. MT7921's ROC acquire carries
-    // the temporary channel/band/width itself (Linux mt7921_mcu_set_roc).
-    // Reprogramming RLM synchronously at every temporary channel switch
-    // blocks the AW timer and can consume the whole next window. Keep the
-    // BSS base context stable; only a matching ROC event permits RF TX.
-    if(!com->sc_awdl_channel) {
-        int rv=mwx_awdl_set_channel(com,channel,operation.epoch);
-        if(!operation.valid()) return kIOReturnAborted;
-        if(rv) return kIOReturnIOError;
-    }
+    // A P2P discovery device has no persistent RLM channel context. Match
+    // mt7921_mcu_set_roc: acquire carries all channel/band/width fields.
+    // Programming RLM here couples discovery to an active BSS and blocks
+    // the initial AW timer on a synchronous firmware wait. Only the matched
+    // unsolicited grant below establishes the temporary radio context.
     uint8_t token=com->sc_awdl_roc.token+1;
     if(!token) token=1;
     // Firmware returns only an 8-bit token. Do not reuse one inside the
@@ -9090,6 +9252,9 @@ void MtkMwx::awdlPublishDiagnostics()
     bool pending=com->sc_awdl_roc.pending;
     mtkawdl::Reservation radio=com->sc_awdl_roc;
     uint64_t delay=com->sc_awdl_roc_grant_delay_us, maxDelay=com->sc_awdl_roc_max_grant_delay_us;
+    uint64_t commandResults=com->sc_awdl_roc_command_results, commandFailed=com->sc_awdl_roc_command_failed,
+             commandMalformed=com->sc_awdl_roc_command_malformed, commandAt=com->sc_awdl_roc_command_result_us;
+    uint32_t commandStatus=com->sc_awdl_roc_command_status;
     uint64_t reasons[static_cast<unsigned>(mtkawdl::RocResult::Count)];
     memcpy(reasons,com->sc_awdl_roc_reasons,sizeof(reasons));
     mtkawdl::RocGrant last=com->sc_awdl_roc_last_event;
@@ -9109,6 +9274,7 @@ void MtkMwx::awdlPublishDiagnostics()
         radio.pending ? (observed<radio.deadline ? "waiting-grant" : "response-expired") :
         radio.granted ? (observed<radio.deadline ? "granted" : "grant-expired") : "idle";
     mwxController()->setProperty("MTKAWDLROCState",state);
+    mwxController()->setProperty("MTKAWDLFirmwareContext","p2p-discovery");
     mwxController()->setProperty("MTKAWDLROCStateObservedAtUS",observed,64);
     mwxController()->setProperty("MTKAWDLROCEvents",events,64);
     mwxController()->setProperty("MTKAWDLROCGrants",grants,64);
@@ -9121,6 +9287,11 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKAWDLROCDeadlineUS",radio.deadline,64);
     mwxController()->setProperty("MTKAWDLROCGrantDelayUS",delay,64);
     mwxController()->setProperty("MTKAWDLROCMaxGrantDelayUS",maxDelay,64);
+    mwxController()->setProperty("MTKAWDLROCCommandResults",commandResults,64);
+    mwxController()->setProperty("MTKAWDLROCCommandFailed",commandFailed,64);
+    mwxController()->setProperty("MTKAWDLROCCommandMalformed",commandMalformed,64);
+    mwxController()->setProperty("MTKAWDLROCCommandLastStatus",static_cast<uint64_t>(commandStatus),32);
+    mwxController()->setProperty("MTKAWDLROCCommandLastResultUS",commandAt,64);
     static const char *const names[]={"Accepted","Malformed","NoGrant","WrongBss",
         "FirmwareStatus","WrongType","Disabled","NotPending","Token","Channel","Late","Duration"};
     static_assert(sizeof(names)/sizeof(names[0])==static_cast<unsigned>(mtkawdl::RocResult::Count),"ROC reason names");
@@ -9152,6 +9323,7 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKAWDLROCSubmitted",com->sc_awdl_roc_submitted,64);
     mwxController()->setProperty("MTKAWDLROCSendFailed",com->sc_awdl_roc_send_failed,64);
     mwxController()->setProperty("MTKAWDLROCScanBlocked",com->sc_awdl_roc_scan_blocked,64);
+    mwxController()->setProperty("MTKAWDLScanSuspended",com->sc_awdl_scan_suspended);
     mwxController()->setProperty("MTKAWDLROCBusyBlocked",com->sc_awdl_roc_busy_blocked,64);
     mwxController()->setProperty("MTKAWDLTXSubmitted",com->sc_awdl_tx_submitted,64);
     mwxController()->setProperty("MTKAWDLTXBadFrame",com->sc_awdl_tx_bad_frame,64);
@@ -9162,6 +9334,17 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKAWDLTXCopyFailed",com->sc_awdl_tx_copy_failed,64);
     mwxController()->setProperty("MTKAWDLTXDMAFailed",com->sc_awdl_tx_dma_failed,64);
     mwxController()->setProperty("MTKAWDLTXLastErrno",static_cast<uint64_t>(com->sc_awdl_tx_errno),32);
+    const auto &tx=com->sc_awdl_tx_status;
+    mwxController()->setProperty("MTKAWDLTXDataAcked",tx.dataAcked,64);
+    mwxController()->setProperty("MTKAWDLTXDataFailed",tx.dataFailed,64);
+    mwxController()->setProperty("MTKAWDLTXMulticastCompleted",tx.multicastCompleted,64);
+    mwxController()->setProperty("MTKAWDLTXMulticastFailed",tx.multicastFailed,64);
+    mwxController()->setProperty("MTKAWDLTXActionCompleted",tx.actionCompleted,64);
+    mwxController()->setProperty("MTKAWDLTXActionFailed",tx.actionFailed,64);
+    mwxController()->setProperty("MTKAWDLTXLastStatus",static_cast<uint64_t>(tx.lastStatus),32);
+    mwxController()->setProperty("MTKAWDLTXLastSequence",static_cast<uint64_t>(tx.lastSequence),32);
+    mwxController()->setProperty("MTKAWDLTXLastWcid",static_cast<uint64_t>(tx.lastWcid),32);
+    mwxController()->setProperty("MTKAWDLTXLastPid",static_cast<uint64_t>(tx.lastPid),32);
 }
 
 IOReturn MtkMwx::awdlTransmit(mbuf_t frame,uint8_t channel)

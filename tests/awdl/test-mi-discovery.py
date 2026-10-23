@@ -1,8 +1,8 @@
 """Exercise production MI controls, scheduler and native RX with failure cases."""
 from pathlib import Path
-import subprocess, tempfile
+import subprocess, tempfile, sys
 root=Path(__file__).resolve().parents[2]
-s=(root/'AirportMtkWlan/AirportMtkAwdlInterface.cpp').read_text()
+s=(Path(sys.argv[1]) if len(sys.argv)>1 else root/'AirportMtkWlan/AirportMtkAwdlInterface.cpp').read_text()
 def fn(sig):
  a=s.index(sig); return s[a:s.index('\n}\n',a)+3]
 header=(root/'include/Airport/apple80211_ioctl.h').read_text()
@@ -75,7 +75,8 @@ struct AirportMtkAwdlInterface{
  actionReceived=0,actionHostAccepted=0,actionHostRejected=0,actionRSSIRejected=0,
  actionNativeDelivered=0,actionInvalid=0,actionNoBuffer=0,nextAction=0,requestDeadline=0;
  uint64_t reserveWaitUS=0,reserveMaxWaitUS=0,reserveInvalidations=0;uint32_t reserveInvalidReason=0;
- uint32_t reserveLeadUS=mtkawdl::rocLeadUs;uint64_t grantLatencyObservedAt=0;
+ uint32_t reserveLeadUS=mtkawdl::rocLeadUs;mtkawdl::RocLeadTiming reserveTiming;uint64_t grantLatencyObservedAt=0;
+ mtkawdl::RocChannelTiming reserveChannelTiming;
  int32_t lastActionRSSI=0;unsigned reserveDuration=0,requestedChannel=0,grantedChannel=0;
  IOReturn reserveStatus=0,actionStatus=0,miStatus=0;mbuf_t queue[64]{};
  uint64_t dataTxSubmitted=0,dataTxFailed=0,dataTxExpired=0,dataTxDeferred=0;IOReturn dataTxStatus=0;
@@ -210,6 +211,7 @@ int main(){
  assert(d.dataTxDeferred==9);
  // A missing unicast station cannot block multicast behind it. Retain only
  // that peer's packet, then submit it once native station programming succeeds.
+ clockUS+=16*1024; // Inside the multicast rendezvous guard.
  d.radio.missingStation=true;enqueue(clockUS);auto unicast=d.queue[d.queueHead];
  wire[4]=1;enqueue(clockUS);wire[4]=peer[0];
  d.serviceInGate();++submitted;
@@ -300,6 +302,28 @@ int main(){
  clockUS=originalExpiry;queued.serviceInGate();assert(queued.queueCount==1&&queued.dataTxExpired==1);
  assert(queued.queueDeadline[queued.queueHead]==secondExpiry);
  clockUS=secondExpiry;queued.serviceInGate();assert(!queued.queueCount&&queued.dataTxExpired==2);
+ // mDNS queued at an edge waits for the multicast guard. A packet queued
+ // during discovery slot 2 survives unchanged until rendezvous slot 10.
+ AirportMtkAwdlInterface rendezvous;rendezvous.state.init(local,clockUS);
+ rendezvous.afMode.mode=3;uint64_t rendezvousEpoch=clockUS;
+ rendezvous.radio.observedAt=clockUS-1;
+ assert(rendezvous.output(rendezvous.makeFrame(eth,sizeof(eth)))==kIOReturnOutputSuccess);
+ rendezvous.serviceInGate();assert(rendezvous.queueCount==1&&!rendezvous.dataTxSubmitted);
+ clockUS=rendezvousEpoch+16*1024;rendezvous.serviceInGate();
+ assert(rendezvous.dataTxSubmitted==1&&!rendezvous.queueCount);
+ clockUS=rendezvousEpoch+2*4*mtkawdl::awUs+16*1024;
+ assert(rendezvous.output(rendezvous.makeFrame(eth,sizeof(eth)))==kIOReturnOutputSuccess);
+ auto waiting=rendezvous.queue[rendezvous.queueHead];auto waitingBytes=waiting->bytes;
+ auto waitingExpiry=rendezvous.queueDeadline[rendezvous.queueHead];
+ for(unsigned slot=2;slot<10;++slot) {
+  clockUS=rendezvousEpoch+slot*4*mtkawdl::awUs+16*1024;
+  rendezvous.serviceInGate();assert(rendezvous.queueCount==1&&rendezvous.dataTxSubmitted==1);
+  assert(rendezvous.queue[rendezvous.queueHead]==waiting&&waiting->bytes==waitingBytes);
+  assert(rendezvous.queueDeadline[rendezvous.queueHead]==waitingExpiry);
+ }
+ clockUS=rendezvousEpoch+10*4*mtkawdl::awUs+16*1024;rendezvous.serviceInGate();
+ assert(rendezvous.dataTxSubmitted==2&&!rendezvous.queueCount);
+ assert(rendezvous.radio.frames.back()==waitingBytes);
  // A known peer's longer sequence is included, with the same finite cap.
  mtkawdl::State budgets;budgets.init(local,clockUS);mtkawdl::State slow;slow.init(peer,clockUS);
  slow.sequence.step=slow.ownSequence.step=63;slow.presence=slow.ownPresence=64;

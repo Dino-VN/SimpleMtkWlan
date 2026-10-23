@@ -6,10 +6,12 @@ infrastructure. It cannot establish firmware acceptance of a P2P context.
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 
 root = Path(__file__).resolve().parents[2]
-source = (root / 'SimpleMtkWlan/hal_mwx/MtkMwx.cpp').read_text()
+source = (Path(sys.argv[1]) if len(sys.argv) > 1 else
+          root / 'SimpleMtkWlan/hal_mwx/MtkMwx.cpp').read_text()
 wire = (root / 'SimpleMtkWlan/hal_mwx/if_mwxreg.h').read_text()
 begin = source.index('int\nmt7921_mcu_uni_add_dev(')
 function = source[begin:source.index('\n}\n', begin) + 3]
@@ -78,10 +80,12 @@ int main() {
     mwx_softc sc{{IEEE80211_M_STA, {2,1,2,3,4,5}}, {1,1,0,1}, 7,
                 {2,1,2,3,4,0x85}};
     mwx_node broadcast{18};
-    // P2P_GO=AP|P2P and the TLV size/offsets come from pinned Linux MT76.
+    // MT76 creates NL80211_IFTYPE_P2P_DEVICE as AP|P2P but leaves
+    // conn_state=1, BSSID and PHY fields zero. This is a discovery device,
+    // not the connected AP BSS configured by uni_add_bss/start_ap.
     std::vector<uint8_t> dev = {1,0,0,0,0,0,12,0,1,0,2,1,2,3,4,0x85};
     std::vector<uint8_t> bss = {1,0,0,0,0,0,32,0,1,1,1,0,2,0,2,0,
-        0,1,0,0x25,0,0xff,0x94,0x73,18,0,0,0,0,6,18,0,3,0,0,0};
+        1,1,0,0,0,0,0,0,18,0,0,0,0,0,18,0,0,0,0,0};
     for (bool enable : {true, false}) {
         sent.clear();
         assert(!mt7921_mcu_uni_add_dev(&sc, &sc.sc_awdl_vif, &broadcast, enable));
@@ -111,7 +115,7 @@ int main() {
     assert(infra[16] == 1 && infra[29] == 0 && infra[8] == 1);
     assert(!memcmp(sent[0].bytes.data()+10, sc.sc_ic.ic_myaddr, 6));
     for (unsigned i=18; i<24; ++i) assert(infra[i] == 0);
-    puts("PASS real device/BSS builder: P2P wire packets, enable/disable ordering, both transport failures, interrupted wait, unchanged infrastructure context. Firmware acceptance unverified.");
+    puts("PASS real device/BSS builder: disconnected MT76 P2P discovery wire packets, enable/disable ordering, both transport failures, interrupted wait, unchanged infrastructure context. Firmware acceptance unverified.");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='mtk-awdl-bss-') as tmp:

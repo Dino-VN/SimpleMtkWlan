@@ -1,5 +1,31 @@
 # Experimental MT7921 AWDL on Tahoe
 
+Latest diagnosis, 2026-10-23 at 12:32: loaded UUID
+`A33533B2-7B18-3B11-BB71-689B9EF70189` receives discovery action frames,
+but AirDrop fails service resolution with `resolveFailure`/`missingEndpoint`
+and zero raw/native data RX. The new endpoint candidate
+`4E711087-6AC2-387E-B0D3-E838BB36FFF1` retains valid iPhone schedules during
+election transitions, schedules multicast at rendezvous slots, retains radio
+grants across same-channel idle gaps, fixes repeated scan cancellation, and
+reports firmware TX outcomes. Release, host regressions and 813 native ABI
+slots pass. Hardware transfer remains unverified; dense switching still has
+physical timing misses, and Wi-Fi scans wait while AWDL is enabled. See
+[endpoint fix and validation](AWDL-endpoint-fix.md).
+
+Earlier hardware check, 2026-10-23: ROC-ACK UUID
+`17E9B561-A5D5-33A0-A502-B471DC377ADC` creates `awdl0`, but active AirDrop
+still fails native timing with missing/skipped starts and near-one-second
+ROC grants. The replacement corrects the P2P discovery BSS, initial ROC and
+management ALTX routing; see [discovery/ROC fix](AWDL-discovery-roc-fix.md).
+It passes host regressions/build/ABI checks and awaits hardware validation.
+
+Hardware follow-up at 11:34: the discovery/ROC candidate
+`13EE01BA-6B06-3C39-81EE-8539A0766814` is loaded, with 444 accepted grants
+for 444 requests and zero timeouts. AirDrop still fails: 51 skipped-start
+sanity failures in an active 30-second check, no data RX, and sharingd
+`missingEndpoint`/`resolveFailure` while sending to the visible iPhone. See the
+hardware follow-up in the discovery/ROC fix document for evidence.
+
 On 2026-10-22, candidate `C85968EF-BEB5-39DC-B18B-CB230B587434`
 caused two confirmed kernel panics at `IOSkywalkPacketQueue.cpp:321`
 (`default packetCompletion()`). Do not install the historical AWDL RX fix ZIP.

@@ -324,8 +324,28 @@ static void nativePeriodTests()
         assert(a.period==16 && a.counter==s.counter(1065536));
     }
 }
+static void capturedTransitionTests()
+{
+    FILE *file=fopen("tests/awdl/fixtures/iphone-election-transition.bin","rb"); assert(file);
+    uint8_t raw[2048]; size_t n=fread(raw,1,sizeof(raw),file); fclose(file); assert(n==203);
+    Advertisement a{};
+    assert(validActionEnvelope(raw,n) && parseAction(raw,n,a));
+    assert(!memcmp(raw+43+21,remote,6)); // Sync TLV still names the peer.
+    assert(!memcmp(a.master,local,6) && !memcmp(a.sync,local,6));
+    State rx; rx.init(local,10000000);
+    int peer=rx.receiveAction(raw,n,10000000);
+    assert(peer>=0 && rx.peers[peer].used && !rx.synchronized);
+    assert(rx.peers[peer].advertisement.sequence.channels[8]==6);
+    assert(rx.peers[peer].advertisement.sequence.channels[10]==149);
+    // A follower naming us cannot make us follow it, but remains a data peer.
+    assert(!memcmp(rx.master,local,6));
+    auto bad=std::vector<uint8_t>(raw,raw+n);bad[bad.size()-40]=1;
+    assert(!parseAction(bad.data(),bad.size(),a)); // Multicast election root rejected.
+    puts("PASS captured iPhone election transition: retain channel schedule without creating an election loop.");
+}
 static void capturedIphoneTests()
 {
+    capturedTransitionTests();
     FILE *file=fopen("tests/awdl/fixtures/iphone-v9-psf.bin","rb"); assert(file);
     uint8_t raw[2048]; size_t n=fread(raw,1,sizeof(raw),file); fclose(file); assert(n==612);
     Advertisement a{}; assert(validActionEnvelope(raw,n) && parseAction(raw,n,a));

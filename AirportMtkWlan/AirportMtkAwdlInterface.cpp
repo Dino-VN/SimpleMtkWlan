@@ -658,12 +658,14 @@ void AirportMtkAwdlInterface::notifyAvailabilityWindowStart(uint8_t channel,uint
     payload.nativeRole=awTimeline.role;
     memcpy(payload.syncMaster,awTimeline.sync,6);
     memcpy(payload.topMaster,awTimeline.root,6);
-    payload.fwStartUsBE=__builtin_bswap32(static_cast<uint32_t>(now));
+    payload.fwStartUsBE=__builtin_bswap32(static_cast<uint32_t>(awTimeline.lastStart));
     payload.channel={APPLE80211_VERSION,channel,
         uint32_t(APPLE80211_C_FLAG_20MHZ | (channel<=14 ? APPLE80211_C_FLAG_2GHZ : APPLE80211_C_FLAG_5GHZ))};
     setProperty("MTKAWDLLastAWStartChannel",static_cast<uint64_t>(channel),32);
     setProperty("MTKAWDLLastAWStartCounter",static_cast<uint64_t>(payload.awCounter),32);
-    setProperty("MTKAWDLLastAWStartUS",now,64);
+    setProperty("MTKAWDLLastAWStartUS",awTimeline.lastStart,64);
+    setProperty("MTKAWDLLastAWStartDeliveryUS",now,64);
+    setProperty("MTKAWDLLastAWStartDeliveryDelayUS",now-awTimeline.lastStart,64);
     ++awStartNotifications;
     setProperty("MTKAWDLAWStartNotifications",awStartNotifications,64);
     setProperty("MTKAWDLAWWindowOpen",true);
@@ -746,6 +748,11 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLReserveWaitUS",reserveWaitUS,64);
     setProperty("MTKAWDLReserveMaxWaitUS",reserveMaxWaitUS,64);
     setProperty("MTKAWDLReserveLeadUS",static_cast<uint64_t>(reserveLeadUS),32);
+    setProperty("MTKAWDLReserveTimingSamples",reserveTiming.updates,64);
+    setProperty("MTKAWDLReserveLeadDecreases",reserveTiming.decreases,64);
+    setProperty("MTKAWDLReserveLeadChannel6US",static_cast<uint64_t>(reserveChannelTiming.lead(6,reserveLeadUS)),32);
+    setProperty("MTKAWDLReserveLeadChannel44US",static_cast<uint64_t>(reserveChannelTiming.lead(44,reserveLeadUS)),32);
+    setProperty("MTKAWDLReserveLeadChannel149US",static_cast<uint64_t>(reserveChannelTiming.lead(149,reserveLeadUS)),32);
     setProperty("MTKAWDLReserveInvalidations",reserveInvalidations,64);
     setProperty("MTKAWDLReserveInvalidReason",static_cast<uint64_t>(reserveInvalidReason),32);
     setProperty("MTKAWDLRequestedAWChannel",static_cast<uint64_t>(requestedWindow.channel),32);
@@ -967,9 +974,8 @@ void AirportMtkAwdlInterface::serviceInGate()
         grantLatencyObservedAt=grant.grantObservedAt;
         // Accepted response latency is measured from submission, independently
         // of the preceding synchronous RLM wait.
-        uint64_t need=uint64_t(grant.responseDelayUS)+reserveWaitUS+8000;
-        if(need>mtkawdl::rocResponseTimeoutUs) need=mtkawdl::rocResponseTimeoutUs;
-        if(need>reserveLeadUS) reserveLeadUS=static_cast<uint32_t>(need);
+        reserveLeadUS=reserveTiming.observe(grant.responseDelayUS,reserveWaitUS);
+        reserveChannelTiming.observe(grant.channel,grant.responseDelayUS,reserveWaitUS);
     }
     if(awTimeline.open && (!grant.granted || grant.channel!=awTimeline.active.channel ||
                          grant.token!=awTimeline.token ||
@@ -997,7 +1003,7 @@ void AirportMtkAwdlInterface::serviceInGate()
             // short presence still leaves us inside the start tolerance.
             // Reacquiring the closed EAW wastes the switching head start.
             bool skipCurrent=awTimeline.emitted && now<awTimeline.active.end;
-            if(!mtkawdl::planRadio(state,now,plan,reserveLeadUS,skipCurrent)) { timer->setTimeoutMS(2); return; }
+            if(!mtkawdl::planRadio(state,now,plan,reserveLeadUS,skipCurrent,&reserveChannelTiming)) { timer->setTimeoutMS(2); return; }
             mtkawdl::Window target=plan.window;
             if(!target.channel || !hal->awdlChannelAllowed(target.channel)) {
                 timer->setTimeoutMS(1); return;
@@ -1010,11 +1016,12 @@ void AirportMtkAwdlInterface::serviceInGate()
             if(grant.granted && now<grant.deadline &&
                ((grant.channel==channel && (!awTimeline.emitted || now>=awTimeline.active.end)) ||
                 (grant.channel==target.channel && requestedChannel==target.channel &&
-                 requestedWindow.start==target.start))) {
+                 requestedWindow.start==target.start && grant.deadline>target.start))) {
                 // Firmware may return a short grant. Replacing it each tick
                 // wastes usable RF time and invalidates delayed grant tokens.
-                // Keep a short grant submitted for this target, or usable
-                // current-slot RF time. An old grant ending in an idle gap
+                // Keep a short grant overlapping this target, or usable
+                // current-slot RF time. A grant expiring before its target
+                // must be replaced at preparation time. An idle-gap grant
                 // must not delay the next reservation beyond its requestAt.
                 timer->setTimeoutMS(1); return;
             }
@@ -1129,7 +1136,7 @@ void AirportMtkAwdlInterface::serviceInGate()
         mbuf_t m=queue[queueHead]; uint64_t time=queueTime[queueHead], expiry=queueDeadline[queueHead];
         const uint8_t *f=(const uint8_t *)mbuf_data(m);
         int peer=state.find(f+4);
-        bool ready=f[4]&1;
+        bool ready=(f[4]&1) && mtkawdl::multicastReady(state,now);
         if(peer>=0) {
             const mtkawdl::Peer &p=state.peers[peer];
             ready=p.channel(now)==channel;

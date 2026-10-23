@@ -35,7 +35,7 @@ puts structs
 print <<'CPP'
 struct ieee80211_channel {unsigned ic_flags,ic_freq;};
 struct ieee80211com {ieee80211_channel ic_channels[256];};
-struct mwx_softc {ieee80211com sc_ic;unsigned sc_flags;uint8_t sc_scan_seq_num;uint32_t sc_bgscan_dwell;};
+struct mwx_softc {ieee80211com sc_ic;unsigned sc_flags;uint8_t sc_scan_seq_num;uint32_t sc_bgscan_dwell;bool sc_awdl_enabled,sc_awdl_scan_suspended;};
 struct mbuf {unsigned char bytes[sizeof(mt76_connac_hw_scan_req)];};
 #define mtod(m,T) reinterpret_cast<T>((m)->bytes)
 #define IEEE80211_IS_CHAN_2GHZ(c) ((c)->ic_freq<100)
@@ -80,7 +80,12 @@ int main(){
   for(unsigned i=0;i<std::min(n,64u);i++) {auto c=i<32?captured.channels[i]:captured.ext_channels[i-32];check(c.band==(i<14?1:2),"band");check(c.channel_num==(i<14?i+1:101+i),"channel");}
   cases++;
  }
- mwx_softc sc={};sc.sc_scan_seq_num=42;alloc_fail=true;
+ mwx_softc sc={};sc.sc_scan_seq_num=42;sc.sc_awdl_enabled=true;
+ for(int bg:{0,1}) {
+  check(mt7921_mcu_hw_scan(&sc,bg)==0,"AWDL scan suspension");
+  check(sc.sc_awdl_scan_suspended && sc.sc_scan_seq_num==42 && sc.sc_flags==0,"suspended scan must not touch firmware or advance sequence");
+ }
+ sc.sc_awdl_enabled=false;sc.sc_awdl_scan_suspended=false;alloc_fail=true;
  check(mt7921_mcu_hw_scan(&sc,1)==ENOMEM,"allocation failure");check(sc.sc_flags==0 && sc.sc_scan_seq_num==42,"allocation failure state");
  alloc_fail=false;send_error=EIO;sc.sc_flags=MWX_FLAG_BGSCAN;
  check(mt7921_mcu_hw_scan(&sc,1)==EIO,"send failure");check(sc.sc_flags==0,"send failure flags");

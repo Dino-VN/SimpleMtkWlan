@@ -57,6 +57,7 @@ public:
     IOEthernetController *mwxController();
     int mwxSleepNsec(void *ident, int priority, const char *wmesg, uint64_t timo);
     void mwxWakeup(void *ident);
+    IOReturn waitPowerTransition();
 
     // Called on the driver's main workloop. RX callback borrows the frame;
     // awdlTransmit always consumes its mbuf, including on error.

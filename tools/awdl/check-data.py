@@ -93,7 +93,10 @@ def check():
                        if key in before['native'] and key in after['native']}
     result['transport_delta'] = transport_delta
     result['hal_delta'] = {key: after['hal'][key] - before['hal'][key]
-                           for key in after['hal'] if key in before['hal'] and key != 'MTKAWDLTXLastErrno'}
+                           for key in after['hal'] if key in before['hal'] and not key.startswith('MTKAWDLTXLast')}
+    result['firmware_tx_status_available'] = 'MTKAWDLTXDataAcked' in after['hal']
+    if any(value < 0 for value in result['hal_delta'].values()):
+        result['reasons'].append('HAL counters reset during observation.')
     result['interface'] = run(['ifconfig', 'awdl0']).decode(errors='replace')
     result['transport_findings'] = []
     if any(value < 0 for value in transport_delta.values()):
@@ -120,6 +123,13 @@ def check():
             ('MTKAWDLTXBadFrame', 'HAL permanently rejected a malformed frame or wrong local identity.')):
             if result['hal_delta'].get(key, 0) > 0:
                 result['transport_findings'].append(finding)
+        for key, finding in (
+            ('MTKAWDLTXDataFailed', 'Firmware reported an AWDL unicast queue, RTS or ACK timeout.'),
+            ('MTKAWDLTXMulticastFailed', 'Firmware reported an AWDL multicast transmission failure.'),
+            ('MTKAWDLTXActionFailed', 'Firmware reported an AWDL discovery-action transmission failure.')):
+            if result['hal_delta'].get(key, 0) > 0:
+                result['transport_findings'].append(finding)
+                result['reasons'].append(finding)
         if transport_delta.get('MTKAWDLDataRxFrames') == 0:
             result['transport_findings'].append('No raw AWDL data reached the receiver during this interval.')
     if not after['native'].get('MTKAWDLDataPathEnabled', False):
@@ -146,6 +156,7 @@ def check():
     result['limitations'] = ['Local multicast ping replies do not prove RF traffic.',
                             'Native TX counts accepted protocol frames, not firmware ACKs.',
                             'DataTxSubmitted counts successful HAL/DMA submissions, not firmware ACKs.',
+                            'TXDataAcked counts firmware-reported unicast ACKs; multicast/action completion does not prove peer reception.',
                             'Transport properties publish once per second; short intervals can miss updates.',
                             'Data counters do not validate an AirDrop file transfer.']
     if not result['reasons']:
